@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Launcher shell: dark, edge-to-edge, no action bar. -->
+    <style name="Theme.ZaiBridge" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/zb_background</item>
+        <item name="android:colorBackground">@color/zb_background</item>
+        <item name="android:colorAccent">@color/zb_accent</item>
+        <item name="android:colorPrimary">@color/zb_surface</item>
+        <item name="android:colorPrimaryDark">@color/zb_background</item>
+        <item name="android:textColorPrimary">@color/zb_text</item>
+        <item name="android:textColorSecondary">@color/zb_text_dim</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+
+    <!-- =====================================================================
+         Game host. The explicit NoTitleBar + Fullscreen parent is what removes
+         every trace of the host: no title bar, no decor window, and the
+         activity then clears the system bars itself.
+    -->
+    <style name="Theme.ZaiBridge.GameHost" parent="@android:style/Theme.NoTitleBar.Fullscreen">
+        <item name="android:windowBackground">@color/zb_black</item>
+        <item name="android:colorBackground">@color/zb_black</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:windowActionBar">false</item>
+        <item name="android:windowLayoutInDisplayCutoutMode" tools:targetApi="27">shortEdges</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowDisablePreview">true</item>
+    </style>
+
+</resources>

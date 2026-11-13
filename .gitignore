@@ -1,0 +1,20 @@
+# Gradle
+.gradle/
+build/
+app/build/
+local.properties
+
+# Android Studio / IntelliJ
+.idea/
+*.iml
+captures/
+.navigation/
+
+# Native build intermediates
+.cxx/
+obj/
+app/.cxx/
+
+# OS noise
+.DS_Store
+Thumbs.db

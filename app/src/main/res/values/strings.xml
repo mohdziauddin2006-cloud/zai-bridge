@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Zai-Bridge</string>
+    <string name="app_tagline">Legacy 32-bit games, native 64-bit host</string>
+
+    <string name="import_game">Import game</string>
+    <string name="empty_title">No games yet</string>
+    <string name="empty_body">Import a 32-bit APK, attach its OBB if it has one, and Zai-Bridge will keep both in private storage.</string>
+    <string name="permission_body">Grant all-files access to browse your phone for old APKs and OBBs.</string>
+    <string name="permission_action">Grant access</string>
+    <string name="granted">All-files access granted</string>
+
+    <string name="dialog_obb_title">Expansion file</string>
+    <string name="dialog_obb_message">Does this game ship an OBB? Attach it and it will be moved into private storage, hidden from the launcher grid.</string>
+    <string name="dialog_obb_choose">Attach OBB</string>
+    <string name="dialog_obb_skip">No OBB</string>
+    <string name="cancel">Cancel</string>
+
+    <string name="importing_title">Importing</string>
+    <string name="importing_body">Copying into private storage…</string>
+    <string name="import_done">%1$s imported</string>
+    <string name="import_failed">Import failed: %1$s</string>
+    <string name="import_no_32bit">No armeabi-v7a libraries inside that APK</string>
+
+    <string name="bridge_starting">Starting translation layer…</string>
+    <string name="bridge_ready">Bridge online — legacy runtime mapped</string>
+    <string name="bridge_failed">Bridge error (%1$d). See logcat tag ARM64_WRAPPER.</string>
+    <string name="bridge_unavailable">Native core unavailable on this device</string>
+</resources>

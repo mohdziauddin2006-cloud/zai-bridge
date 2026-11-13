@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Flattened mark for API 24/25, which have no adaptive icon support. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <path
+        android:pathData="M0,0 L108,0 L108,108 L0,108 Z"
+        android:fillColor="#080D15" />
+
+    <path
+        android:pathData="M54,54 C49,45 43,41 36,41 C28,41 24,47 24,54 C24,61 28,67 36,67 C43,67 49,63 54,54"
+        android:strokeColor="#33FFB454"
+        android:strokeWidth="12"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M54,54 C59,45 65,41 72,41 C80,41 84,47 84,54 C84,61 80,67 72,67 C65,67 59,63 54,54"
+        android:strokeColor="#333BE0F2"
+        android:strokeWidth="12"
+        android:strokeLineCap="round" />
+
+    <path
+        android:pathData="M54,54 C49,45 43,41 36,41 C28,41 24,47 24,54 C24,61 28,67 36,67 C43,67 49,63 54,54"
+        android:strokeColor="#FFB454"
+        android:strokeWidth="5"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M54,54 C59,45 65,41 72,41 C80,41 84,47 84,54 C84,61 80,67 72,67 C65,67 59,63 54,54"
+        android:strokeColor="#3BE0F2"
+        android:strokeWidth="5"
+        android:strokeLineCap="round" />
+
+    <path
+        android:pathData="M30,76 L78,76"
+        android:strokeColor="#9FC3DC"
+        android:strokeWidth="2.5"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M40,70 L40,76 M68,70 L68,76"
+        android:strokeColor="#5C7F99"
+        android:strokeWidth="2.5"
+        android:strokeLineCap="round" />
+</vector>

@@ -1,0 +1,3565 @@
+// =============================================================================
+//  wrapper_arm64.cpp   (Zai-Bridge translation core)
+//
+//  ARM32 -> ARM64 userspace bridge: runs the legacy ARMv7 libraries of any
+//  imported APK inside Zai-Bridge's 64-bit process by emulating them with
+//  Unicorn and translating the JNI boundary in both directions.
+//
+//  The payload set is no longer discovered next to this shared object. It is
+//  supplied per session by GameHostActivity, which asks the core to map
+//  <filesDir>/games/<package>/payload/lib*32.so. That directory is assembled by
+//  the ingestion engine from the guest APK's lib/armeabi-v7a entry.
+//
+//  Layout of the emulated (guest) 32-bit address space
+//  ---------------------------------------------------
+//    0x3000_0000  guest heap      - shadow structs, strings, ref handles
+//    0x4000_0000  image #0        - libNimble.so      (16 MB slot per library)
+//    0x4100_0000  image #1        - libapp.so
+//    0x5000_0000  trap page       - JNI thunks + unresolved-import stubs
+//    0x500F_0000  return sentinel - unmapped; uc_emu_start() "until" address
+//    0x7FE0_0000  guest stack     - 1 MB, grows down from 0x7FF0_0000
+//
+//  How a JNI call is intercepted
+//  -----------------------------
+//  The guest never sees a real JNIEnv*. It sees a 32-bit shadow whose only
+//  field points at a table of 32-bit "stub" addresses, one per JNI slot. Each
+//  stub is a `bx lr` in the trap page that is caught by a UC_HOOK_CODE hook
+//  before it executes; the hook performs the real (64-bit) JNI call, writes the
+//  result to R0 and returns through LR. Calls in the other direction (ART ->
+//  native method) enter through a generated ARM64 trampoline that spills x0-x7,
+//  calls back into C++, and re-enters the emulator at the ARM32 function.
+//
+//  Intentionally NOT implemented yet (scaffold scope)
+//  --------------------------------------------------
+//   * Syscall-level bridging (open/read/mmap/pthread/clock_gettime/EAGL): only
+//     the libc memory, string and log surface is forwarded to the host today.
+//     Anything else still resolves to a logging stub that returns 0, so the
+//     loader reports exactly what is missing instead of jumping into garbage.
+//   * A host pointer can never become a guest pointer (the upper 32 bits would
+//     be truncated), so malloc() is served from the emulated heap and the
+//     memory routines marshal through guest memory rather than wrapping the
+//     host call blindly.
+//   * Long/double arguments and float/double returns across the JNI boundary.
+//   * Nested re-entry (guest -> JNI method -> guest) inside a hook.
+//   * ARM32 TLS (CP15 TPIDRURO), caller-saved VFP state, exception unwinding.
+//   * Full JNINativeInterface coverage; unimplemented slots are logged once.
+// =============================================================================
+
+#include <jni.h>
+#include <unicorn/unicorn.h>
+#include <android/log.h>
+
+#include <dirent.h>
+#include <dlfcn.h>
+#include <elf.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cctype>
+#include <cerrno>
+#include <cmath>
+#include <cstddef>
+#include <cstdio>
+#include <cstdint>
+#include <cstdlib>
+#include <chrono>
+#include <cstring>
+#include <ctime>
+#include <functional>
+#include <iterator>
+#include <map>
+#include <string>
+#include <sys/time.h>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+#define LOG_TAG "ARM64_WRAPPER"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+// Implemented at file scope: referenced by the trampoline generator and by the
+// module-directory probe before their definitions are reached.
+extern "C" uint64_t bridge_native_entry(uint32_t id, uint64_t* host_args);
+extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved);
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// Guest address space
+// ---------------------------------------------------------------------------
+constexpr uint32_t kHeapBase   = 0x30000000u;
+constexpr size_t   kHeapSize   = 64u * 1024u * 1024u;
+
+constexpr uint32_t kImageBase0 = 0x40000000u;
+constexpr uint32_t kImageStride = 0x01000000u;  // 16 MB per library slot
+
+constexpr uint32_t kStubBase     = 0x50000000u;
+constexpr size_t   kStubStride   = 8;           // bytes per stub
+constexpr size_t   kStubCount    = 1024;
+constexpr size_t   kStubRegionSz = kStubCount * kStubStride;
+
+constexpr uint32_t kReturnSentinel = 0x500F0000u;
+
+constexpr uint32_t kStackTop  = 0x7FF00000u;
+constexpr size_t   kStackSize = 1u * 1024u * 1024u;
+
+// Guard against runaway guest code (a broken import bridge shows up as a hang).
+constexpr uint64_t kMaxInstructions = 40u * 1000u * 1000u;
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+constexpr uint32_t align_down(uint32_t v, uint32_t a) { return v & ~(a - 1u); }
+constexpr uint32_t align_up(uint32_t v, uint32_t a) { return (v + a - 1u) & ~(a - 1u); }
+
+constexpr uint32_t kPageSize = 4096u;
+
+// ===========================================================================
+// 1. ARM64 trampoline generator (host -> guest entry points)
+//
+// ART hands a native method whatever its Java signature says, so a single C
+// function cannot serve every method. Each registered method gets a 40-byte
+// ARM64 stub that spills x0-x7 into an array, calls the common C handler with
+// (id, args), and returns whatever the handler leaves in x0.
+// ===========================================================================
+class Arm64Trampolines {
+public:
+    // 16 words: 11 instructions of code plus an 8-byte-aligned literal pool
+    // entry (a 64-bit `ldr` literal must be naturally aligned).
+    static constexpr size_t kStubSize = 64;
+    static constexpr size_t kPoolSize = 64 * 1024;
+
+    static bool init() {
+        if (pool_) return true;
+        void* p = mmap(nullptr, kPoolSize, PROT_READ | PROT_WRITE | PROT_EXEC,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) {
+            LOGE("trampoline pool: RWX mmap failed (%s). JNI downcalls unavailable.",
+                 strerror(errno));
+            return false;
+        }
+        pool_ = static_cast<uint8_t*>(p);
+        used_ = 0;
+        LOGI("trampoline pool: %p (%zu KB, RWX)", p, kPoolSize / 1024);
+        return true;
+    }
+
+    static void* emit(uint32_t id, void* target) {
+        if (!pool_ || used_ + kStubSize > kPoolSize) return nullptr;
+        uintptr_t base = reinterpret_cast<uintptr_t>(pool_ + used_);
+
+        uint32_t* w = reinterpret_cast<uint32_t*>(base);
+        w[0] = 0xD10103FFu;  // sub  sp, sp, #64
+        w[1] = 0xA90007E0u;  // stp  x0, x1, [sp, #0]
+        w[2] = 0xA9010FE2u;  // stp  x2, x3, [sp, #16]
+        w[3] = 0xA90217E4u;  // stp  x4, x5, [sp, #32]
+        w[4] = 0xA9031FE6u;  // stp  x6, x7, [sp, #48]
+        w[5] = 0xD2800000u | ((id & 0xFFFFu) << 5);  // mov x0, #id
+        w[6] = 0x910003E1u;  // mov  x1, sp
+        // Absolute indirect call. A direct `bl` only reaches +-128 MB and this
+        // pool is allocated far away from the library on 64-bit Android, so a
+        // relative branch would silently truncate and jump into arbitrary code.
+        w[7] = 0x580000B0u;  // ldr  x16, [pc, #20]  -> literal at w[12]
+        w[8] = 0xD63F0200u;  // blr  x16
+        w[9] = 0x910103FFu;  // add  sp, sp, #64
+        w[10] = 0xD65F03C0u; // ret
+        const uint64_t t = reinterpret_cast<uintptr_t>(target);
+        w[11] = 0xD503201Fu; // nop (execution never reaches here)
+        w[12] = static_cast<uint32_t>(t & 0xFFFFFFFFu);        // .quad target
+        w[13] = static_cast<uint32_t>(t >> 32);
+        w[14] = 0xD503201Fu; // padding
+        w[15] = 0xD503201Fu; // padding
+
+        __builtin___clear_cache(reinterpret_cast<char*>(base),
+                                reinterpret_cast<char*>(base + kStubSize));
+        used_ += kStubSize;
+        return reinterpret_cast<void*>(base);
+    }
+
+private:
+    static uint8_t* pool_;
+    static size_t   used_;
+};
+
+uint8_t* Arm64Trampolines::pool_ = nullptr;
+size_t   Arm64Trampolines::used_ = 0;
+
+// ===========================================================================
+// 2. Emulator: one ARM32 Unicorn instance + guest memory helpers
+// ===========================================================================
+class Emulator {
+public:
+    bool init() {
+        // UC_MODE_ARM is 0, so ARM|THUMB selects Thumb-2 with ARM interworking.
+        const uc_mode mode = static_cast<uc_mode>(UC_MODE_ARM | UC_MODE_THUMB);
+        uc_err err = uc_open(UC_ARCH_ARM, mode, &uc_);
+        if (err != UC_ERR_OK) {
+            LOGE("uc_open(ARM32) failed: %s", uc_strerror(err));
+            return false;
+        }
+
+        // ---- VFP / NEON bring-up ------------------------------------------
+        // A real kernel enables CP10/CP11 in CPACR and sets FPEXC.EN before it
+        // ever returns to userspace. Unicorn leaves both cleared, so the first
+        // VFP instruction a constructor executes (`vmov s0, r0`, `vldr s0,[r5]`)
+        // is rejected as an undefined instruction. Every Android ARMv7 binary
+        // is compiled assuming the kernel already did this, so the emulator has
+        // to stand in for the kernel here, once, before any guest code runs.
+        int32_t cpacr = 0x00F00000;   // cp10 + cp11: full access
+        int32_t fpexc = 0x40000000;   // EN: VFP/NEON active
+        uc_reg_write(uc_, UC_ARM_REG_C1_C0_2, &cpacr);
+        uc_reg_write(uc_, UC_ARM_REG_FPEXC, &fpexc);
+
+        int32_t seen_cpacr = 0, seen_fpexc = 0;
+        uc_reg_read(uc_, UC_ARM_REG_C1_C0_2, &seen_cpacr);
+        uc_reg_read(uc_, UC_ARM_REG_FPEXC, &seen_fpexc);
+        LOGI("VFP bring-up: CPACR=%08x (cp10/11 %s), FPEXC=%08x (EN %s)", seen_cpacr,
+             (seen_cpacr & 0x00F00000) == 0x00F00000 ? "granted" : "DENIED", seen_fpexc,
+             (seen_fpexc & 0x40000000) ? "set" : "CLEAR");
+        if ((seen_cpacr & 0x00F00000) != 0x00F00000 || !(seen_fpexc & 0x40000000)) {
+            LOGE("VFP bring-up failed: every float instruction will trap");
+            return false;
+        }
+
+        // TCG needs an executable buffer; report early if the app sandbox
+        // forbids it rather than failing later inside uc_emu_start().
+        void* probe = mmap(nullptr, kPageSize, PROT_READ | PROT_WRITE | PROT_EXEC,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (probe == MAP_FAILED) {
+            LOGE("executable mmap denied (%s); TCG cannot run in this sandbox",
+                 strerror(errno));
+            return false;
+        }
+        munmap(probe, kPageSize);
+
+        if (!map(kHeapBase, kHeapSize, "heap") ||
+            !map(kStackTop - kStackSize, kStackSize, "stack") ||
+            !map(kStubBase, kStubRegionSz, "trap page")) {
+            return false;
+        }
+
+        // Every stub starts as `bx lr`; the code hook intercepts before it runs,
+        // so this is only a safety net if a hook is ever missed.
+        std::vector<uint8_t> stub(kStubStride, 0);
+        for (size_t i = 0; i < kStubCount; ++i) {
+            stub[0] = 0x1E; stub[1] = 0xFF; stub[2] = 0x2F; stub[3] = 0xE1;
+            if (!write(kStubBase + static_cast<uint32_t>(i * kStubStride), stub.data(), 4)) {
+                return false;
+            }
+        }
+
+        LOGI("uc_open(UC_ARCH_ARM, ARM|THUMB) ok - guest heap @ %08x, stack @ %08x",
+             kHeapBase, kStackTop - static_cast<uint32_t>(kStackSize));
+        return true;
+    }
+
+    uc_engine* uc() const { return uc_; }
+
+    bool map(uint32_t addr, size_t size, const char* what) {
+        uc_err err = uc_mem_map(uc_, addr, size, UC_PROT_READ | UC_PROT_WRITE | UC_PROT_EXEC);
+        if (err != UC_ERR_OK) {
+            LOGE("uc_mem_map(%s) %08x+%zu failed: %s", what, addr, size, uc_strerror(err));
+            return false;
+        }
+        return true;
+    }
+
+    // Guest heap: a bump allocator over a fixed arena with a first-fit free
+    // list. A pure bump allocator survives startup but dies a few thousand
+    // frames into a render loop, because games churn the allocator constantly
+    // and a host pointer can never be handed back to 32-bit code.
+    uint32_t alloc(size_t bytes, size_t alignment = 8) {
+        if (bytes == 0) bytes = 1;
+        const uint32_t want = align_up(static_cast<uint32_t>(bytes), 8);
+
+        for (auto it = free_list_.begin(); it != free_list_.end(); ++it) {
+            if (it->second < want) continue;
+            const uint32_t at = it->first;
+            const uint32_t rest = it->second - want;
+            free_list_.erase(it);
+            if (rest >= 8) free_list_[at + want] = rest;
+            return at;
+        }
+
+        const uint32_t at = align_up(heap_cursor_, static_cast<uint32_t>(alignment));
+        if (at + want > kHeapBase + kHeapSize) {
+            LOGE("guest heap exhausted (want %zu bytes, %zu bytes live)", bytes,
+                 static_cast<size_t>(heap_cursor_ - kHeapBase));
+            return 0;
+        }
+        heap_cursor_ = at + want;
+        return at;
+    }
+
+    // Return a guest block to the free list and coalesce with its neighbours.
+    void release(uint32_t p, size_t bytes) {
+        if (p < kHeapBase || p >= kHeapBase + kHeapSize || bytes == 0) return;
+        const uint32_t want = align_up(static_cast<uint32_t>(bytes), 8);
+        auto ins = free_list_.emplace(p, want).first;
+
+        auto next = std::next(ins);
+        if (next != free_list_.end() && p + ins->second == next->first) {
+            ins->second += next->second;
+            free_list_.erase(next);
+        }
+        if (ins != free_list_.begin()) {
+            auto prev = std::prev(ins);
+            if (prev->first + prev->second == p) {
+                prev->second += ins->second;
+                free_list_.erase(ins);
+            }
+        }
+    }
+
+    size_t heap_live() const { return static_cast<size_t>(heap_cursor_ - kHeapBase); }
+
+    bool write(uint32_t addr, const void* data, size_t len) {
+        uc_err err = uc_mem_write(uc_, addr, data, len);
+        if (err != UC_ERR_OK) {
+            LOGE("uc_mem_write(%08x, %zu) failed: %s", addr, len, uc_strerror(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool read(uint32_t addr, void* out, size_t len) {
+        uc_err err = uc_mem_read(uc_, addr, out, len);
+        return err == UC_ERR_OK;
+    }
+
+    bool write_u32(uint32_t addr, uint32_t v) { return write(addr, &v, sizeof v); }
+
+    uint32_t read_u32(uint32_t addr, bool* ok = nullptr) {
+        uint32_t v = 0;
+        bool r = read(addr, &v, sizeof v);
+        if (ok) *ok = r;
+        return v;
+    }
+
+    std::string read_cstr(uint32_t addr, size_t max = 1024) {
+        std::string s;
+        for (size_t i = 0; i < max; ++i) {
+            uint8_t c = 0;
+            if (!read(addr + static_cast<uint32_t>(i), &c, 1) || c == 0) break;
+            s.push_back(static_cast<char>(c));
+        }
+        return s;
+    }
+
+    bool reg_write(int reg, uint32_t v) {
+        return uc_reg_write(uc_, reg, &v) == UC_ERR_OK;
+    }
+
+    bool reg_read(int reg, uint32_t& v) {
+        v = 0;
+        return uc_reg_read(uc_, reg, &v) == UC_ERR_OK;
+    }
+
+    // Enter the guest, stopping when PC reaches the return sentinel.
+    //
+    // AAPCS: the first four words travel in R0-R3 and everything after that is
+    // pushed onto the stack at [SP], [SP+4], ... Native methods with more than
+    // four parameters (and their JNIEnv*/jobject prefix) need the stack path.
+    bool call(uint32_t entry, const std::vector<uint32_t>& args, uint32_t& ret,
+              const char* what = "") {
+        uc_context* saved = nullptr;
+        if (uc_context_alloc(uc_, &saved) != UC_ERR_OK) return false;
+        uc_context_save(uc_, saved);
+
+        // One 4 KB frame per nesting level, so a guest->Java->guest round trip
+        // cannot clobber the frame of the call it is nested inside.
+        const uint32_t sp = align_down(kStackTop - 0x1000u * (depth_ + 1), 8);
+
+        reg_write(UC_ARM_REG_SP, sp);
+        reg_write(UC_ARM_REG_LR, kReturnSentinel);
+        for (size_t i = 0; i < args.size() && i < 4; ++i) {
+            reg_write(UC_ARM_REG_R0 + static_cast<int>(i), args[i]);
+        }
+        for (size_t i = 4; i < args.size(); ++i) {
+            write_u32(sp + static_cast<uint32_t>((i - 4) * 4), args[i]);
+        }
+
+        // Run in chunks so a guest that spins (typically a wait loop for a
+        // worker thread this single-threaded emulator never starts) is visible
+        // instead of hanging the host silently.
+        constexpr uint32_t kChunk = 4u * 1000u * 1000u;
+        const auto started = std::chrono::steady_clock::now();
+        uint64_t budget = kMaxInstructions;
+        uint32_t pc = entry;
+        uc_err err = UC_ERR_OK;
+
+        if (call_trace_ < 60) {
+            ++call_trace_;
+            LOGI("emu call #%d: %s @%08x (%zu args, depth %u)", call_trace_, what, entry,
+                 args.size(), depth_);
+        }
+
+        ++depth_;
+        for (;;) {
+            err = uc_emu_start(uc_, pc, kReturnSentinel, 0, kChunk);
+            if (err != UC_ERR_OK) break;
+
+            uint32_t cur = 0;
+            reg_read(UC_ARM_REG_PC, cur);
+            if (cur == kReturnSentinel) break;   // normal return
+
+            budget -= std::min<uint64_t>(budget, kChunk);
+            const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - started).count();
+
+            if (budget == 0 || elapsed > 90) {
+                uint32_t lr = 0;
+                reg_read(UC_ARM_REG_LR, lr);
+                LOGE("call(%s) @%08x never returned: spinning at pc=%08x lr=%08x "
+                     "after %llds", what, entry, cur, lr, static_cast<long long>(elapsed));
+                emu_ok_ = false;
+                break;
+            }
+            if (elapsed / 10 > last_report_) {
+                last_report_ = elapsed / 10;
+                LOGW("call(%s): still in guest at pc=%08x (%llds)", what, cur,
+                     static_cast<long long>(elapsed));
+            }
+            pc = cur;
+        }
+        --depth_;
+
+        bool ok = false;
+        if (err == UC_ERR_OK) {
+            ok = reg_read(UC_ARM_REG_R0, ret);
+        } else {
+            uint32_t pc = 0, lr = 0;
+            reg_read(UC_ARM_REG_PC, pc);
+            reg_read(UC_ARM_REG_LR, lr);
+            LOGE("call(%s) @%08x aborted: %s (pc=%08x lr=%08x)", what, entry,
+                 uc_strerror(err), pc, lr);
+        }
+
+        uc_context_restore(uc_, saved);
+        uc_context_free(saved);
+        return ok;
+    }
+
+private:
+    uc_engine* uc_ = nullptr;
+    uint32_t   heap_cursor_ = kHeapBase;
+    uint32_t   depth_ = 0;                   // nested call depth
+    bool       emu_ok_ = true;               // last call made progress
+    int        call_trace_ = 0;              // bounded entry logging for uc calls
+    long long  last_report_ = 0;             // seconds bucket for spin reports
+    std::map<uint32_t, size_t> free_list_;   // guest address -> size
+};
+
+// ===========================================================================
+// 3. Static linker: maps ELF32 PT_LOAD segments and resolves dynamic symbols
+// ===========================================================================
+struct LoadedLibrary {
+    std::string path;
+    std::string soname;
+    uint32_t    bias = 0;
+    uint32_t    map_addr = 0;
+    uint32_t    map_size = 0;
+    std::unordered_map<std::string, uint32_t> exports;
+    std::vector<uint32_t> init_array;
+    uint32_t    init_fn = 0;
+
+    // Dynamic-table metadata, kept so relocations can run in a second pass
+    // once every payload is mapped (libapp32.so imports symbols that
+    // libNimble32.so / libfmodex32.so export, and those are not mapped yet when
+    // libapp32.so is first parsed).
+    uint32_t symtab = 0, strtab = 0, strsz = 0;
+    uint32_t rel = 0, relsz = 0, jmprel = 0, pltrelsz = 0;
+
+    // DT_INIT_ARRAY is filled in with link-time relative addresses and only
+    // becomes usable once R_ARM_RELATIVE has been applied, so it is read back
+    // after linking, not at map time.
+    uint32_t init_array_v = 0;
+    uint32_t init_array_sz = 0;
+};
+
+// A `Java_<class>_<method>` export found in a guest library: the host ART must
+// be able to bind this name, so it becomes a registered native method.
+struct JavaExport {
+    std::string class_path;   // com/ea/EAIO/EAIO
+    std::string method;       // StartupNativeImpl
+    uint32_t    fn = 0;       // guest address of the function
+};
+
+class StaticLinker {
+public:
+    explicit StaticLinker(Emulator& emu) : emu_(emu) {}
+
+    // Called for symbols that no loaded library defines.
+    void set_import_resolver(std::function<uint32_t(const std::string&)> fn) {
+        import_resolver_ = std::move(fn);
+    }
+
+    LoadedLibrary* load(const std::string& path, uint32_t image_base) {
+        std::vector<uint8_t> buf;
+        if (!read_file(path, buf)) return nullptr;
+
+        Elf32_Ehdr eh{};
+        memcpy(&eh, buf.data(), sizeof eh);
+        if (memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0 ||
+            eh.e_ident[EI_CLASS] != ELFCLASS32 ||
+            eh.e_ident[EI_DATA] != ELFDATA2LSB ||
+            eh.e_machine != EM_ARM) {
+            LOGE("%s: not an ARM32 little-endian ELF", path.c_str());
+            return nullptr;
+        }
+
+        std::vector<Elf32_Phdr> phdrs(eh.e_phnum);
+        memcpy(phdrs.data(), buf.data() + eh.e_phoff, eh.e_phnum * sizeof(Elf32_Phdr));
+
+        uint32_t min_v = UINT32_MAX, max_v = 0;
+        const Elf32_Phdr* dyn_ph = nullptr;
+        for (const auto& ph : phdrs) {
+            if (ph.p_type == PT_LOAD) {
+                min_v = std::min(min_v, align_down(ph.p_vaddr, kPageSize));
+                max_v = std::max(max_v, align_up(ph.p_vaddr + ph.p_memsz, kPageSize));
+            } else if (ph.p_type == PT_DYNAMIC) {
+                dyn_ph = &ph;
+            }
+        }
+        if (min_v >= max_v || image_base < min_v) {
+            LOGE("%s: unusable PT_LOAD range", path.c_str());
+            return nullptr;
+        }
+
+        auto lib = new LoadedLibrary();
+        lib->path = path;
+        lib->bias = image_base - min_v;
+        lib->map_addr = image_base;
+        lib->map_size = max_v - min_v;
+
+        if (!emu_.map(lib->map_addr, lib->map_size, "image")) {
+            delete lib;
+            return nullptr;
+        }
+
+        for (const auto& ph : phdrs) {
+            if (ph.p_type != PT_LOAD) continue;
+            if (ph.p_filesz == 0) continue;   // pure .bss: already zero from uc_mem_map
+            if (ph.p_offset + ph.p_filesz > buf.size()) {
+                LOGE("%s: PT_LOAD outside file bounds", path.c_str());
+                delete lib;
+                return nullptr;
+            }
+            if (!emu_.write(lib->bias + ph.p_vaddr, buf.data() + ph.p_offset, ph.p_filesz)) {
+                delete lib;
+                return nullptr;
+            }
+        }
+
+        LOGI("%s loaded: bias %08x, %u bytes, %zu segments", path.c_str(), lib->bias,
+             lib->map_size, phdrs.size());
+
+        if (dyn_ph) {
+            if (!parse_dynamic(*lib, buf, *dyn_ph)) {
+                delete lib;
+                return nullptr;
+            }
+        }
+
+        libs_.push_back(lib);
+        return lib;
+    }
+
+    uint32_t resolve_global(const std::string& name) {
+        for (auto* lib : libs_) {
+            auto it = lib->exports.find(name);
+            if (it != lib->exports.end()) return it->second;
+        }
+        return 0;
+    }
+
+    // Second pass: every payload is mapped, so symbol resolution is no longer
+    // order-dependent. apply_relocs() builds import stubs for anything the
+    // guest libraries plus the host routing table cannot satisfy.
+    void link_all() {
+        for (auto* lib : libs_) {
+            size_t applied = 0, failed = 0;
+            apply_relocs(*lib, lib->symtab, lib->strtab, lib->strsz,
+                         lib->rel, lib->relsz, applied, failed);
+            apply_relocs(*lib, lib->symtab, lib->strtab, lib->strsz,
+                         lib->jmprel, lib->pltrelsz, applied, failed);
+            LOGI("%s: %zu relocations applied, %zu unresolved slots", lib->path.c_str(),
+                 applied, failed);
+
+            // Now that the array entries have been relocated, they hold real
+            // guest addresses.
+            if (lib->init_array_sz) {
+                const uint32_t entries = lib->init_array_sz / sizeof(uint32_t);
+                for (uint32_t i = 0; i < entries; ++i) {
+                    const uint32_t fn = emu_.read_u32(lib->bias + lib->init_array_v + i * 4);
+                    if (fn == 0 || fn == 0xFFFFFFFFu) continue;
+                    lib->init_array.push_back(fn);
+                }
+            }
+        }
+    }
+
+    const std::vector<LoadedLibrary*>& libs() const { return libs_; }
+
+    // Every `Java_*` export across the mapped payloads. This is what makes the
+    // bridge APK-agnostic: no symbol name is hardcoded anywhere.
+    std::vector<JavaExport> java_exports() const {
+        std::vector<JavaExport> out;
+        for (const auto* lib : libs_) {
+            for (const auto& kv : lib->exports) {
+                JavaExport e;
+                if (parse_java_symbol(kv.first, e.class_path, e.method)) {
+                    e.fn = kv.second;
+                    out.push_back(e);
+                }
+            }
+        }
+        return out;
+    }
+
+    // Java_com_example_Foo_bar -> ("com/example/Foo", "bar")
+    // Underscore escapes per the JNI spec: _1 '_', _2 ';', _3 '[', _0XXXX.
+    static bool parse_java_symbol(const std::string& sym, std::string& cls,
+                                  std::string& method) {
+        const std::string prefix = "Java_";
+        if (sym.compare(0, prefix.size(), prefix) != 0) return false;
+
+        // Drop the optional `__<mangled-args>` suffix used for overloads.
+        std::string body = sym.substr(prefix.size());
+        const size_t dbl = body.find("__");
+        if (dbl != std::string::npos) body = body.substr(0, dbl);
+        if (body.empty()) return false;
+
+        std::vector<std::string> parts;
+        std::string cur;
+        for (size_t i = 0; i < body.size(); ++i) {
+            const char c = body[i];
+            if (c != '_') { cur.push_back(c); continue; }
+            if (i + 1 >= body.size()) return false;
+            const char n = body[i + 1];
+            if (n == '1') { cur.push_back('_'); i += 1; }
+            else if (n == '2') { cur.push_back(';'); i += 1; }
+            else if (n == '3') { cur.push_back('['); i += 1; }
+            else if (n == '0' && i + 5 < body.size() + 1) {
+                cur.push_back(static_cast<char>(std::strtol(body.substr(i + 1, 4).c_str(),
+                                                            nullptr, 16)));
+                i += 4;
+            } else {
+                parts.push_back(cur);
+                cur.clear();
+            }
+        }
+        parts.push_back(cur);
+        if (parts.size() < 2) return false;
+
+        method = parts.back();
+        cls.clear();
+        for (size_t i = 0; i + 1 < parts.size(); ++i) {
+            if (i) cls.push_back('/');
+            cls += parts[i];
+        }
+        return !cls.empty() && !method.empty();
+    }
+
+private:
+    static bool read_file(const std::string& path, std::vector<uint8_t>& out) {
+        int fd = open(path.c_str(), O_RDONLY);
+        if (fd < 0) {
+            LOGE("open(%s): %s", path.c_str(), strerror(errno));
+            return false;
+        }
+        struct stat st{};
+        if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+            close(fd);
+            return false;
+        }
+        out.resize(static_cast<size_t>(st.st_size));
+        size_t got = 0;
+        while (got < out.size()) {
+            ssize_t n = read(fd, out.data() + got, out.size() - got);
+            if (n <= 0) { close(fd); return false; }
+            got += static_cast<size_t>(n);
+        }
+        close(fd);
+        return true;
+    }
+
+    uint32_t sym_count(const LoadedLibrary& lib, uint32_t hash_v, uint32_t symtab_v,
+                       uint32_t strtab_v) const {
+        if (hash_v) {
+            // DT_HASH: nbucket, nchain -> nchain is the symbol count.
+            bool ok = false;
+            uint32_t nchain = emu_.read_u32(lib.bias + hash_v + 4, &ok);
+            if (ok) return nchain;
+        }
+        if (strtab_v > symtab_v) return (strtab_v - symtab_v) / sizeof(Elf32_Sym);
+        return 0;
+    }
+
+    std::string sym_name(const LoadedLibrary& lib, uint32_t strtab, uint32_t strsz,
+                         uint32_t name_off) const {
+        if (name_off >= strsz) return {};
+        return emu_.read_cstr(lib.bias + strtab + name_off, strsz - name_off);
+    }
+
+    uint32_t lookup_in_libs(const std::string& name) { return resolve_global(name); }
+
+    bool parse_dynamic(LoadedLibrary& lib, const std::vector<uint8_t>& buf,
+                       const Elf32_Phdr& dyn_ph) {
+        const size_t n = dyn_ph.p_filesz / sizeof(Elf32_Dyn);
+        const Elf32_Dyn* dyn = reinterpret_cast<const Elf32_Dyn*>(buf.data() + dyn_ph.p_offset);
+
+        uint32_t symtab = 0, strtab = 0, strsz = 0, hash_v = 0;
+        uint32_t rel = 0, relsz = 0, jmprel = 0, pltrelsz = 0;
+        uint32_t init_array = 0, init_arraysz = 0;
+
+        for (size_t i = 0; i < n; ++i) {
+            switch (dyn[i].d_tag) {
+                case DT_SYMTAB:     symtab = dyn[i].d_un.d_ptr; break;
+                case DT_STRTAB:     strtab = dyn[i].d_un.d_ptr; break;
+                case DT_STRSZ:      strsz = dyn[i].d_un.d_val; break;
+                case DT_HASH:       hash_v = dyn[i].d_un.d_ptr; break;
+                case DT_REL:        rel = dyn[i].d_un.d_ptr; break;
+                case DT_RELSZ:      relsz = dyn[i].d_un.d_val; break;
+                case DT_JMPREL:     jmprel = dyn[i].d_un.d_ptr; break;
+                case DT_PLTRELSZ:   pltrelsz = dyn[i].d_un.d_val; break;
+                case DT_INIT_ARRAY: init_array = dyn[i].d_un.d_ptr; break;
+                case DT_INIT_ARRAYSZ: init_arraysz = dyn[i].d_un.d_val; break;
+                case DT_INIT:       lib.init_fn = lib.bias + dyn[i].d_un.d_ptr; break;
+                case DT_SONAME:
+                    if (strtab) lib.soname = emu_.read_cstr(lib.bias + strtab + dyn[i].d_un.d_val);
+                    break;
+                default: break;
+            }
+        }
+
+        if (!symtab || !strtab) {
+            LOGW("%s: no dynamic symbol table", lib.path.c_str());
+            return true;
+        }
+
+        // ---- exports -------------------------------------------------------
+        const uint32_t count = sym_count(lib, hash_v, symtab, strtab);
+        for (uint32_t i = 1; i < count; ++i) {
+            Elf32_Sym sym{};
+            if (!emu_.read(lib.bias + symtab + i * sizeof(Elf32_Sym), &sym, sizeof sym)) break;
+            if (sym.st_name == 0 || sym.st_name >= strsz) continue;
+            if (sym.st_shndx == SHN_UNDEF || sym.st_value == 0) continue;
+            if (ELF32_ST_BIND(sym.st_info) != STB_GLOBAL &&
+                ELF32_ST_BIND(sym.st_info) != STB_WEAK) continue;
+            std::string name = sym_name(lib, strtab, strsz, sym.st_name);
+            if (!name.empty()) lib.exports[name] = lib.bias + sym.st_value;
+        }
+        LOGI("%s: %zu dynamic symbols, soname=%s", lib.path.c_str(), lib.exports.size(),
+             lib.soname.empty() ? "<none>" : lib.soname.c_str());
+
+        // ---- relocations ---------------------------------------------------
+        // Deferred: see link_all(). Only record where they live.
+        lib.symtab = symtab;   lib.strtab = strtab;  lib.strsz = strsz;
+        lib.rel = rel;         lib.relsz = relsz;
+        lib.jmprel = jmprel;   lib.pltrelsz = pltrelsz;
+
+        // ---- static constructors ------------------------------------------
+        // Recorded, not read: the entries are still unrelocated here.
+        lib.init_array_v = init_array;
+        lib.init_array_sz = init_arraysz;
+        return true;
+    }
+
+    void apply_relocs(LoadedLibrary& lib, uint32_t symtab, uint32_t strtab, uint32_t strsz,
+                      uint32_t rel_v, uint32_t relsz, size_t& applied, size_t& failed) {
+        if (!rel_v || !relsz) return;
+        const uint32_t count = relsz / sizeof(Elf32_Rel);
+        unsigned unknown = 0;
+
+        for (uint32_t i = 0; i < count; ++i) {
+            Elf32_Rel r{};
+            if (!emu_.read(lib.bias + rel_v + i * sizeof(Elf32_Rel), &r, sizeof r)) return;
+
+            const uint32_t slot = lib.bias + r.r_offset;
+            const uint32_t type = ELF32_R_TYPE(r.r_info);
+            const uint32_t symi = ELF32_R_SYM(r.r_info);
+            const uint32_t addend = emu_.read_u32(slot);
+
+            switch (type) {
+                case R_ARM_RELATIVE:
+                    emu_.write_u32(slot, lib.bias + addend);
+                    ++applied;
+                    break;
+                case R_ARM_ABS32:
+                case R_ARM_GLOB_DAT:
+                case R_ARM_JUMP_SLOT: {
+                    const uint32_t target = resolve_symbol(lib, symtab, strtab, strsz, symi);
+                    if (!target) { ++failed; break; }
+                    emu_.write_u32(slot, type == R_ARM_ABS32 ? target + addend : target);
+                    ++applied;
+                    break;
+                }
+                case R_ARM_NONE:
+                    break;
+                default:
+                    if (unknown++ < 5) {
+                        LOGW("%s: unsupported relocation type %u at %08x", lib.path.c_str(),
+                             type, r.r_offset);
+                    }
+                    ++failed;
+                    break;
+            }
+        }
+    }
+
+    uint32_t resolve_symbol(const LoadedLibrary& lib, uint32_t symtab, uint32_t strtab,
+                            uint32_t strsz, uint32_t index) {
+        if (index == 0) return 0;
+
+        Elf32_Sym sym{};
+        if (!emu_.read(lib.bias + symtab + index * sizeof(Elf32_Sym), &sym, sizeof sym)) {
+            return 0;
+        }
+        if (sym.st_shndx != SHN_UNDEF && sym.st_value != 0) return lib.bias + sym.st_value;
+
+        std::string name = sym_name(lib, strtab, strsz, sym.st_name);
+        if (name.empty()) return 0;
+
+        uint32_t addr = lookup_in_libs(name);
+        if (addr) return addr;
+
+        // Cross-library or bionic import: route through the bridge.
+        if (import_resolver_) return import_resolver_(name);
+        return 0;
+    }
+
+    Emulator&      emu_;
+    std::vector<LoadedLibrary*> libs_;
+    std::function<uint32_t(const std::string&)> import_resolver_;
+};
+
+// ===========================================================================
+// 4. JNI bridge
+// ===========================================================================
+enum StubKind : int { kStubJniEnv = 1, kStubJniVm, kStubImport };
+
+struct StubSlot {
+    StubKind    kind;
+    int         index;
+    std::string name;
+};
+
+struct NativeEntry {
+    uint32_t    id = 0;
+    uint32_t    guest_fn = 0;
+    std::string cls;
+    std::string name;
+    std::string sig;
+    char        ret_type = 'V';
+    std::vector<char> arg_types;
+    void*       code = nullptr;
+};
+
+#define JNIENV_IDX(field) (static_cast<int>(offsetof(JNINativeInterface, field) / sizeof(void*)))
+#define JNIVM_IDX(field)  (static_cast<int>(offsetof(JNIInvokeInterface, field) / sizeof(void*)))
+
+constexpr int kIdxGetVersion       = JNIENV_IDX(GetVersion);
+constexpr int kIdxFindClass        = JNIENV_IDX(FindClass);
+constexpr int kIdxGetObjectClass   = JNIENV_IDX(GetObjectClass);
+constexpr int kIdxGetSuperclass    = JNIENV_IDX(GetSuperclass);
+constexpr int kIdxGetMethodID      = JNIENV_IDX(GetMethodID);
+constexpr int kIdxGetStaticMethodID= JNIENV_IDX(GetStaticMethodID);
+constexpr int kIdxGetFieldID       = JNIENV_IDX(GetFieldID);
+constexpr int kIdxNewStringUTF     = JNIENV_IDX(NewStringUTF);
+constexpr int kIdxGetStringUTFLength = JNIENV_IDX(GetStringUTFLength);
+constexpr int kIdxGetStringUTFChars  = JNIENV_IDX(GetStringUTFChars);
+constexpr int kIdxReleaseStringUTFChars = JNIENV_IDX(ReleaseStringUTFChars);
+constexpr int kIdxRegisterNatives  = JNIENV_IDX(RegisterNatives);
+constexpr int kIdxExceptionOccurred = JNIENV_IDX(ExceptionOccurred);
+constexpr int kIdxExceptionDescribe = JNIENV_IDX(ExceptionDescribe);
+constexpr int kIdxExceptionClear   = JNIENV_IDX(ExceptionClear);
+constexpr int kIdxExceptionCheck   = JNIENV_IDX(ExceptionCheck);
+constexpr int kIdxNewGlobalRef     = JNIENV_IDX(NewGlobalRef);
+constexpr int kIdxDeleteGlobalRef  = JNIENV_IDX(DeleteGlobalRef);
+constexpr int kIdxDeleteLocalRef   = JNIENV_IDX(DeleteLocalRef);
+constexpr int kIdxNewLocalRef      = JNIENV_IDX(NewLocalRef);
+constexpr int kIdxIsSameObject     = JNIENV_IDX(IsSameObject);
+constexpr int kIdxGetJavaVM        = JNIENV_IDX(GetJavaVM);
+constexpr int kIdxIsInstanceOf     = JNIENV_IDX(IsInstanceOf);
+constexpr int kIdxIsAssignableFrom = JNIENV_IDX(IsAssignableFrom);
+constexpr int kIdxThrow            = JNIENV_IDX(Throw);
+constexpr int kIdxThrowNew         = JNIENV_IDX(ThrowNew);
+constexpr int kIdxFatalError       = JNIENV_IDX(FatalError);
+constexpr int kIdxPushLocalFrame   = JNIENV_IDX(PushLocalFrame);
+constexpr int kIdxPopLocalFrame    = JNIENV_IDX(PopLocalFrame);
+constexpr int kIdxEnsureLocalCapacity = JNIENV_IDX(EnsureLocalCapacity);
+constexpr int kIdxAllocObject      = JNIENV_IDX(AllocObject);
+constexpr int kIdxNewObject        = JNIENV_IDX(NewObject);
+constexpr int kIdxNewObjectV       = JNIENV_IDX(NewObjectV);
+constexpr int kIdxNewObjectA       = JNIENV_IDX(NewObjectA);
+constexpr int kIdxToReflectedMethod = JNIENV_IDX(ToReflectedMethod);
+constexpr int kIdxFromReflectedMethod = JNIENV_IDX(FromReflectedMethod);
+
+// The Call<Type>Method{,V,A} blocks are 30 consecutive slots each. Order is
+// type-major and, within a type, plain / V (va_list) / A (jvalue array).
+constexpr int kIdxCallObjectMethod       = JNIENV_IDX(CallObjectMethod);
+constexpr int kIdxCallStaticObjectMethod = JNIENV_IDX(CallStaticObjectMethod);
+constexpr char kCallTypeOrder[10] = {'L', 'Z', 'B', 'C', 'S', 'I', 'J', 'F', 'D', 'V'};
+
+// Array entry points, also laid out in fixed runs we can index arithmetically.
+constexpr int kIdxGetArrayLength        = JNIENV_IDX(GetArrayLength);
+constexpr int kIdxNewObjectArray        = JNIENV_IDX(NewObjectArray);
+constexpr int kIdxGetObjectArrayElement = JNIENV_IDX(GetObjectArrayElement);
+constexpr int kIdxSetObjectArrayElement = JNIENV_IDX(SetObjectArrayElement);
+constexpr int kIdxNewBooleanArray       = JNIENV_IDX(NewBooleanArray);
+constexpr int kIdxGetBooleanArrayRegion  = JNIENV_IDX(GetBooleanArrayRegion);
+constexpr int kIdxGetBooleanArrayElements = JNIENV_IDX(GetBooleanArrayElements);
+
+constexpr int kIdxVmDestroy        = JNIVM_IDX(DestroyJavaVM);
+constexpr int kIdxVmAttach         = JNIVM_IDX(AttachCurrentThread);
+constexpr int kIdxVmDetach         = JNIVM_IDX(DetachCurrentThread);
+constexpr int kIdxVmGetEnv         = JNIVM_IDX(GetEnv);
+
+// Resolve a class through the guest application's DexClassLoader. ART's
+// FindClass uses the loader of the *host* application, where the guest's
+// classes do not exist, so a Java_<class> export could never bind. Going
+// through ClassLoader.loadClass by name reaches the injected guest dex.
+jclass find_class_through(JNIEnv* env, jobject loader, const std::string& slash_name) {
+    if (loader && !slash_name.empty()) {
+        jclass loader_cls = env->FindClass("java/lang/ClassLoader");
+        if (loader_cls) {
+            jmethodID load = env->GetMethodID(loader_cls, "loadClass",
+                                              "(Ljava/lang/String;)Ljava/lang/Class;");
+            if (load) {
+                std::string dotted = slash_name;
+                std::replace(dotted.begin(), dotted.end(), '/', '.');
+                jstring name = env->NewStringUTF(dotted.c_str());
+                if (name) {
+                    auto cls = static_cast<jclass>(env->CallObjectMethod(loader, load, name));
+                    env->DeleteLocalRef(name);
+                    env->DeleteLocalRef(loader_cls);
+                    if (env->ExceptionCheck()) {
+                        env->ExceptionClear();   // not in the guest dex (yet)
+                        return nullptr;
+                    }
+                    return cls;
+                }
+            }
+            env->DeleteLocalRef(loader_cls);
+        }
+        if (env->ExceptionCheck()) env->ExceptionClear();
+    }
+    return env->FindClass(slash_name.c_str());
+}
+
+class JniBridge {
+public:
+    // std::function rather than a member pointer: the routing table is now
+    // large and mostly one-line lambdas over host libc/libm entry points.
+    using ImportHandler = std::function<uint32_t()>;
+
+    explicit JniBridge(Emulator& emu) : emu_(emu), linker_(emu) {}
+
+    bool init(JavaVM* /*vm*/, JNIEnv* env) {
+        env_ = env;
+        if (!Arm64Trampolines::init()) return false;
+
+        linker_.set_import_resolver([this](const std::string& name) {
+            return import_stub(name);
+        });
+
+        // Host routing table for the imports every libc-linked ARM32 binary
+        // needs. Anything absent here still gets a stub and is reported.
+        install_import_handlers();
+
+        // Data imports (address-of, not a call) get real guest memory instead
+        // of a code stub: the guest dereferences these.
+        stack_guard_ = emu_.alloc(4, 4);
+        errno_cell_ = emu_.alloc(4, 4);
+        return_gadget_ = emu_.alloc(8, 4);
+        if (stack_guard_ && errno_cell_ && return_gadget_) {
+            emu_.write_u32(stack_guard_, 0x00A5A5A5u);
+            emu_.write_u32(errno_cell_, 0);
+            // mov r0, #0 ; ldr pc, [sp], #4  - a guest `ret` that also clears r0.
+            const uint32_t gadget[] = {0xE3A00000u, 0xE49DF004u};
+            emu_.write(return_gadget_, gadget, sizeof gadget);
+            data_slots_["__stack_chk_guard"] = stack_guard_;
+            data_slots_["__errno"] = errno_cell_;
+        }
+
+        // 32-bit JNIEnv shadow: one word pointing at the function table.
+        env_funcs_ = emu_.alloc(256 * sizeof(uint32_t), 16);
+        env_shadow_ = emu_.alloc(4, 4);
+        if (!env_funcs_ || !env_shadow_) return false;
+
+        for (int i = 0; i < 256; ++i) {
+            uint32_t stub = make_stub(kStubJniEnv, i, jni_env_name(i));
+            if (!emu_.write_u32(env_funcs_ + static_cast<uint32_t>(i) * 4, stub)) return false;
+        }
+        if (!emu_.write_u32(env_shadow_, env_funcs_)) return false;
+
+        // 32-bit JavaVM shadow.
+        vm_funcs_ = emu_.alloc(16 * sizeof(uint32_t), 16);
+        vm_shadow_ = emu_.alloc(4, 4);
+        if (!vm_funcs_ || !vm_shadow_) return false;
+        for (int i = 0; i < 16; ++i) {
+            uint32_t stub = make_stub(kStubJniVm, i, jni_vm_name(i));
+            if (!emu_.write_u32(vm_funcs_ + static_cast<uint32_t>(i) * 4, stub)) return false;
+        }
+        if (!emu_.write_u32(vm_shadow_, vm_funcs_)) return false;
+
+        // One code hook covers the whole trap page.
+        uc_err err = uc_hook_add(emu_.uc(), &hook_, UC_HOOK_CODE,
+                                 reinterpret_cast<void*>(&JniBridge::code_hook_thunk),
+                                 this, static_cast<uint64_t>(kStubBase),
+                                 static_cast<uint64_t>(kStubBase + kStubRegionSz - 1));
+        if (err != UC_ERR_OK) {
+            LOGE("uc_hook_add failed: %s", uc_strerror(err));
+            return false;
+        }
+
+        LOGI("JNI bridge ready: env shadow %08x, vm shadow %08x, trap page %08x",
+             env_shadow_, vm_shadow_, kStubBase);
+        LOGI("JNIEnv slot map: FindClass=%d GetObjectClass=%d GetMethodID=%d "
+             "GetFieldID=%d GetStaticMethodID=%d NewStringUTF=%d GetJavaVM=%d",
+             kIdxFindClass, kIdxGetObjectClass, kIdxGetMethodID, kIdxGetFieldID,
+             kIdxGetStaticMethodID, kIdxNewStringUTF, kIdxGetJavaVM);
+        return true;
+    }
+
+    LoadedLibrary* map_library(const std::string& path, uint32_t image_base) {
+        return linker_.load(path, image_base);
+    }
+
+    // Second pass, once every payload is mapped: relocations can now resolve
+    // symbols across libraries instead of depending on load order.
+    void link_all() { linker_.link_all(); }
+
+    const std::vector<LoadedLibrary*>& libraries() const { return linker_.libs(); }
+
+    void run_all_constructors() {
+        for (const auto* lib : linker_.libs()) run_constructors(*lib);
+    }
+
+    // Look up an export in one specific library: both libNimble.so and libapp.so
+    // export JNI_OnLoad, and we must run the one belonging to libapp.so.
+    static uint32_t export_of(const LoadedLibrary* lib, const std::string& name) {
+        if (!lib) return 0;
+        auto it = lib->exports.find(name);
+        return it == lib->exports.end() ? 0 : it->second;
+    }
+
+    // guest JNI_OnLoad(vm, reserved)
+    bool call_onload(uint32_t fn, uint32_t& ret) {
+        return emu_.call(fn, {vm_shadow_, 0}, ret, "JNI_OnLoad");
+    }
+
+    void report_imports() { log_import_report(); }
+
+    // =====================================================================
+    // Universal JNI binding
+    //
+    // ART resolves a native method by looking for the symbol
+    // `Java_<class>_<method>` in the library handle. Those symbols exist, but
+    // they live inside the ARM32 payload and ART - a 64-bit process - can never
+    // see them. Exporting them by name would hardcode one APK, so instead we
+    // read the guest's dynamic symbol table, and for every `Java_*` export we
+    // ask the class (via reflection on the real JNIEnv) for that method's true
+    // descriptor, then bind ART to a generated 64-bit trampoline that re-enters
+    // the emulator at the guest function.
+    // =====================================================================
+    void bind_java_exports() {
+        const std::vector<JavaExport> exports = linker_.java_exports();
+        if (exports.empty()) {
+            LOGW("no Java_* exports in the mapped payloads");
+            return;
+        }
+        natives_.reserve(natives_.size() + exports.size());
+        LOGI("binding %zu Java_* exports into the host runtime", exports.size());
+
+        size_t bound = 0;
+        for (const auto& e : exports) {
+            if (bind_one(e)) ++bound;
+            else pending_.push_back(e);
+        }
+        LOGI("Java_* binding: %zu/%zu bound, %zu deferred (class not loaded yet)",
+             bound, exports.size(), pending_.size());
+    }
+
+    // Retried on later JNI traffic: a class that was not resolvable from
+    // JNI_OnLoad is usually available once the app has started.
+    void retry_pending_bindings() {
+        if (pending_.empty()) return;
+        std::vector<JavaExport> still;
+        for (const auto& e : pending_) {
+            if (!bind_one(e)) still.push_back(e);
+        }
+        const size_t done = pending_.size() - still.size();
+        pending_.swap(still);
+        if (done) LOGI("deferred Java_* bindings: %zu resolved, %zu left", done, pending_.size());
+    }
+
+    // Run DT_INIT / DT_INIT_ARRAY of a freshly loaded library.
+    void run_constructors(const LoadedLibrary& lib) {
+        std::vector<uint32_t> fns;
+        if (lib.init_fn) fns.push_back(lib.init_fn);
+        for (uint32_t f : lib.init_array) fns.push_back(f);
+
+        for (uint32_t fn : fns) {
+            uint32_t ret = 0;
+            if (!emu_.call(fn, {}, ret, "constructor")) {
+                LOGW("%s: constructor %08x failed", lib.path.c_str(), fn);
+            }
+        }
+        if (!fns.empty()) LOGI("%s: %zu static constructors ran", lib.path.c_str(), fns.size());
+    }
+
+    uint32_t env_shadow() const { return env_shadow_; }
+    uint32_t vm_shadow() const { return vm_shadow_; }
+
+    // The guest dex loader supplied by GameHostActivity. Kept as a plain
+    // reference: the Java side holds the loader for the whole session.
+    void set_guest_loader(jobject loader) { guest_loader_ = loader; }
+
+    // ---- 64-bit -> 32-bit reference map -----------------------------------
+    uint32_t to_guest_ref(void* p) {
+        if (!p) return 0;
+        auto it = ref_reverse_.find(p);
+        if (it != ref_reverse_.end()) return it->second;
+        const uint32_t h = next_ref_++;
+        refs_[h] = p;
+        ref_reverse_[p] = h;
+        return h;
+    }
+
+    void* from_guest_ref(uint32_t h) {
+        auto it = refs_.find(h);
+        return it == refs_.end() ? nullptr : it->second;
+    }
+
+    uint32_t guest_str(const std::string& s) {
+        const uint32_t at = emu_.alloc(s.size() + 1, 4);
+        if (!at) return 0;
+        emu_.write(at, s.c_str(), s.size() + 1);
+        return at;
+    }
+
+    std::string guest_string(uint32_t addr) { return emu_.read_cstr(addr); }
+
+    // ---- called from the generated ARM64 trampoline -----------------------
+    uint64_t native_entry(uint32_t id, uint64_t* host_args) {
+        if (id >= natives_.size()) return 0;
+        const NativeEntry& e = natives_[id];
+
+        // Trace the first few calls per method; RunLoop ticks are per-frame and
+        // would otherwise drown the log.
+        auto seen = native_calls_.find(id);
+        const int n = (seen == native_calls_.end()) ? 0 : seen->second;
+        native_calls_[id] = n + 1;
+        if (n < 3 || e.name == "StartupNativeImpl") {
+            LOGI("native %s%s <- ART (call #%d)", e.name.c_str(), e.sig.c_str(), n + 1);
+        }
+
+        std::vector<uint32_t> args;
+        args.push_back(env_shadow_);
+        args.push_back(to_guest_ref(reinterpret_cast<void*>(host_args[1])));  // thiz
+
+        size_t ai = 2;
+        for (char t : e.arg_types) {
+            const uint64_t v = host_args[ai++];
+            if (t == 'L' || t == '[') {
+                args.push_back(to_guest_ref(reinterpret_cast<void*>(v)));
+            } else if (t == 'J' || t == 'D') {
+                LOGW("%s%s: 64-bit argument truncated (not implemented)", e.name.c_str(),
+                     e.sig.c_str());
+                args.push_back(static_cast<uint32_t>(v));
+            } else {
+                args.push_back(static_cast<uint32_t>(v));
+            }
+        }
+
+        uint32_t ret = 0;
+        const bool ok = emu_.call(e.guest_fn, args, ret, e.name.c_str());
+        if (n < 3) LOGI("native %s -> %s (ret=%d)", e.name.c_str(), ok ? "returned" : "FAILED",
+                        static_cast<int>(ret));
+        if (!ok) return 0;
+        return static_cast<uint64_t>(ret);
+    }
+
+private:
+    // ---- Java_* binding helpers --------------------------------------------
+    bool bind_one(const JavaExport& e) {
+        jclass cls = find_class_through(env_, guest_loader_, e.class_path);
+        if (!cls) {
+            env_->ExceptionClear();   // normal while the class is still loading
+            return false;
+        }
+
+        std::string sig;
+        if (!find_method_signature(cls, e.method, sig)) {
+            LOGW("Java_* %s.%s: no Java method with that name", e.class_path.c_str(),
+                 e.method.c_str());
+            env_->DeleteLocalRef(cls);
+            return false;
+        }
+
+        NativeEntry ne;
+        ne.id = static_cast<uint32_t>(natives_.size());
+        ne.guest_fn = e.fn;
+        ne.cls = e.class_path;
+        ne.name = e.method;
+        ne.sig = sig;
+        parse_signature(sig, ne);
+
+        void* code = Arm64Trampolines::emit(ne.id, reinterpret_cast<void*>(&bridge_native_entry));
+        if (!code) {
+            env_->DeleteLocalRef(cls);
+            return false;
+        }
+        ne.code = code;
+        natives_.push_back(ne);
+
+        JNINativeMethod m{natives_.back().name.c_str(), natives_.back().sig.c_str(), code};
+        const jint rc = env_->RegisterNatives(cls, &m, 1);
+        if (rc != JNI_OK) {
+            env_->ExceptionClear();
+            natives_.pop_back();
+            env_->DeleteLocalRef(cls);
+            return false;
+        }
+
+        LOGI("  bound %s.%s%s -> guest %08x", e.class_path.c_str(), e.method.c_str(),
+             sig.c_str(), e.fn);
+        env_->DeleteLocalRef(cls);
+        return true;
+    }
+
+    // Walks the class's declared methods and returns the descriptor of the one
+    // whose name matches, e.g. "(Ljava/lang/String;I)V".
+    bool find_method_signature(jclass cls, const std::string& want, std::string& sig) {
+        jclass class_cls = env_->FindClass("java/lang/Class");
+        jclass method_cls = env_->FindClass("java/lang/reflect/Method");
+        if (!class_cls || !method_cls) {
+            env_->ExceptionClear();
+            return false;
+        }
+
+        jmethodID get_declared = env_->GetMethodID(class_cls, "getDeclaredMethods",
+                                                   "()[Ljava/lang/reflect/Method;");
+        jmethodID get_name = env_->GetMethodID(method_cls, "getName", "()Ljava/lang/String;");
+        jmethodID get_ret = env_->GetMethodID(method_cls, "getReturnType", "()Ljava/lang/Class;");
+        jmethodID get_params = env_->GetMethodID(method_cls, "getParameterTypes",
+                                                 "()[Ljava/lang/Class;");
+        if (!get_declared || !get_name || !get_ret || !get_params) {
+            env_->ExceptionClear();
+            return false;
+        }
+
+        auto methods = static_cast<jobjectArray>(env_->CallObjectMethod(cls, get_declared));
+        if (!methods) {
+            env_->ExceptionClear();
+            return false;
+        }
+
+        bool found = false;
+        const jsize count = env_->GetArrayLength(methods);
+        for (jsize i = 0; i < count && !found; ++i) {
+            jobject m = env_->GetObjectArrayElement(methods, i);
+            if (!m) continue;
+
+            if (method_name(m, get_name) == want) {
+                auto ret = static_cast<jclass>(env_->CallObjectMethod(m, get_ret));
+                auto params = static_cast<jobjectArray>(env_->CallObjectMethod(m, get_params));
+                if (ret && params) {
+                    sig = "(";
+                    const jsize argc = env_->GetArrayLength(params);
+                    for (jsize k = 0; k < argc; ++k) {
+                        auto pc = static_cast<jclass>(env_->GetObjectArrayElement(params, k));
+                        sig += class_descriptor(pc);
+                        if (pc) env_->DeleteLocalRef(pc);
+                    }
+                    sig += ")";
+                    sig += class_descriptor(ret);
+                    found = true;
+                }
+                if (ret) env_->DeleteLocalRef(ret);
+                if (params) env_->DeleteLocalRef(params);
+            }
+            env_->DeleteLocalRef(m);
+        }
+        env_->DeleteLocalRef(methods);
+
+        if (env_->ExceptionCheck()) {
+            env_->ExceptionClear();
+            return false;
+        }
+        return found;
+    }
+
+    std::string method_name(jobject method, jmethodID get_name) {
+        auto jn = static_cast<jstring>(env_->CallObjectMethod(method, get_name));
+        if (!jn) return {};
+        std::string out;
+        const char* p = env_->GetStringUTFChars(jn, nullptr);
+        if (p) {
+            out = p;
+            env_->ReleaseStringUTFChars(jn, p);
+        }
+        env_->DeleteLocalRef(jn);
+        return out;
+    }
+
+    std::string class_descriptor(jclass c) {
+        if (!c) return "V";
+        jclass class_cls = env_->FindClass("java/lang/Class");
+        if (!class_cls) { env_->ExceptionClear(); return "V"; }
+        jmethodID get_name = env_->GetMethodID(class_cls, "getName", "()Ljava/lang/String;");
+        env_->DeleteLocalRef(class_cls);
+        if (!get_name) return "V";
+
+        auto jn = static_cast<jstring>(env_->CallObjectMethod(c, get_name));
+        std::string name;
+        if (jn) {
+            const char* p = env_->GetStringUTFChars(jn, nullptr);
+            if (p) { name = p; env_->ReleaseStringUTFChars(jn, p); }
+            env_->DeleteLocalRef(jn);
+        }
+        if (name.empty()) return "V";
+
+        if (name[0] == '[') {
+            for (char& ch : name) if (ch == '.') ch = '/';
+            return name;
+        }
+
+        static const std::unordered_map<std::string, std::string> prim = {
+            {"void", "V"}, {"boolean", "Z"}, {"byte", "B"}, {"char", "C"},
+            {"short", "S"}, {"int", "I"}, {"long", "J"}, {"float", "F"},
+            {"double", "D"},
+        };
+        auto it = prim.find(name);
+        if (it != prim.end()) return it->second;
+
+        for (char& ch : name) if (ch == '.') ch = '/';
+        return "L" + name + ";";
+    }
+
+    // ---- stub table --------------------------------------------------------
+    uint32_t make_stub(StubKind kind, int index, const std::string& name) {
+        const size_t slot = slots_.size();
+        if (slot >= kStubCount) {
+            LOGE("trap page exhausted (%zu stubs)", kStubCount);
+            return kStubBase;  // slot 0 is still a valid `bx lr`
+        }
+        slots_.push_back({kind, index, name});
+        return kStubBase + static_cast<uint32_t>(slot * kStubStride);
+    }
+
+    uint32_t import_stub(const std::string& name) {
+        auto it = import_slots_.find(name);
+        if (it != import_slots_.end()) return it->second;
+
+        // Data symbols must resolve to readable memory, not to a code stub.
+        auto d = data_slots_.find(name);
+        if (d != data_slots_.end()) {
+            import_slots_[name] = d->second;
+            return d->second;
+        }
+
+        const uint32_t addr = make_stub(kStubImport, 0, name);
+        import_slots_[name] = addr;
+        return addr;
+    }
+
+    static void code_hook_thunk(uc_engine* uc, uint64_t address, uint32_t size,
+                                void* user_data) {
+        (void)uc; (void)size;
+        static_cast<JniBridge*>(user_data)->on_stub(static_cast<uint32_t>(address));
+    }
+
+    void on_stub(uint32_t pc) {
+        const size_t slot = (pc - kStubBase) / kStubStride;
+        if (slot >= slots_.size()) return;
+
+        uint32_t lr = 0;
+        emu_.reg_read(UC_ARM_REG_LR, lr);
+
+        redirected_ = false;
+        const StubSlot& s = slots_[slot];
+        uint32_t ret = 0;
+        switch (s.kind) {
+            case kStubJniEnv: ret = dispatch_env(s.index); break;
+            case kStubJniVm:  ret = dispatch_vm(s.index);  break;
+            case kStubImport: ret = dispatch_import(slot, s); break;
+        }
+
+        // A handler may have re-pointed PC itself (an in-guest call such as
+        // pthread_once); in that case returning to LR here would skip it.
+        if (redirected_) return;
+
+        emu_.reg_write(UC_ARM_REG_R0, ret);
+        emu_.reg_write(UC_ARM_REG_PC, lr);   // return to the guest caller
+    }
+
+    // Call a guest function from inside a hook. uc_emu_start() is not
+    // reentrant, so instead of nesting we push the caller's LR, point LR at a
+    // guest trampoline that clears R0 and returns, and jump straight to the
+    // target. The guest's own `ret` then lands back in the caller.
+    uint32_t call_in_guest(uint32_t fn, uint32_t first_arg = 0) {
+        if (!fn || !return_gadget_) return 0;
+        uint32_t sp = 0, lr = 0;
+        emu_.reg_read(UC_ARM_REG_SP, sp);
+        emu_.reg_read(UC_ARM_REG_LR, lr);
+        if (sp < kHeapBase || sp > kStackTop) {
+            LOGW("call_in_guest(%08x): implausible SP %08x", fn, sp);
+            return 0;
+        }
+        if (!emu_.write_u32(sp - 4, lr)) return 0;
+        emu_.reg_write(UC_ARM_REG_SP, sp - 4);
+        emu_.reg_write(UC_ARM_REG_R0, first_arg);
+        emu_.reg_write(UC_ARM_REG_LR, return_gadget_);
+        emu_.reg_write(UC_ARM_REG_PC, fn);
+        redirected_ = true;
+        return 0;
+    }
+
+    uint32_t arg(size_t i) {
+        uint32_t v = 0;
+        emu_.reg_read(UC_ARM_REG_R0 + static_cast<int>(i), v);
+        return v;
+    }
+
+    uint32_t dispatch_import(size_t slot, const StubSlot& s) {
+        auto it = import_handlers_.find(s.name);
+        if (it != import_handlers_.end()) return it->second();
+
+        const int key = 3 * 100000 + static_cast<int>(slot);
+        if (logged_.insert(key).second) {
+            LOGW("unimplemented import: %s (returning 0)", s.name.c_str());
+        }
+        return 0;
+    }
+
+    uint32_t dispatch_env(int index) {
+        if (!pending_.empty()) retry_pending_bindings();
+
+        switch (index) {
+            case kIdxGetVersion:
+                return static_cast<uint32_t>(env_->GetVersion());
+
+            case kIdxFindClass: {
+                const std::string name = guest_string(arg(1));
+                jclass c = env_->FindClass(name.c_str());
+                if (!c) { env_->ExceptionClear(); LOGE("FindClass(%s) failed", name.c_str()); }
+                return to_guest_ref(c);
+            }
+
+            case kIdxGetObjectClass: {
+                auto* o = static_cast<jobject>(from_guest_ref(arg(1)));
+                return o ? to_guest_ref(env_->GetObjectClass(o)) : 0;
+            }
+
+            case kIdxGetSuperclass:
+                return to_guest_ref(env_->GetSuperclass(
+                    static_cast<jclass>(from_guest_ref(arg(1)))));
+
+            case kIdxGetMethodID: {
+                auto* c = static_cast<jclass>(from_guest_ref(arg(1)));
+                if (!c) return 0;
+                const std::string name = guest_string(arg(2));
+                const std::string sig = guest_string(arg(3));
+                jmethodID m = env_->GetMethodID(c, name.c_str(), sig.c_str());
+                if (!m) { env_->ExceptionClear(); LOGW("GetMethodID(%s%s) failed", name.c_str(), sig.c_str()); }
+                // Remembered so a later Call*Method can rebuild the argument list.
+                else method_sigs_[static_cast<void*>(m)] = sig;
+                return to_guest_ref(m);
+            }
+
+            case kIdxGetStaticMethodID: {
+                const std::string name = guest_string(arg(2));
+                const std::string sig = guest_string(arg(3));
+                jmethodID m = env_->GetStaticMethodID(static_cast<jclass>(from_guest_ref(arg(1))),
+                                                      name.c_str(), sig.c_str());
+                if (!m) { env_->ExceptionClear(); LOGW("GetStaticMethodID(%s%s) failed", name.c_str(), sig.c_str()); }
+                else method_sigs_[static_cast<void*>(m)] = sig;
+                return to_guest_ref(m);
+            }
+
+            case kIdxGetFieldID: {
+                const std::string name = guest_string(arg(2));
+                const std::string sig = guest_string(arg(3));
+                return to_guest_ref(env_->GetFieldID(static_cast<jclass>(from_guest_ref(arg(1))),
+                                                     name.c_str(), sig.c_str()));
+            }
+
+            case kIdxNewStringUTF: {
+                const std::string s = guest_string(arg(1));
+                return to_guest_ref(env_->NewStringUTF(s.c_str()));
+            }
+
+            case kIdxGetStringUTFLength:
+                return static_cast<uint32_t>(env_->GetStringUTFLength(
+                    static_cast<jstring>(from_guest_ref(arg(1)))));
+
+            case kIdxGetStringUTFChars: {
+                auto* str = static_cast<jstring>(from_guest_ref(arg(1)));
+                if (!str) return 0;
+                const char* chars = env_->GetStringUTFChars(str, nullptr);
+                if (!chars) return 0;
+                // The guest must get a real 32-bit pointer it can dereference,
+                // so hand it a private copy in guest memory.
+                const uint32_t at = guest_str(chars);
+                env_->ReleaseStringUTFChars(str, chars);
+                return at;
+            }
+
+            case kIdxReleaseStringUTFChars:
+                // The guest got a private copy; nothing to release on the host.
+                return 0;
+
+            case kIdxNewGlobalRef:
+                return to_guest_ref(env_->NewGlobalRef(
+                    static_cast<jobject>(from_guest_ref(arg(1)))));
+
+            case kIdxDeleteGlobalRef:
+                return 0;
+
+            case kIdxDeleteLocalRef:
+                return 0;
+
+            case kIdxNewLocalRef:
+                return to_guest_ref(env_->NewLocalRef(
+                    static_cast<jobject>(from_guest_ref(arg(1)))));
+
+            case kIdxIsSameObject:
+                return env_->IsSameObject(static_cast<jobject>(from_guest_ref(arg(1))),
+                                          static_cast<jobject>(from_guest_ref(arg(2))))
+                           ? JNI_TRUE : JNI_FALSE;
+
+            case kIdxGetJavaVM: {
+                const uint32_t out = arg(1);
+                if (out) emu_.write_u32(out, vm_shadow_);
+                return JNI_OK;
+            }
+
+            case kIdxExceptionOccurred:
+                return to_guest_ref(env_->ExceptionOccurred());
+
+            case kIdxExceptionDescribe:
+                env_->ExceptionDescribe();
+                return 0;
+
+            case kIdxExceptionClear:
+                env_->ExceptionClear();
+                return 0;
+
+            case kIdxExceptionCheck:
+                return env_->ExceptionCheck() ? JNI_TRUE : JNI_FALSE;
+
+            case kIdxRegisterNatives:
+                return register_natives();
+
+            case kIdxIsInstanceOf:
+                return env_->IsInstanceOf(static_cast<jobject>(from_guest_ref(arg(1))),
+                                          static_cast<jclass>(from_guest_ref(arg(2))))
+                           ? JNI_TRUE : JNI_FALSE;
+
+            case kIdxIsAssignableFrom:
+                return env_->IsAssignableFrom(static_cast<jclass>(from_guest_ref(arg(1))),
+                                              static_cast<jclass>(from_guest_ref(arg(2))))
+                           ? JNI_TRUE : JNI_FALSE;
+
+            case kIdxThrow:
+                return static_cast<uint32_t>(
+                    env_->Throw(static_cast<jthrowable>(from_guest_ref(arg(1)))));
+
+            case kIdxThrowNew: {
+                const std::string msg = guest_string(arg(2));
+                LOGE("guest throws %s: %s", guest_string(arg(1)).c_str(), msg.c_str());
+                return static_cast<uint32_t>(env_->ThrowNew(
+                    static_cast<jclass>(from_guest_ref(arg(1))), msg.c_str()));
+            }
+
+            case kIdxFatalError:
+                LOGE("guest FatalError: %s", guest_string(arg(1)).c_str());
+                return 0;
+
+            case kIdxPushLocalFrame:
+                return static_cast<uint32_t>(
+                    env_->PushLocalFrame(static_cast<jint>(arg(1))));
+
+            case kIdxPopLocalFrame:
+                return to_guest_ref(
+                    env_->PopLocalFrame(static_cast<jobject>(from_guest_ref(arg(1)))));
+
+            case kIdxEnsureLocalCapacity:
+                return static_cast<uint32_t>(
+                    env_->EnsureLocalCapacity(static_cast<jint>(arg(1))));
+
+            case kIdxAllocObject:
+                return to_guest_ref(
+                    env_->AllocObject(static_cast<jclass>(from_guest_ref(arg(1)))));
+
+            case kIdxNewObject:   return new_object(0);
+            case kIdxNewObjectV:  return new_object(1);
+            case kIdxNewObjectA:  return new_object(2);
+
+            case kIdxGetArrayLength:
+                return static_cast<uint32_t>(
+                    env_->GetArrayLength(static_cast<jarray>(from_guest_ref(arg(1)))));
+
+            case kIdxNewObjectArray:
+                return to_guest_ref(env_->NewObjectArray(
+                    static_cast<jsize>(arg(1)),
+                    static_cast<jclass>(from_guest_ref(arg(2))),
+                    static_cast<jobject>(from_guest_ref(arg(3)))));
+
+            case kIdxGetObjectArrayElement:
+                return to_guest_ref(env_->GetObjectArrayElement(
+                    static_cast<jobjectArray>(from_guest_ref(arg(1))),
+                    static_cast<jsize>(arg(2))));
+
+            case kIdxSetObjectArrayElement:
+                env_->SetObjectArrayElement(
+                    static_cast<jobjectArray>(from_guest_ref(arg(1))),
+                    static_cast<jsize>(arg(2)),
+                    static_cast<jobject>(from_guest_ref(arg(3))));
+                return 0;
+
+            default:
+                // Fixed-layout blocks, indexed arithmetically rather than with
+                // dozens of individual case labels.
+                if (index >= kIdxCallObjectMethod &&
+                    index < kIdxCallObjectMethod + 30) {
+                    const int k = index - kIdxCallObjectMethod;
+                    return call_java(kCallTypeOrder[k / 3], false, k % 3);
+                }
+                if (index >= kIdxCallStaticObjectMethod &&
+                    index < kIdxCallStaticObjectMethod + 30) {
+                    const int k = index - kIdxCallStaticObjectMethod;
+                    return call_java(kCallTypeOrder[k / 3], true, k % 3);
+                }
+                if (index >= kIdxNewBooleanArray && index < kIdxNewBooleanArray + 8) {
+                    return new_primitive_array(array_type(index - kIdxNewBooleanArray));
+                }
+                if (index >= kIdxGetBooleanArrayRegion &&
+                    index < kIdxGetBooleanArrayRegion + 16) {
+                    const int k = index - kIdxGetBooleanArrayRegion;
+                    return array_region(array_type(k / 2), (k % 2) == 1);
+                }
+                if (index >= kIdxGetBooleanArrayElements &&
+                    index < kIdxGetBooleanArrayElements + 16) {
+                    const int k = index - kIdxGetBooleanArrayElements;
+                    const char t = array_type(k / 2);
+                    return (k % 2) == 0 ? array_elements(t) : release_array_elements(t);
+                }
+                log_once_env(index);
+                return 0;
+        }
+    }
+
+    uint32_t dispatch_vm(int index) {
+        switch (index) {
+            case kIdxVmGetEnv:
+                if (arg(1)) emu_.write_u32(arg(1), env_shadow_);
+                return JNI_OK;
+            case kIdxVmAttach:
+                if (arg(1)) emu_.write_u32(arg(1), env_shadow_);
+                return JNI_OK;
+            case kIdxVmDetach:
+            case kIdxVmDestroy:
+                return JNI_OK;
+            default:
+                log_once_vm(index);
+                return 0;
+        }
+    }
+
+    // =====================================================================
+    // Host routing table
+    //
+    // ARM32 Android uses the *softfp* ABI: a `float` argument travels in a core
+    // register as its raw bit pattern and a `double` in an even/odd register
+    // pair, so every handler reinterprets R0..R3 instead of trusting the host
+    // calling convention. 64-bit results are written back to R1 as well as R0.
+    // =====================================================================
+    float f_arg(int i) {
+        const uint32_t b = arg(i);
+        float f;
+        std::memcpy(&f, &b, sizeof f);
+        return f;
+    }
+
+    double d_arg(int i) {
+        const uint32_t lo = arg(i), hi = arg(i + 1);
+        const uint64_t b = static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
+        double d;
+        std::memcpy(&d, &b, sizeof d);
+        return d;
+    }
+
+    uint32_t ret_f(float f) {
+        uint32_t b;
+        std::memcpy(&b, &f, sizeof b);
+        return b;
+    }
+
+    uint32_t ret_d(double d) {
+        uint64_t b;
+        std::memcpy(&b, &d, sizeof b);
+        emu_.reg_write(UC_ARM_REG_R1, static_cast<uint32_t>(b >> 32));
+        return static_cast<uint32_t>(b);
+    }
+
+    uint32_t ret_i64(int64_t v) {
+        const uint64_t b = static_cast<uint64_t>(v);
+        emu_.reg_write(UC_ARM_REG_R1, static_cast<uint32_t>(b >> 32));
+        return static_cast<uint32_t>(b);
+    }
+
+    void write_double(uint32_t at, double d) {
+        uint64_t b;
+        std::memcpy(&b, &d, sizeof b);
+        emu_.write_u32(at, static_cast<uint32_t>(b));
+        emu_.write_u32(at + 4, static_cast<uint32_t>(b >> 32));
+    }
+
+    // ---- pthread / TLS ---------------------------------------------------
+    // The guest is single-threaded inside the emulator, so mutual exclusion is
+    // trivially satisfied and the lock calls are honest no-ops. What must be
+    // real is pthread_once (static initialisation runs exactly once) and the
+    // TLS key/value pairs, or C++ statics in libapp.so never initialise.
+    uint32_t imp_pthread_once() {
+        const uint32_t once = arg(0), fn = arg(1);
+        const uint32_t state = emu_.read_u32(once);
+        if (state != 0) return 0;
+        if (!emu_.write_u32(once, 1)) return 0;
+        LOGI("pthread_once: running init routine %08x in-guest", fn);
+        return call_in_guest(fn);
+    }
+
+    uint32_t imp_pthread_key_create() {
+        const uint32_t out = arg(0);
+        const uint32_t key = next_tls_key_++;
+        if (out) emu_.write_u32(out, key);
+        return 0;
+    }
+
+    uint32_t imp_pthread_getspecific() {
+        auto it = tls_values_.find(arg(0));
+        return it == tls_values_.end() ? 0 : it->second;
+    }
+
+    uint32_t imp_pthread_setspecific() {
+        tls_values_[arg(0)] = arg(1);
+        return 0;
+    }
+
+    // ---- time ------------------------------------------------------------
+    uint32_t imp_gettimeofday() {
+        struct timeval tv{};
+        ::gettimeofday(&tv, nullptr);
+        const uint32_t out = arg(0);
+        if (out) {
+            emu_.write_u32(out + 0, static_cast<uint32_t>(tv.tv_sec));
+            emu_.write_u32(out + 4, static_cast<uint32_t>(tv.tv_usec));
+        }
+        return 0;
+    }
+
+    uint32_t imp_clock_gettime() {
+        struct timespec ts{};
+        ::clock_gettime(static_cast<clockid_t>(arg(0)), &ts);
+        const uint32_t out = arg(1);
+        if (out) {
+            emu_.write_u32(out + 0, static_cast<uint32_t>(ts.tv_sec));
+            emu_.write_u32(out + 4, static_cast<uint32_t>(ts.tv_nsec));
+        }
+        return 0;
+    }
+
+    // ---- POSIX file / stdio -----------------------------------------------
+    // Guest paths are ordinary Android paths, so the host opens them directly.
+    // Only the handle is narrowed: the guest gets a small integer, the host
+    // keeps the real descriptor / FILE*.
+    int host_fd(uint32_t g) {
+        auto it = fd_map_.find(g);
+        return it == fd_map_.end() ? -1 : it->second;
+    }
+
+    uint32_t imp_open() {
+        const std::string path = guest_string(arg(0));
+        const int fd = ::open(path.c_str(), static_cast<int>(arg(1)),
+                              static_cast<int>(arg(2)));
+        if (fd < 0) {
+            LOGW("open(%s) -> %s", path.c_str(), strerror(errno));
+            return static_cast<uint32_t>(-1);
+        }
+        const uint32_t g = next_handle_++;
+        fd_map_[g] = fd;
+        return g;
+    }
+
+    uint32_t imp_close() {
+        auto it = fd_map_.find(arg(0));
+        if (it == fd_map_.end()) return 0;
+        ::close(it->second);
+        fd_map_.erase(it);
+        return 0;
+    }
+
+    uint32_t imp_read() {
+        const int fd = host_fd(arg(0));
+        if (fd < 0) return static_cast<uint32_t>(-1);
+        const uint32_t dst = arg(1);
+        uint32_t n = arg(2);
+        std::vector<uint8_t> buf(n);
+        const ssize_t got = ::read(fd, buf.data(), n);
+        if (got <= 0) return static_cast<uint32_t>(got);
+        emu_.write(dst, buf.data(), static_cast<size_t>(got));
+        return static_cast<uint32_t>(got);
+    }
+
+    uint32_t imp_write() {
+        const int fd = host_fd(arg(0));
+        if (fd < 0) return static_cast<uint32_t>(-1);
+        const uint32_t src = arg(1);
+        const uint32_t n = arg(2);
+        std::vector<uint8_t> buf(n);
+        if (n && !emu_.read(src, buf.data(), n)) return static_cast<uint32_t>(-1);
+        return static_cast<uint32_t>(::write(fd, buf.data(), n));
+    }
+
+    uint32_t imp_lseek() {
+        const int fd = host_fd(arg(0));
+        if (fd < 0) return static_cast<uint32_t>(-1);
+        const uint64_t lo = arg(1), hi = arg(2);
+        const uint64_t off = lo | (hi << 32);
+        const off_t r = ::lseek(fd, static_cast<off_t>(static_cast<int64_t>(off)),
+                                static_cast<int>(arg(3)));
+        return ret_i64(static_cast<int64_t>(r));
+    }
+
+    // bionic ARM32 `struct stat` is 104 bytes with these offsets (verified
+    // against the NDK's armv7 headers). The host layout is different, so it is
+    // marshalled field by field rather than memcpy'd.
+    void write_guest_stat(uint32_t at, const struct stat& st) {
+        if (!at) return;
+        std::vector<uint8_t> buf(104, 0);
+        auto put32 = [&](size_t off, uint32_t v) { std::memcpy(&buf[off], &v, 4); };
+        auto put64 = [&](size_t off, uint64_t v) { std::memcpy(&buf[off], &v, 8); };
+        put64(0,  static_cast<uint64_t>(st.st_dev));
+        put32(16, static_cast<uint32_t>(st.st_mode));
+        put64(48, static_cast<uint64_t>(st.st_size));
+        put32(80, static_cast<uint32_t>(st.st_mtime));
+        put64(96, static_cast<uint64_t>(st.st_ino));
+        emu_.write(at, buf.data(), buf.size());
+    }
+
+    uint32_t imp_stat_common(bool by_fd) {
+        const uint32_t out = arg(by_fd ? 1 : 1);
+        struct stat st{};
+        int rc = -1;
+        if (by_fd) {
+            const int fd = host_fd(arg(0));
+            if (fd < 0) return static_cast<uint32_t>(-1);
+            rc = ::fstat(fd, &st);
+        } else {
+            rc = ::stat(guest_string(arg(0)).c_str(), &st);
+        }
+        if (rc != 0) return static_cast<uint32_t>(-1);
+        write_guest_stat(out, st);
+        return 0;
+    }
+
+    uint32_t imp_fopen() {
+        const std::string path = guest_string(arg(0));
+        const std::string mode = guest_string(arg(1));
+        FILE* f = ::fopen(path.c_str(), mode.c_str());
+        if (!f) {
+            LOGW("fopen(%s, %s) -> %s", path.c_str(), mode.c_str(), strerror(errno));
+            return 0;
+        }
+        const uint32_t h = next_handle_++;
+        file_map_[h] = f;
+        return h;
+    }
+
+    FILE* host_file(uint32_t h) {
+        auto it = file_map_.find(h);
+        return it == file_map_.end() ? nullptr : it->second;
+    }
+
+    uint32_t imp_fread() {
+        FILE* f = host_file(arg(3));
+        if (!f) return 0;
+        const size_t sz = arg(1), n = arg(2);
+        std::vector<uint8_t> buf(sz * n);
+        const size_t got = ::fread(buf.data(), sz, n, f);
+        if (got) emu_.write(arg(0), buf.data(), got * sz);
+        return static_cast<uint32_t>(got);
+    }
+
+    uint32_t imp_fwrite() {
+        FILE* f = host_file(arg(3));
+        if (!f) return 0;
+        const size_t sz = arg(1), n = arg(2);
+        std::vector<uint8_t> buf(sz * n);
+        if (!buf.empty() && !emu_.read(arg(0), buf.data(), buf.size())) return 0;
+        return static_cast<uint32_t>(::fwrite(buf.data(), sz, n, f));
+    }
+
+    uint32_t imp_opendir() {
+        const std::string path = guest_string(arg(0));
+        DIR* d = ::opendir(path.c_str());
+        if (!d) return 0;
+        const uint32_t h = next_handle_++;
+        const uint32_t buf = guest_alloc(280);   // bionic ARM32 struct dirent
+        if (!buf) { ::closedir(d); return 0; }
+        dir_map_[h] = {d, buf};
+        return h;
+    }
+
+    uint32_t imp_readdir() {
+        auto it = dir_map_.find(arg(0));
+        if (it == dir_map_.end()) return 0;
+        struct dirent* e = ::readdir(it->second.host);
+        if (!e) return 0;
+
+        std::vector<uint8_t> buf(280, 0);
+        const uint64_t ino = static_cast<uint64_t>(e->d_ino);
+        std::memcpy(&buf[0], &ino, 8);
+        const uint16_t reclen = 280;
+        std::memcpy(&buf[16], &reclen, 2);
+        buf[18] = static_cast<uint8_t>(e->d_type);   // d_name starts at 19
+        std::strncpy(reinterpret_cast<char*>(&buf[19]), e->d_name, 255);
+        emu_.write(it->second.buf, buf.data(), buf.size());
+        return it->second.buf;
+    }
+
+    uint32_t imp_closedir() {
+        auto it = dir_map_.find(arg(0));
+        if (it == dir_map_.end()) return 0;
+        ::closedir(it->second.host);
+        emu_.release(it->second.buf, 280);
+        dir_map_.erase(it);
+        return 0;
+    }
+
+    // ---- misc libc -------------------------------------------------------
+    uint32_t imp_abort() {
+        LOGE("guest called abort() - stopping the run here");
+        emu_.reg_write(UC_ARM_REG_PC, kReturnSentinel);
+        redirected_ = true;
+        return 0;
+    }
+
+    uint32_t imp_assert2() {
+        LOGE("guest assertion failed: %s (%s:%u)", guest_string(arg(3)).c_str(),
+             guest_string(arg(0)).c_str(), emu_.read_u32(arg(1)));
+        return 0;
+    }
+
+    uint32_t imp_sysconf() {
+        switch (static_cast<int>(arg(0))) {
+            case 39: return 4096;    // _SC_PAGESIZE
+            case 30: return 4096;    // _SC_PAGE_SIZE
+            case 96:                 // _SC_NPROCESSORS_CONF
+            case 97: return 4;       // _SC_NPROCESSORS_ONLN
+            default: return 1;       // a plausible "supported" answer
+        }
+    }
+
+    void install_import_handlers() {
+        // ---------------- memory ---------------------------------------
+        import_handlers_["malloc"]  = [this] { return imp_malloc(); };
+        import_handlers_["calloc"]  = [this] { return imp_calloc(); };
+        import_handlers_["realloc"] = [this] { return imp_realloc(); };
+        import_handlers_["free"]    = [this] { return imp_free(); };
+        import_handlers_["memcpy"]  = [this] { return imp_memcpy(); };
+        import_handlers_["memmove"] = [this] { return imp_memmove(); };
+        import_handlers_["memset"]  = [this] { return imp_memset(); };
+        import_handlers_["memcmp"]  = [this] { return imp_memcmp(); };
+        import_handlers_["__aeabi_memcpy"]  = [this] { return imp_memcpy(); };
+        import_handlers_["__aeabi_memcpy4"] = [this] { return imp_memcpy(); };
+        import_handlers_["__aeabi_memcpy8"] = [this] { return imp_memcpy(); };
+        import_handlers_["__aeabi_memmove"]  = [this] { return imp_memmove(); };
+        import_handlers_["__aeabi_memmove4"] = [this] { return imp_memmove(); };
+        import_handlers_["__aeabi_memmove8"] = [this] { return imp_memmove(); };
+        import_handlers_["__aeabi_memclr"]  = [this] { return imp_memclr(); };
+        import_handlers_["__aeabi_memclr4"] = [this] { return imp_memclr(); };
+        import_handlers_["__aeabi_memclr8"] = [this] { return imp_memclr(); };
+        import_handlers_["__aeabi_memset"]  = [this] { return imp_aeabi_memset(); };
+        import_handlers_["__aeabi_memset4"] = [this] { return imp_aeabi_memset(); };
+        import_handlers_["__aeabi_memset8"] = [this] { return imp_aeabi_memset(); };
+        import_handlers_["bzero"] = [this] { return imp_memclr(); };
+        import_handlers_["bcopy"] = [this] {
+            copy_guest(arg(0), arg(1), arg(2));
+            return 0u;
+        };
+        import_handlers_["memchr"] = [this] {
+            uint32_t p = arg(0);
+            const uint8_t want = static_cast<uint8_t>(arg(1) & 0xFFu);
+            uint32_t n = arg(2);
+            while (n--) {
+                uint8_t c = 0;
+                if (!emu_.read(p, &c, 1)) return 0u;
+                if (c == want) return p;
+                ++p;
+            }
+            return 0u;
+        };
+
+        // ---------------- strings --------------------------------------
+        import_handlers_["strlen"] = [this] { return imp_strlen(); };
+        import_handlers_["strcpy"] = [this] { return imp_strcpy(); };
+        import_handlers_["strcmp"] = [this] { return imp_strcmp(); };
+        import_handlers_["strncmp"] = [this] {
+            const std::string a = guest_string(arg(0));
+            const std::string b = guest_string(arg(1));
+            return static_cast<uint32_t>(std::strncmp(a.c_str(), b.c_str(), arg(2)));
+        };
+        import_handlers_["strcasecmp"] = [this] {
+            const std::string a = guest_string(arg(0));
+            const std::string b = guest_string(arg(1));
+            return static_cast<uint32_t>(::strcasecmp(a.c_str(), b.c_str()));
+        };
+        import_handlers_["strncpy"] = [this] {
+            const uint32_t dst = arg(0);
+            const std::string src = guest_string(arg(1));
+            const uint32_t n = arg(2);
+            std::vector<uint8_t> buf(n, 0);
+            const size_t copy = std::min<size_t>(src.size(), n);
+            std::memcpy(buf.data(), src.data(), copy);
+            emu_.write(dst, buf.data(), buf.size());
+            return dst;
+        };
+        import_handlers_["strcat"] = [this] {
+            const uint32_t dst = arg(0);
+            const std::string base = guest_string(dst);
+            const std::string add = guest_string(arg(1));
+            const std::string joined = base + add;
+            emu_.write(dst, joined.c_str(), joined.size() + 1);
+            return dst;
+        };
+        import_handlers_["strchr"] = [this] {
+            const uint32_t s = arg(0);
+            const char c = static_cast<char>(arg(1) & 0xFFu);
+            const std::string str = guest_string(s);
+            const size_t at = str.find(c);
+            if (at != std::string::npos) return s + static_cast<uint32_t>(at);
+            return c == 0 ? s + static_cast<uint32_t>(str.size()) : 0u;
+        };
+        import_handlers_["strrchr"] = [this] {
+            const uint32_t s = arg(0);
+            const char c = static_cast<char>(arg(1) & 0xFFu);
+            const std::string str = guest_string(s);
+            const size_t at = str.rfind(c);
+            if (at != std::string::npos) return s + static_cast<uint32_t>(at);
+            return c == 0 ? s + static_cast<uint32_t>(str.size()) : 0u;
+        };
+        import_handlers_["strstr"] = [this] {
+            const uint32_t h = arg(0);
+            const std::string hay = guest_string(h);
+            const std::string needle = guest_string(arg(1));
+            const size_t at = hay.find(needle);
+            return at == std::string::npos ? 0u : h + static_cast<uint32_t>(at);
+        };
+        import_handlers_["strdup"] = [this] { return strdup_into_guest(arg(0), SIZE_MAX); };
+        import_handlers_["strndup"] = [this] { return strdup_into_guest(arg(0), arg(1)); };
+        import_handlers_["atoi"] = [this] {
+            return static_cast<uint32_t>(std::strtol(guest_string(arg(0)).c_str(), nullptr, 10));
+        };
+        import_handlers_["atol"] = [this] {
+            return static_cast<uint32_t>(std::strtol(guest_string(arg(0)).c_str(), nullptr, 10));
+        };
+        import_handlers_["strtol"] = [this] {
+            const std::string s = guest_string(arg(0));
+            const uint32_t endp = arg(1);
+            char* end = nullptr;
+            const long v = std::strtol(s.c_str(), &end, static_cast<int>(arg(2)));
+            if (endp) {
+                emu_.write_u32(endp, arg(0) + static_cast<uint32_t>(end ? end - s.c_str() : 0));
+            }
+            return static_cast<uint32_t>(v);
+        };
+        import_handlers_["strtoul"] = [this] {
+            const std::string s = guest_string(arg(0));
+            return static_cast<uint32_t>(std::strtoul(s.c_str(), nullptr, static_cast<int>(arg(2))));
+        };
+
+        // ---------------- libm (softfp in / softfp out) -----------------
+        auto un_f = [this](float (*fn)(float)) {
+            return [this, fn] { return ret_f(fn(f_arg(0))); };
+        };
+        auto un_d = [this](double (*fn)(double)) {
+            return [this, fn] { return ret_d(fn(d_arg(0))); };
+        };
+        auto bi_f = [this](float (*fn)(float, float)) {
+            return [this, fn] { return ret_f(fn(f_arg(0), f_arg(1))); };
+        };
+        auto bi_d = [this](double (*fn)(double, double)) {
+            return [this, fn] { return ret_d(fn(d_arg(0), d_arg(2))); };
+        };
+
+        import_handlers_["sqrtf"]  = un_f(::sqrtf);
+        import_handlers_["sinf"]   = un_f(::sinf);
+        import_handlers_["cosf"]   = un_f(::cosf);
+        import_handlers_["tanf"]   = un_f(::tanf);
+        import_handlers_["asinf"]  = un_f(::asinf);
+        import_handlers_["acosf"]  = un_f(::acosf);
+        import_handlers_["atanf"]  = un_f(::atanf);
+        import_handlers_["expf"]   = un_f(::expf);
+        import_handlers_["logf"]   = un_f(::logf);
+        import_handlers_["log10f"] = un_f(::log10f);
+        import_handlers_["floorf"] = un_f(::floorf);
+        import_handlers_["ceilf"]  = un_f(::ceilf);
+        import_handlers_["fabsf"]  = un_f(::fabsf);
+        import_handlers_["roundf"] = un_f(::roundf);
+        import_handlers_["truncf"] = un_f(::truncf);
+
+        import_handlers_["sqrt"]  = un_d(::sqrt);
+        import_handlers_["sin"]   = un_d(::sin);
+        import_handlers_["cos"]   = un_d(::cos);
+        import_handlers_["tan"]   = un_d(::tan);
+        import_handlers_["asin"]  = un_d(::asin);
+        import_handlers_["acos"]  = un_d(::acos);
+        import_handlers_["atan"]  = un_d(::atan);
+        import_handlers_["exp"]   = un_d(::exp);
+        import_handlers_["log"]   = un_d(::log);
+        import_handlers_["log10"] = un_d(::log10);
+        import_handlers_["floor"] = un_d(::floor);
+        import_handlers_["ceil"]  = un_d(::ceil);
+        import_handlers_["fabs"]  = un_d(::fabs);
+        import_handlers_["round"] = un_d(::round);
+        import_handlers_["trunc"] = un_d(::trunc);
+
+        import_handlers_["powf"]   = bi_f(::powf);
+        import_handlers_["fmodf"]  = bi_f(::fmodf);
+        import_handlers_["atan2f"] = bi_f(::atan2f);
+        import_handlers_["fminf"]  = bi_f(::fminf);
+        import_handlers_["fmaxf"]  = bi_f(::fmaxf);
+
+        import_handlers_["pow"]   = bi_d(::pow);
+        import_handlers_["fmod"]  = bi_d(::fmod);
+        import_handlers_["atan2"] = bi_d(::atan2);
+        import_handlers_["fmin"]  = bi_d(::fmin);
+        import_handlers_["fmax"]  = bi_d(::fmax);
+
+        import_handlers_["modf"] = [this] {
+            const double v = d_arg(0);
+            double ip = 0;
+            const double fp = ::modf(v, &ip);
+            const uint32_t out = arg(2);
+            if (out) write_double(out, ip);
+            return ret_d(fp);
+        };
+        import_handlers_["modff"] = [this] {
+            const float v = f_arg(0);
+            float ip = 0;
+            const float fp = ::modff(v, &ip);
+            const uint32_t out = arg(1);
+            if (out) emu_.write_u32(out, ret_f(ip));
+            return ret_f(fp);
+        };
+        import_handlers_["ldexp"] = [this] { return ret_d(::ldexp(d_arg(0), static_cast<int>(arg(2)))); };
+        import_handlers_["frexp"] = [this] {
+            int e = 0;
+            const double m = ::frexp(d_arg(0), &e);
+            const uint32_t out = arg(2);
+            if (out) emu_.write_u32(out, static_cast<uint32_t>(e));
+            return ret_d(m);
+        };
+
+        // ---------------- ARM AEABI helpers -----------------------------
+        // These are the ARM-specific runtime routines the compiler emits for
+        // conversions and 64-bit division; without them every float-to-int cast
+        // in the game lands on a stub that returns 0.
+        import_handlers_["__aeabi_d2lz"] = [this] { return ret_i64(static_cast<long long>(d_arg(0))); };
+        import_handlers_["__aeabi_d2ulz"] = [this] { return ret_i64(static_cast<long long>(static_cast<unsigned long long>(d_arg(0)))); };
+        import_handlers_["__aeabi_f2lz"] = [this] { return ret_i64(static_cast<long long>(f_arg(0))); };
+        import_handlers_["__aeabi_f2ulz"] = [this] { return ret_i64(static_cast<long long>(static_cast<unsigned long long>(f_arg(0)))); };
+        import_handlers_["__aeabi_d2iz"] = [this] { return static_cast<uint32_t>(static_cast<int>(d_arg(0))); };
+        import_handlers_["__aeabi_d2uiz"] = [this] { return static_cast<uint32_t>(static_cast<unsigned>(d_arg(0))); };
+        import_handlers_["__aeabi_f2iz"] = [this] { return static_cast<uint32_t>(static_cast<int>(f_arg(0))); };
+        import_handlers_["__aeabi_f2uiz"] = [this] { return static_cast<uint32_t>(static_cast<unsigned>(f_arg(0))); };
+        import_handlers_["__aeabi_l2f"] = [this] {
+            return ret_f(static_cast<float>(static_cast<long long>(d_arg(0))));
+        };
+        import_handlers_["__aeabi_ul2f"] = [this] {
+            const uint64_t v = static_cast<uint64_t>(arg(0)) | (static_cast<uint64_t>(arg(1)) << 32);
+            return ret_f(static_cast<float>(v));
+        };
+        import_handlers_["__aeabi_l2d"] = [this] {
+            return ret_d(static_cast<double>(static_cast<long long>(d_arg(0))));
+        };
+        import_handlers_["__aeabi_i2f"] = [this] { return ret_f(static_cast<float>(static_cast<int32_t>(arg(0)))); };
+        import_handlers_["__aeabi_ui2f"] = [this] { return ret_f(static_cast<float>(arg(0))); };
+        import_handlers_["__aeabi_i2d"] = [this] { return ret_d(static_cast<double>(static_cast<int32_t>(arg(0)))); };
+        import_handlers_["__aeabi_ui2d"] = [this] { return ret_d(static_cast<double>(arg(0))); };
+        import_handlers_["__aeabi_f2d"] = [this] { return ret_d(static_cast<double>(f_arg(0))); };
+        import_handlers_["__aeabi_d2f"] = [this] { return ret_f(static_cast<float>(d_arg(0))); };
+        import_handlers_["__aeabi_idiv"] = [this] {
+            const int32_t b = static_cast<int32_t>(arg(1));
+            return b == 0 ? 0u : static_cast<uint32_t>(static_cast<int32_t>(arg(0)) / b);
+        };
+        import_handlers_["__aeabi_uidiv"] = [this] {
+            const uint32_t b = arg(1);
+            return b == 0 ? 0u : arg(0) / b;
+        };
+        import_handlers_["__aeabi_idivmod"] = [this] {
+            const int32_t a = static_cast<int32_t>(arg(0));
+            const int32_t b = static_cast<int32_t>(arg(1));
+            if (b == 0) return 0u;
+            emu_.reg_write(UC_ARM_REG_R1, static_cast<uint32_t>(a % b));
+            return static_cast<uint32_t>(a / b);
+        };
+        import_handlers_["__aeabi_uidivmod"] = [this] {
+            const uint32_t a = arg(0), b = arg(1);
+            if (b == 0) return 0u;
+            emu_.reg_write(UC_ARM_REG_R1, a % b);
+            return a / b;
+        };
+
+        // ---------------- pthread / TLS ---------------------------------
+        import_handlers_["pthread_once"] = [this] { return imp_pthread_once(); };
+        import_handlers_["pthread_key_create"] = [this] { return imp_pthread_key_create(); };
+        import_handlers_["pthread_getspecific"] = [this] { return imp_pthread_getspecific(); };
+        import_handlers_["pthread_setspecific"] = [this] { return imp_pthread_setspecific(); };
+        import_handlers_["pthread_self"] = [] { return 1u; };
+        import_handlers_["pthread_equal"] = [this] {
+            return arg(0) == arg(1) ? 1u : 0u;
+        };
+        import_handlers_["pthread_create"] = [this] {
+            LOGW("pthread_create(%s): guest threads are not emulated, returning EAGAIN",
+                 guest_string(arg(2)).c_str());
+            return 11u;   // EAGAIN: the engine falls back to its sync path
+        };
+        import_handlers_["pthread_join"] = [] { return 0u; };
+        import_handlers_["pthread_detach"] = [] { return 0u; };
+        for (const char* n : {"pthread_mutex_init", "pthread_mutex_lock", "pthread_mutex_trylock",
+                              "pthread_mutex_unlock", "pthread_mutex_destroy",
+                              "pthread_mutexattr_init", "pthread_mutexattr_settype",
+                              "pthread_mutexattr_destroy",
+                              "pthread_cond_init", "pthread_cond_wait", "pthread_cond_timedwait",
+                              "pthread_cond_signal", "pthread_cond_broadcast",
+                              "pthread_cond_destroy", "pthread_condattr_init",
+                              "pthread_condattr_destroy", "pthread_condattr_setclock",
+                              "pthread_rwlock_init", "pthread_rwlock_rdlock",
+                              "pthread_rwlock_wrlock", "pthread_rwlock_unlock",
+                              "pthread_rwlock_destroy", "pthread_attr_init",
+                              "pthread_attr_destroy", "pthread_attr_setdetachstate",
+                              "pthread_attr_setstacksize", "pthread_attr_setschedparam",
+                              "pthread_attr_getschedparam", "pthread_attr_setschedpolicy",
+                              "pthread_attr_setguardsize", "pthread_setname_np"}) {
+            import_handlers_[n] = [] { return 0u; };
+        }
+
+        import_handlers_["sem_init"] = [this] {
+            const uint32_t sem = arg(0);
+            if (sem) emu_.write_u32(sem, arg(2));
+            return 0u;
+        };
+        import_handlers_["sem_destroy"] = [] { return 0u; };
+        import_handlers_["sem_wait"] = [] { return 0u; };
+        import_handlers_["sem_trywait"] = [] { return 0u; };
+        import_handlers_["sem_timedwait"] = [] { return 0u; };
+        import_handlers_["sem_post"] = [] { return 0u; };
+        import_handlers_["sem_getvalue"] = [this] {
+            const uint32_t out = arg(1);
+            if (out) emu_.write_u32(out, 1);
+            return 0u;
+        };
+
+        // ---------------- time / scheduling -----------------------------
+        import_handlers_["gettimeofday"] = [this] { return imp_gettimeofday(); };
+        import_handlers_["clock_gettime"] = [this] { return imp_clock_gettime(); };
+        import_handlers_["time"] = [this] {
+            const uint32_t out = arg(0);
+            const uint32_t now = static_cast<uint32_t>(::time(nullptr));
+            if (out) emu_.write_u32(out, now);
+            return now;
+        };
+        import_handlers_["clock"] = [] { return static_cast<uint32_t>(::clock()); };
+        import_handlers_["usleep"] = [this] {
+            ::usleep(arg(0));
+            return 0u;
+        };
+        import_handlers_["sleep"] = [this] {
+            ::sleep(arg(0));
+            return 0u;
+        };
+        import_handlers_["sched_yield"] = [] { return 0u; };
+
+        // ---------------- file / stdio ----------------------------------
+        import_handlers_["open"]    = [this] { return imp_open(); };
+        import_handlers_["close"]   = [this] { return imp_close(); };
+        import_handlers_["read"]    = [this] { return imp_read(); };
+        import_handlers_["write"]   = [this] { return imp_write(); };
+        import_handlers_["lseek"]   = [this] { return imp_lseek(); };
+        import_handlers_["lseek64"] = [this] { return imp_lseek(); };
+        import_handlers_["fstat"]   = [this] { return imp_stat_common(true); };
+        import_handlers_["stat"]    = [this] { return imp_stat_common(false); };
+        import_handlers_["access"]  = [this] {
+            const std::string p = guest_string(arg(0));
+            return ::access(p.c_str(), static_cast<int>(arg(1))) == 0 ? 0u
+                                                                      : static_cast<uint32_t>(-1);
+        };
+        import_handlers_["unlink"] = [this] {
+            return ::unlink(guest_string(arg(0)).c_str()) == 0 ? 0u : static_cast<uint32_t>(-1);
+        };
+        import_handlers_["rename"] = [this] {
+            return ::rename(guest_string(arg(0)).c_str(), guest_string(arg(1)).c_str()) == 0
+                       ? 0u : static_cast<uint32_t>(-1);
+        };
+        import_handlers_["mkdir"] = [this] {
+            return ::mkdir(guest_string(arg(0)).c_str(), static_cast<mode_t>(arg(1))) == 0
+                       ? 0u : static_cast<uint32_t>(-1);
+        };
+        import_handlers_["rmdir"] = [this] {
+            return ::rmdir(guest_string(arg(0)).c_str()) == 0 ? 0u : static_cast<uint32_t>(-1);
+        };
+        import_handlers_["chmod"] = [this] {
+            return ::chmod(guest_string(arg(0)).c_str(), static_cast<mode_t>(arg(1))) == 0
+                       ? 0u : static_cast<uint32_t>(-1);
+        };
+        import_handlers_["ftruncate"] = [this] {
+            const int fd = host_fd(arg(0));
+            if (fd < 0) return static_cast<uint32_t>(-1);
+            return ::ftruncate(fd, static_cast<off_t>(arg(1))) == 0 ? 0u
+                                                                   : static_cast<uint32_t>(-1);
+        };
+        import_handlers_["fsync"] = [this] {
+            const int fd = host_fd(arg(0));
+            if (fd < 0) return static_cast<uint32_t>(-1);
+            return ::fsync(fd) == 0 ? 0u : static_cast<uint32_t>(-1);
+        };
+        import_handlers_["opendir"]  = [this] { return imp_opendir(); };
+        import_handlers_["readdir"]  = [this] { return imp_readdir(); };
+        import_handlers_["closedir"] = [this] { return imp_closedir(); };
+
+        import_handlers_["fopen"]  = [this] { return imp_fopen(); };
+        import_handlers_["fread"]  = [this] { return imp_fread(); };
+        import_handlers_["fwrite"] = [this] { return imp_fwrite(); };
+        import_handlers_["fclose"] = [this] {
+            FILE* f = host_file(arg(0));
+            if (!f) return static_cast<uint32_t>(-1);
+            ::fclose(f);
+            file_map_.erase(arg(0));
+            return 0u;
+        };
+        import_handlers_["fseek"] = [this] {
+            FILE* f = host_file(arg(0));
+            if (!f) return static_cast<uint32_t>(-1);
+            return ::fseek(f, static_cast<long>(arg(1)), static_cast<int>(arg(2))) == 0
+                       ? 0u : static_cast<uint32_t>(-1);
+        };
+        import_handlers_["ftell"] = [this] {
+            FILE* f = host_file(arg(0));
+            return f ? static_cast<uint32_t>(::ftell(f)) : static_cast<uint32_t>(-1);
+        };
+        import_handlers_["feof"] = [this] {
+            FILE* f = host_file(arg(0));
+            return f ? static_cast<uint32_t>(::feof(f)) : 0u;
+        };
+        import_handlers_["fflush"] = [this] {
+            FILE* f = host_file(arg(0));
+            return ::fflush(f) == 0 ? 0u : static_cast<uint32_t>(-1);
+        };
+        import_handlers_["fgetc"] = [this] {
+            FILE* f = host_file(arg(0));
+            return f ? static_cast<uint32_t>(::fgetc(f)) : static_cast<uint32_t>(-1);
+        };
+        import_handlers_["putc"] = [this] {
+            FILE* f = host_file(arg(1));
+            return f ? static_cast<uint32_t>(::putc(static_cast<int>(arg(0)), f))
+                     : static_cast<uint32_t>(-1);
+        };
+        import_handlers_["fgets"] = [this] {
+            FILE* f = host_file(arg(2));
+            if (!f) return 0u;
+            char tmp[1024];
+            const int n = static_cast<int>(std::min<uint32_t>(arg(1), sizeof tmp));
+            if (!::fgets(tmp, n, f)) return 0u;
+            emu_.write(arg(0), tmp, std::strlen(tmp) + 1);
+            return arg(0);
+        };
+        import_handlers_["fileno"] = [this] {
+            FILE* f = host_file(arg(0));
+            if (!f) return static_cast<uint32_t>(-1);
+            const uint32_t g = next_handle_++;
+            fd_map_[g] = ::fileno(f);
+            return g;
+        };
+
+        // ---------------- misc libc -------------------------------------
+        import_handlers_["__errno"] = [this] { return errno_cell_; };
+        import_handlers_["__stack_chk_fail"] = [this] {
+            LOGE("guest stack protector tripped (__stack_chk_fail) - stopping");
+            emu_.reg_write(UC_ARM_REG_PC, kReturnSentinel);
+            redirected_ = true;
+            return 0u;
+        };
+        import_handlers_["abort"] = [this] { return imp_abort(); };
+        import_handlers_["exit"] = [this] { return imp_abort(); };
+        import_handlers_["_exit"] = [this] { return imp_abort(); };
+        import_handlers_["__assert2"] = [this] { return imp_assert2(); };
+        import_handlers_["__assert"] = [this] { return imp_assert2(); };
+        import_handlers_["sysconf"] = [this] { return imp_sysconf(); };
+        import_handlers_["getenv"] = [this] {
+            LOGI("getenv(%s) -> (unset)", guest_string(arg(0)).c_str());
+            return 0u;
+        };
+        import_handlers_["setenv"] = [] { return 0u; };
+        import_handlers_["getpid"] = [] { return static_cast<uint32_t>(::getpid()); };
+        import_handlers_["getegid"] = [] { return static_cast<uint32_t>(::getegid()); };
+        import_handlers_["getuid"] = [] { return static_cast<uint32_t>(::getuid()); };
+        import_handlers_["prctl"] = [] { return 0u; };
+        import_handlers_["syscall"] = [] { return static_cast<uint32_t>(-1); };
+        import_handlers_["system"] = [] { return static_cast<uint32_t>(-1); };
+        import_handlers_["waitpid"] = [] { return static_cast<uint32_t>(-1); };
+        import_handlers_["dup2"] = [] { return static_cast<uint32_t>(-1); };
+        import_handlers_["setjmp"] = [] { return 0u; };
+        import_handlers_["sigsetjmp"] = [] { return 0u; };
+        import_handlers_["__aeabi_atexit"] = [] { return 0u; };
+        import_handlers_["fwide"] = [] { return 0u; };
+        import_handlers_["strncasecmp"] = [this] {
+            const std::string a = guest_string(arg(0));
+            const std::string b = guest_string(arg(1));
+            return static_cast<uint32_t>(::strncasecmp(a.c_str(), b.c_str(), arg(2)));
+        };
+        import_handlers_["strpbrk"] = [this] {
+            const uint32_t s = arg(0);
+            const std::string hay = guest_string(s);
+            const std::string set = guest_string(arg(1));
+            const size_t at = hay.find_first_of(set);
+            return at == std::string::npos ? 0u : s + static_cast<uint32_t>(at);
+        };
+        import_handlers_["memrchr"] = [this] {
+            uint32_t base = arg(0);
+            const uint8_t want = static_cast<uint8_t>(arg(1) & 0xFFu);
+            uint32_t n = arg(2);
+            while (n--) {
+                uint8_t c = 0;
+                if (!emu_.read(base + n, &c, 1)) return 0u;
+                if (c == want) return base + n;
+            }
+            return 0u;
+        };
+        import_handlers_["btowc"] = [this] { return arg(0) & 0xFFu; };
+        import_handlers_["strtok_r"] = [this] {
+            const uint32_t savep = arg(2);
+            const std::string delim = guest_string(arg(1));
+            uint32_t cur = arg(0) ? arg(0) : (savep ? emu_.read_u32(savep) : 0);
+            if (!cur) return 0u;
+
+            auto is_delim = [&](uint8_t c) {
+                return c != 0 && delim.find(static_cast<char>(c)) != std::string::npos;
+            };
+
+            for (;;) {                      // skip leading delimiters
+                uint8_t c = 0;
+                if (!emu_.read(cur, &c, 1) || c == 0) {
+                    if (savep) emu_.write_u32(savep, 0);
+                    return 0u;
+                }
+                if (!is_delim(c)) break;
+                ++cur;
+            }
+
+            const uint32_t start = cur;
+            for (;;) {                      // find the end of the token
+                uint8_t c = 0;
+                if (!emu_.read(cur, &c, 1) || c == 0) {
+                    if (savep) emu_.write_u32(savep, 0);
+                    return start;
+                }
+                if (is_delim(c)) {
+                    const uint8_t zero = 0;
+                    emu_.write(cur, &zero, 1);
+                    if (savep) emu_.write_u32(savep, cur + 1);
+                    return start;
+                }
+                ++cur;
+            }
+        };
+        for (const char* n : {"isalpha", "isprint", "isgraph", "isdigit", "isspace",
+                              "isalnum", "isupper", "islower", "isxdigit", "ispunct",
+                              "iscntrl", "toupper", "tolower"}) {
+            const std::string name = n;
+            import_handlers_[n] = [this, name] {
+                const int c = static_cast<int>(arg(0) & 0xFFu);
+                if (name == "toupper") return static_cast<uint32_t>(::toupper(c));
+                if (name == "tolower") return static_cast<uint32_t>(::tolower(c));
+                if (name == "isalpha") return ::isalpha(c) ? 1u : 0u;
+                if (name == "isprint") return ::isprint(c) ? 1u : 0u;
+                if (name == "isgraph") return ::isgraph(c) ? 1u : 0u;
+                if (name == "isdigit") return ::isdigit(c) ? 1u : 0u;
+                if (name == "isspace") return ::isspace(c) ? 1u : 0u;
+                if (name == "isalnum") return ::isalnum(c) ? 1u : 0u;
+                if (name == "isupper") return ::isupper(c) ? 1u : 0u;
+                if (name == "islower") return ::islower(c) ? 1u : 0u;
+                if (name == "isxdigit") return ::isxdigit(c) ? 1u : 0u;
+                if (name == "ispunct") return ::ispunct(c) ? 1u : 0u;
+                return ::iscntrl(c) ? 1u : 0u;
+            };
+        }
+        import_handlers_["getauxval"] = [this] {
+            return arg(0) == 6 ? 4096u : 0u;   // AT_PAGESZ
+        };
+        import_handlers_["__cxa_atexit"] = [] { return 0u; };
+        import_handlers_["__cxa_finalize"] = [] { return 0u; };
+        import_handlers_["dlopen"] = [this] {
+            LOGW("dlopen(%s) unsupported in guest", guest_string(arg(0)).c_str());
+            return 0u;
+        };
+        import_handlers_["dlsym"] = [] { return 0u; };
+        import_handlers_["dlclose"] = [] { return 0u; };
+        import_handlers_["dlerror"] = [] { return 0u; };
+        import_handlers_["dladdr"] = [] { return 0u; };
+        import_handlers_["__gnu_Unwind_Find_exidx"] = [] { return 0u; };
+        import_handlers_["fork"] = [] { return static_cast<uint32_t>(-1); };
+        import_handlers_["execv"] = [] { return static_cast<uint32_t>(-1); };
+        import_handlers_["execl"] = [] { return static_cast<uint32_t>(-1); };
+        for (const char* n : {"sigaction", "sigprocmask", "sigemptyset", "sigfillset",
+                              "sigaddset", "sigdelset", "sigismember", "signal",
+                              "pthread_sigmask", "setpriority", "nice", "setbuf",
+                              "pthread_attr_setstack", "pthread_getattr_np",
+                              "pthread_getschedparam", "pthread_exit", "gmtime_r",
+                              "localtime_r"}) {
+            import_handlers_[n] = [] { return 0u; };
+        }
+        import_handlers_["getpwuid_r"] = [] { return static_cast<uint32_t>(-1); };
+        for (const char* n : {"AndroidBitmap_getInfo", "AndroidBitmap_lockPixels",
+                              "AndroidBitmap_unlockPixels"}) {
+            import_handlers_[n] = [] { return static_cast<uint32_t>(-1); };
+        }
+
+        // ---------------- liblog ----------------------------------------
+        import_handlers_["__android_log_print"] = [this] { return imp_log_print(); };
+        import_handlers_["__android_log_write"] = [this] {
+            const std::string text = guest_string(arg(2));
+            __android_log_print(static_cast<int>(arg(0)),
+                                guest_string(arg(1)).c_str(), "%s", text.c_str());
+            return static_cast<uint32_t>(text.size());
+        };
+        import_handlers_["__android_log_assert"] = [this] {
+            LOGE("guest assert: %s", guest_string(arg(2)).c_str());
+            return 0u;
+        };
+        import_handlers_["__android_log_vprint"] = [this] { return imp_log_print(); };
+    }
+
+    // malloc'd copy of a guest string, owned by the guest heap.
+    uint32_t strdup_into_guest(uint32_t src, size_t cap) {
+        const std::string s = guest_string(src);
+        const size_t n = std::min(s.size(), cap == SIZE_MAX ? s.size() : cap);
+        const uint32_t at = guest_alloc(n + 1);
+        if (!at) return 0;
+        emu_.write(at, s.data(), n);
+        emu_.write_u32(at + static_cast<uint32_t>(n), 0);
+        return at;
+    }
+
+    // =====================================================================
+    // Bionic / libm / liblog import bridging
+    //
+    // These handlers run as host code but every argument and result is a
+    // 32-bit guest address. Two consequences drive the implementation:
+    //   * allocation is served from the emulated heap, never from host
+    //     malloc(), because a 64-bit host pointer cannot be returned in R0;
+    //   * the memory routines copy through the emulator's address space
+    //     instead of calling the host memcpy() on guest addresses.
+    // =====================================================================
+    uint32_t guest_alloc(size_t n) {
+        if (n == 0) n = 1;
+        const uint32_t p = emu_.alloc(n, 8);
+        if (p) guest_allocs_[p] = n;
+        return p;
+    }
+
+    void copy_guest(uint32_t src, uint32_t dst, uint32_t n) {
+        uint8_t buf[4096];
+        while (n > 0) {
+            const size_t chunk = std::min<size_t>(n, sizeof buf);
+            if (!emu_.read(src, buf, chunk)) {
+                LOGW("memcpy: unreadable source %08x", src);
+                return;
+            }
+            if (!emu_.write(dst, buf, chunk)) {
+                LOGW("memcpy: unwritable destination %08x", dst);
+                return;
+            }
+            src += static_cast<uint32_t>(chunk);
+            dst += static_cast<uint32_t>(chunk);
+            n -= static_cast<uint32_t>(chunk);
+        }
+    }
+
+    size_t guest_strlen(uint32_t addr) {
+        constexpr size_t kCap = 1u << 20;
+        uint8_t buf[256];
+        size_t len = 0;
+        while (len < kCap) {
+            const size_t chunk = std::min<size_t>(sizeof buf, kCap - len);
+            if (!emu_.read(addr + static_cast<uint32_t>(len), buf, chunk)) break;
+            for (size_t i = 0; i < chunk; ++i) {
+                if (buf[i] == 0) return len + i;
+            }
+            len += chunk;
+        }
+        return len;
+    }
+
+    uint32_t imp_malloc() { return guest_alloc(arg(0)); }
+
+    uint32_t imp_calloc() {
+        const uint64_t total = static_cast<uint64_t>(arg(0)) * static_cast<uint64_t>(arg(1));
+        if (total > 0x7FFFFFFFu) return 0;
+        // The heap arena is mapped zeroed and never recycled, so fresh
+        // allocations are already content-free.
+        return guest_alloc(static_cast<size_t>(total));
+    }
+
+    uint32_t imp_realloc() {
+        const uint32_t old_p = arg(0);
+        const uint32_t size = arg(1);
+        if (!old_p) return guest_alloc(size);
+
+        auto it = guest_allocs_.find(old_p);
+        const size_t old_size = it == guest_allocs_.end() ? 0 : it->second;
+        const uint32_t new_p = guest_alloc(size);
+        if (!new_p) return 0;
+        copy_guest(old_p, new_p, static_cast<uint32_t>(std::min<size_t>(old_size, size)));
+        if (it != guest_allocs_.end()) {
+            emu_.release(old_p, it->second);
+            guest_allocs_.erase(it);
+        }
+        return new_p;
+    }
+
+    uint32_t imp_free() {
+        const uint32_t p = arg(0);
+        auto it = guest_allocs_.find(p);
+        if (it == guest_allocs_.end()) return 0;   // not ours: ignore
+        emu_.release(it->first, it->second);
+        guest_allocs_.erase(it);
+        return 0;
+    }
+
+    uint32_t imp_memcpy() {
+        const uint32_t dst = arg(0);
+        copy_guest(arg(1), dst, arg(2));
+        return dst;
+    }
+
+    // memmove semantics matter: the ARM32 `__aeabi_memmove` call sites rely on
+    // overlapping regions being handled correctly.
+    uint32_t imp_memmove() {
+        const uint32_t dst = arg(0), src = arg(1), n = arg(2);
+        if (overlaps(dst, src, n)) {
+            std::vector<uint8_t> tmp(n);
+            if (n && !emu_.read(src, tmp.data(), n)) return dst;
+            if (n) emu_.write(dst, tmp.data(), n);
+        } else {
+            copy_guest(src, dst, n);
+        }
+        return dst;
+    }
+
+    static bool overlaps(uint32_t a, uint32_t b, uint32_t n) {
+        if (n == 0) return false;
+        return a < b + n && b < a + n;
+    }
+
+    uint32_t imp_memset() {
+        const uint32_t dst = arg(0);
+        const uint8_t c = static_cast<uint8_t>(arg(1) & 0xFFu);
+        uint32_t n = arg(2);
+        uint8_t buf[1024];
+        std::memset(buf, c, sizeof buf);
+        uint32_t at = dst;
+        while (n > 0) {
+            const size_t chunk = std::min<size_t>(n, sizeof buf);
+            if (!emu_.write(at, buf, chunk)) break;
+            at += static_cast<uint32_t>(chunk);
+            n -= static_cast<uint32_t>(chunk);
+        }
+        return dst;
+    }
+
+    // __aeabi_memset(dst, n, c) - note the swapped n/c order versus memset().
+    uint32_t imp_aeabi_memset() {
+        uint32_t dst = arg(0), n = arg(1);
+        const uint8_t c = static_cast<uint8_t>(arg(2) & 0xFFu);
+        uint8_t buf[1024];
+        std::memset(buf, c, sizeof buf);
+        const uint32_t start = dst;
+        while (n > 0) {
+            const size_t chunk = std::min<size_t>(n, sizeof buf);
+            if (!emu_.write(dst, buf, chunk)) break;
+            dst += static_cast<uint32_t>(chunk);
+            n -= static_cast<uint32_t>(chunk);
+        }
+        return start;
+    }
+
+    uint32_t imp_memclr() {
+        uint32_t dst = arg(0), n = arg(1);
+        const uint32_t start = dst;
+        uint8_t zero[1024] = {};
+        while (n > 0) {
+            const size_t chunk = std::min<size_t>(n, sizeof zero);
+            if (!emu_.write(dst, zero, chunk)) break;
+            dst += static_cast<uint32_t>(chunk);
+            n -= static_cast<uint32_t>(chunk);
+        }
+        return start;
+    }
+
+    uint32_t imp_memcmp() {
+        uint32_t a = arg(0), b = arg(1), n = arg(2);
+        uint8_t ba[512], bb[512];
+        while (n > 0) {
+            const size_t chunk = std::min<size_t>(n, sizeof ba);
+            if (!emu_.read(a, ba, chunk) || !emu_.read(b, bb, chunk)) return 0;
+            const int r = std::memcmp(ba, bb, chunk);
+            if (r) return static_cast<uint32_t>(r);
+            a += static_cast<uint32_t>(chunk);
+            b += static_cast<uint32_t>(chunk);
+            n -= static_cast<uint32_t>(chunk);
+        }
+        return 0;
+    }
+
+    uint32_t imp_strlen() { return static_cast<uint32_t>(guest_strlen(arg(0))); }
+
+    uint32_t imp_strcpy() {
+        const uint32_t dst = arg(0), src = arg(1);
+        const size_t len = guest_strlen(src);
+        std::vector<uint8_t> buf(len + 1, 0);
+        if (len && !emu_.read(src, buf.data(), len)) return dst;
+        emu_.write(dst, buf.data(), buf.size());
+        return dst;
+    }
+
+    uint32_t imp_strcmp() {
+        const std::string a = guest_string(arg(0));
+        const std::string b = guest_string(arg(1));
+        return static_cast<uint32_t>(std::strcmp(a.c_str(), b.c_str()));
+    }
+
+    static uint64_t read_u64(const std::function<uint32_t()>& next) {
+        const uint64_t lo = next();
+        const uint64_t hi = next();
+        return lo | (hi << 32);
+    }
+
+    static double read_double(const std::function<uint32_t()>& next) {
+        const uint64_t bits = read_u64(next);
+        double d = 0;
+        std::memcpy(&d, &bits, sizeof d);
+        return d;
+    }
+
+    // Rewrites a guest format string against guest varargs, so the host logger
+    // never sees a 32-bit guest pointer.
+    std::string format_guest(const std::string& fmt,
+                             const std::function<uint32_t()>& next) {
+        std::string out;
+        char tmp[512];
+
+        for (size_t i = 0; i < fmt.size(); ++i) {
+            if (fmt[i] != '%') { out.push_back(fmt[i]); continue; }
+            if (i + 1 >= fmt.size()) { out.push_back('%'); break; }
+            if (fmt[i + 1] == '%') { out.push_back('%'); ++i; continue; }
+
+            size_t j = i + 1;
+            std::string spec = "%";
+            while (j < fmt.size() && std::strchr("-+ #0", fmt[j]) != nullptr) {
+                spec.push_back(fmt[j++]);
+            }
+            while (j < fmt.size() && std::isdigit(static_cast<unsigned char>(fmt[j]))) {
+                spec.push_back(fmt[j++]);
+            }
+            if (j < fmt.size() && fmt[j] == '.') {
+                spec.push_back(fmt[j++]);
+                while (j < fmt.size() && std::isdigit(static_cast<unsigned char>(fmt[j]))) {
+                    spec.push_back(fmt[j++]);
+                }
+            }
+            std::string len;
+            while (j < fmt.size() && std::strchr("hljztL", fmt[j]) != nullptr) {
+                len.push_back(fmt[j]);
+                spec.push_back(fmt[j]);
+                ++j;
+            }
+            if (j >= fmt.size()) break;
+
+            const char conv = fmt[j];
+            spec.push_back(conv);
+            const bool wide = len.find("ll") != std::string::npos;
+
+            switch (conv) {
+                case 's': {
+                    const uint32_t p = next();
+                    const std::string s = p ? guest_string(p) : std::string("(null)");
+                    snprintf(tmp, sizeof tmp, spec.c_str(), s.c_str());
+                    out += tmp;
+                    break;
+                }
+                case 'd': case 'i':
+                    if (wide) {
+                        snprintf(tmp, sizeof tmp, spec.c_str(),
+                                 static_cast<long long>(read_u64(next)));
+                    } else {
+                        snprintf(tmp, sizeof tmp, spec.c_str(), static_cast<int>(next()));
+                    }
+                    out += tmp;
+                    break;
+                case 'u': case 'o': case 'x': case 'X':
+                    if (wide) {
+                        snprintf(tmp, sizeof tmp, spec.c_str(),
+                                 static_cast<unsigned long long>(read_u64(next)));
+                    } else {
+                        snprintf(tmp, sizeof tmp, spec.c_str(), static_cast<unsigned>(next()));
+                    }
+                    out += tmp;
+                    break;
+                case 'c':
+                    out.push_back(static_cast<char>(next() & 0xFFu));
+                    break;
+                case 'p':
+                    snprintf(tmp, sizeof tmp, "0x%08x", next());
+                    out += tmp;
+                    break;
+                case 'f': case 'F': case 'g': case 'G': case 'e': case 'E':
+                    snprintf(tmp, sizeof tmp, spec.c_str(), read_double(next));
+                    out += tmp;
+                    break;
+                default:
+                    out += spec;
+                    break;
+            }
+            i = j;
+        }
+        return out;
+    }
+
+    uint32_t imp_log_print() {
+        const int prio = static_cast<int>(arg(0));
+        const std::string tag = guest_string(arg(1));
+        const std::string fmt = guest_string(arg(2));
+
+        // ARM32: varargs start in R3 and continue on the stack at [SP].
+        uint32_t sp = 0;
+        emu_.reg_read(UC_ARM_REG_SP, sp);
+        size_t index = 0;
+        auto next = [&]() -> uint32_t {
+            if (index == 0) { ++index; return arg(3); }
+            const uint32_t v = emu_.read_u32(sp + static_cast<uint32_t>((index - 1) * 4));
+            ++index;
+            return v;
+        };
+
+        const std::string text = format_guest(fmt, next);
+        __android_log_print(prio, tag.empty() ? "GUEST" : tag.c_str(), "%s", text.c_str());
+        return static_cast<uint32_t>(text.size());
+    }
+
+    // Import-coverage report: what the guest asked for versus what the host
+    // actually implements. Printed once the guest has been given a chance to run.
+    void log_import_report() {
+        size_t bridged = 0;
+        std::string missing;
+        for (const auto& kv : import_slots_) {
+            if (import_handlers_.count(kv.first)) { ++bridged; continue; }
+            if (missing.size() < 1200) {
+                missing += kv.first;
+                missing.push_back(' ');
+            }
+        }
+        const size_t total = import_slots_.size();
+        LOGI("IMPORT COVERAGE: %zu/%zu imports bridged, %zu unresolved",
+             bridged, total, total - bridged);
+        LOGI("IMPORT UNRESOLVED: %s", missing.c_str());
+    }
+
+    void log_once_env(int index) {
+        const uint32_t key = 1u * 100000u + static_cast<uint32_t>(index);
+        if (logged_.insert(static_cast<int>(key)).second) {
+            LOGW("unimplemented JNIEnv slot #%d (%s)", index, jni_env_name(index));
+        }
+    }
+
+    void log_once_vm(int index) {
+        const uint32_t key = 2u * 100000u + static_cast<uint32_t>(index);
+        if (logged_.insert(static_cast<int>(key)).second) {
+            LOGW("unimplemented JavaVM slot #%d (%s)", index, jni_vm_name(index));
+        }
+    }
+
+    // Guest -> env->RegisterNatives(env, clazz, methods, n)
+    uint32_t register_natives() {
+        auto* clazz = static_cast<jclass>(from_guest_ref(arg(1)));
+        const uint32_t methods = arg(2);
+        const uint32_t count = arg(3);
+
+        if (!clazz) {
+            LOGE("RegisterNatives: unknown class handle %08x", arg(1));
+            return JNI_ERR;
+        }
+        if (count > 512) {
+            LOGE("RegisterNatives: implausible method count %u", count);
+            return JNI_ERR;
+        }
+
+        std::vector<JNINativeMethod> host_methods;
+        host_methods.reserve(count);
+        // host_methods[] stores c_str() pointers into natives_; reserve now so
+        // the strings never move underneath those pointers.
+        natives_.reserve(natives_.size() + count);
+
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint32_t base = methods + i * 12;   // sizeof(JNINativeMethod32)
+            const uint32_t name_p = emu_.read_u32(base + 0);
+            const uint32_t sig_p  = emu_.read_u32(base + 4);
+            const uint32_t fn_p   = emu_.read_u32(base + 8);
+
+            std::string name = guest_string(name_p);
+            std::string sig  = guest_string(sig_p);
+
+            NativeEntry e;
+            e.id = static_cast<uint32_t>(natives_.size());
+            e.guest_fn = fn_p;
+            e.name = name;
+            e.sig = sig;
+            parse_signature(sig, e);
+
+            void* code = Arm64Trampolines::emit(e.id, reinterpret_cast<void*>(&bridge_native_entry));
+            if (!code) {
+                LOGE("RegisterNatives: trampoline pool exhausted");
+                return JNI_ERR;
+            }
+            e.code = code;
+            natives_.push_back(e);
+
+            host_methods.push_back(
+                {natives_.back().name.c_str(), natives_.back().sig.c_str(), code});
+            LOGI("  native %s%s -> guest %08x (trampoline %p)", name.c_str(), sig.c_str(),
+                 fn_p, code);
+        }
+
+        jint rc = env_->RegisterNatives(clazz, host_methods.data(),
+                                        static_cast<jint>(host_methods.size()));
+        LOGI("RegisterNatives: %u methods -> rc=%d%s", count, rc,
+             rc == JNI_OK ? "" : " (retry after the class is loaded)");
+        if (rc != JNI_OK) env_->ExceptionClear();
+        return static_cast<uint32_t>(rc);
+    }
+
+    // =====================================================================
+    // Guest -> Java calls and array traffic
+    //
+    // The guest cannot call Java directly: a jmethodID it holds is one of our
+    // 32-bit ref handles, and its arguments live in guest memory. Every call is
+    // rebuilt as an array of `jvalue`s and issued through the *A entry points,
+    // which is the only variadic-free form the host offers.
+    // =====================================================================
+    static size_t element_size(char t) {
+        switch (t) {
+            case 'Z': case 'B': return 1;
+            case 'C': case 'S': return 2;
+            case 'I': case 'F': return 4;
+            case 'J': case 'D': return 8;
+            default:            return 4;
+        }
+    }
+
+    // Z,B,C,S,I,J,F,D - the order New<Type>Array and the array blocks use.
+    static char array_type(int i) { return kCallTypeOrder[i + 1]; }
+
+    uint32_t new_primitive_array(char t) {
+        const jsize len = static_cast<jsize>(arg(1));
+        switch (t) {
+            case 'Z': return to_guest_ref(env_->NewBooleanArray(len));
+            case 'B': return to_guest_ref(env_->NewByteArray(len));
+            case 'C': return to_guest_ref(env_->NewCharArray(len));
+            case 'S': return to_guest_ref(env_->NewShortArray(len));
+            case 'I': return to_guest_ref(env_->NewIntArray(len));
+            case 'J': return to_guest_ref(env_->NewLongArray(len));
+            case 'F': return to_guest_ref(env_->NewFloatArray(len));
+            case 'D': return to_guest_ref(env_->NewDoubleArray(len));
+            default:  return 0;
+        }
+    }
+
+    uint32_t array_region(char t, bool set) {
+        jarray arr = static_cast<jarray>(from_guest_ref(arg(1)));
+        const jsize start = static_cast<jsize>(arg(2));
+        const jsize len = static_cast<jsize>(arg(3));
+        const uint32_t buf = arg(4);
+        if (!arr || len <= 0) return 0;
+
+        std::vector<uint8_t> tmp(static_cast<size_t>(len) * element_size(t));
+        if (set && !emu_.read(buf, tmp.data(), tmp.size())) {
+            LOGE("SetArrayRegion: unreadable guest buffer %08x", buf);
+            return 0;
+        }
+
+        switch (t) {
+            case 'Z':
+                if (set) env_->SetBooleanArrayRegion((jbooleanArray)arr, start, len, (jboolean*)tmp.data());
+                else     env_->GetBooleanArrayRegion((jbooleanArray)arr, start, len, (jboolean*)tmp.data());
+                break;
+            case 'B':
+                if (set) env_->SetByteArrayRegion((jbyteArray)arr, start, len, (jbyte*)tmp.data());
+                else     env_->GetByteArrayRegion((jbyteArray)arr, start, len, (jbyte*)tmp.data());
+                break;
+            case 'C':
+                if (set) env_->SetCharArrayRegion((jcharArray)arr, start, len, (jchar*)tmp.data());
+                else     env_->GetCharArrayRegion((jcharArray)arr, start, len, (jchar*)tmp.data());
+                break;
+            case 'S':
+                if (set) env_->SetShortArrayRegion((jshortArray)arr, start, len, (jshort*)tmp.data());
+                else     env_->GetShortArrayRegion((jshortArray)arr, start, len, (jshort*)tmp.data());
+                break;
+            case 'I':
+                if (set) env_->SetIntArrayRegion((jintArray)arr, start, len, (jint*)tmp.data());
+                else     env_->GetIntArrayRegion((jintArray)arr, start, len, (jint*)tmp.data());
+                break;
+            case 'J':
+                if (set) env_->SetLongArrayRegion((jlongArray)arr, start, len, (jlong*)tmp.data());
+                else     env_->GetLongArrayRegion((jlongArray)arr, start, len, (jlong*)tmp.data());
+                break;
+            case 'F':
+                if (set) env_->SetFloatArrayRegion((jfloatArray)arr, start, len, (jfloat*)tmp.data());
+                else     env_->GetFloatArrayRegion((jfloatArray)arr, start, len, (jfloat*)tmp.data());
+                break;
+            case 'D':
+                if (set) env_->SetDoubleArrayRegion((jdoubleArray)arr, start, len, (jdouble*)tmp.data());
+                else     env_->GetDoubleArrayRegion((jdoubleArray)arr, start, len, (jdouble*)tmp.data());
+                break;
+            default: break;
+        }
+
+        if (!set) emu_.write(buf, tmp.data(), tmp.size());
+        return 0;
+    }
+
+    struct ArrayPin {
+        jarray arr = nullptr;
+        void*  host = nullptr;
+        char   type = 'B';
+        jsize  len = 0;
+    };
+
+    uint32_t array_elements(char t) {
+        jarray arr = static_cast<jarray>(from_guest_ref(arg(1)));
+        if (!arr) return 0;
+
+        void* host = nullptr;
+        switch (t) {
+            case 'Z': host = env_->GetBooleanArrayElements((jbooleanArray)arr, nullptr); break;
+            case 'B': host = env_->GetByteArrayElements((jbyteArray)arr, nullptr); break;
+            case 'C': host = env_->GetCharArrayElements((jcharArray)arr, nullptr); break;
+            case 'S': host = env_->GetShortArrayElements((jshortArray)arr, nullptr); break;
+            case 'I': host = env_->GetIntArrayElements((jintArray)arr, nullptr); break;
+            case 'J': host = env_->GetLongArrayElements((jlongArray)arr, nullptr); break;
+            case 'F': host = env_->GetFloatArrayElements((jfloatArray)arr, nullptr); break;
+            case 'D': host = env_->GetDoubleArrayElements((jdoubleArray)arr, nullptr); break;
+            default: return 0;
+        }
+        if (!host) return 0;
+
+        const jsize len = env_->GetArrayLength(arr);
+        const size_t bytes = static_cast<size_t>(len) * element_size(t);
+        const uint32_t at = guest_alloc(bytes ? bytes : 1);
+        if (!at) return 0;
+        emu_.write(at, host, bytes);
+        pins_[at] = {arr, host, t, len};
+        return at;
+    }
+
+    uint32_t release_array_elements(char t) {
+        const uint32_t at = arg(1);
+        auto it = pins_.find(at);
+        if (it == pins_.end()) return 0;
+
+        const jint mode = static_cast<jint>(arg(2));
+        const size_t bytes = static_cast<size_t>(it->second.len) * element_size(t);
+        if (mode != JNI_ABORT && bytes) {
+            emu_.read(at, it->second.host, bytes);
+        }
+
+        jarray arr = it->second.arr;
+        void* host = it->second.host;
+        pins_.erase(it);
+        emu_.release(at, bytes ? bytes : 1);
+
+        switch (t) {
+            case 'Z': env_->ReleaseBooleanArrayElements((jbooleanArray)arr, (jboolean*)host, mode); break;
+            case 'B': env_->ReleaseByteArrayElements((jbyteArray)arr, (jbyte*)host, mode); break;
+            case 'C': env_->ReleaseCharArrayElements((jcharArray)arr, (jchar*)host, mode); break;
+            case 'S': env_->ReleaseShortArrayElements((jshortArray)arr, (jshort*)host, mode); break;
+            case 'I': env_->ReleaseIntArrayElements((jintArray)arr, (jint*)host, mode); break;
+            case 'J': env_->ReleaseLongArrayElements((jlongArray)arr, (jlong*)host, mode); break;
+            case 'F': env_->ReleaseFloatArrayElements((jfloatArray)arr, (jfloat*)host, mode); break;
+            case 'D': env_->ReleaseDoubleArrayElements((jdoubleArray)arr, (jdouble*)host, mode); break;
+            default: break;
+        }
+        return 0;
+    }
+
+    std::string signature_of(jmethodID mid) {
+        auto it = method_sigs_.find(mid);
+        return it == method_sigs_.end() ? std::string() : it->second;
+    }
+
+    // Rebuilds the guest's argument list as host jvalues.
+    //   variant 0: direct varargs (R3, then the stack)
+    //   variant 1: va_list - on ARM32 that is a pointer to the argument words
+    //   variant 2: const jvalue* - 8 bytes per argument
+    bool read_args(const std::string& sig, int variant, std::vector<jvalue>& out) {
+        const size_t open = sig.find('(');
+        if (open == std::string::npos) return false;
+
+        size_t word_index = 0;
+        size_t jv_index = 0;
+        uint32_t jv_base = 0, va_ptr = 0, sp = 0;
+
+        if (variant == 2) {
+            jv_base = arg(3);
+        } else if (variant == 1) {
+            const uint32_t va = arg(3);
+            va_ptr = va ? emu_.read_u32(va) : 0;
+        } else {
+            emu_.reg_read(UC_ARM_REG_SP, sp);
+        }
+
+        auto next_word = [&]() -> uint32_t {
+            uint32_t v = 0;
+            if (variant == 0) {
+                if (word_index == 0) v = arg(3);
+                else v = emu_.read_u32(sp + static_cast<uint32_t>((word_index - 1) * 4));
+            } else {
+                v = emu_.read_u32(va_ptr + static_cast<uint32_t>(word_index * 4));
+            }
+            ++word_index;
+            return v;
+        };
+
+        auto read_one = [&](char t) -> jvalue {
+            jvalue v{};
+            const uint32_t at = jv_base + static_cast<uint32_t>(jv_index * 8);
+            auto w32 = [&]() -> uint32_t {
+                return variant == 2 ? emu_.read_u32(at) : next_word();
+            };
+            auto w64 = [&]() -> uint64_t {
+                if (variant == 2) {
+                    const uint64_t lo = emu_.read_u32(at), hi = emu_.read_u32(at + 4);
+                    return lo | (hi << 32);
+                }
+                const uint64_t lo = next_word(), hi = next_word();
+                return lo | (hi << 32);
+            };
+            switch (t) {
+                case 'Z': v.z = static_cast<jboolean>(w32() & 0xFFu); break;
+                case 'B': v.b = static_cast<jbyte>(w32() & 0xFFu); break;
+                case 'C': v.c = static_cast<jchar>(w32() & 0xFFFFu); break;
+                case 'S': v.s = static_cast<jshort>(w32() & 0xFFFFu); break;
+                case 'I': v.i = static_cast<jint>(w32()); break;
+                case 'J': v.j = static_cast<jlong>(w64()); break;
+                case 'F': { const uint32_t b = w32(); float f; std::memcpy(&f, &b, 4); v.f = f; break; }
+                case 'D': { const uint64_t b = w64(); double d; std::memcpy(&d, &b, 8); v.d = d; break; }
+                default:  v.l = static_cast<jobject>(from_guest_ref(w32())); break;   // 'L'/'['
+            }
+            ++jv_index;
+            return v;
+        };
+
+        size_t i = open + 1;
+        while (i < sig.size() && sig[i] != ')') {
+            char t = sig[i];
+            if (t == '[') {
+                while (i + 1 < sig.size() && sig[i + 1] == '[') ++i;
+                if (i + 1 < sig.size() && sig[i + 1] == 'L') {
+                    i = sig.find(';', i);
+                    if (i == std::string::npos) return false;
+                } else {
+                    ++i;
+                }
+                out.push_back(read_one('L'));
+                ++i;
+                continue;
+            }
+            if (t == 'L') {
+                i = sig.find(';', i);
+                if (i == std::string::npos) return false;
+                out.push_back(read_one('L'));
+                ++i;
+                continue;
+            }
+            out.push_back(read_one(t));
+            ++i;
+        }
+        return true;
+    }
+
+    uint32_t call_java(char ret, bool is_static, int variant) {
+        jobject recv = is_static ? nullptr : static_cast<jobject>(from_guest_ref(arg(1)));
+        jclass  cls  = is_static ? static_cast<jclass>(from_guest_ref(arg(1))) : nullptr;
+        jmethodID mid = static_cast<jmethodID>(from_guest_ref(arg(2)));
+        if (!mid) { LOGW("Call*Method: null methodID"); return 0; }
+        if (!recv && !cls) { LOGW("Call*Method: null receiver"); return 0; }
+
+        const std::string sig = signature_of(mid);
+        if (sig.empty()) {
+            LOGW("Call*Method: no signature cached for method %p", mid);
+            return 0;
+        }
+
+        std::vector<jvalue> args;
+        args.reserve(sig.size());
+        if (!read_args(sig, variant, args)) return 0;
+        jvalue* a = args.empty() ? nullptr : args.data();
+
+        switch (ret) {
+            case 'V':
+                if (is_static) env_->CallStaticVoidMethodA(cls, mid, a);
+                else           env_->CallVoidMethodA(recv, mid, a);
+                return 0;
+            case 'L': {
+                jobject r = is_static ? env_->CallStaticObjectMethodA(cls, mid, a)
+                                      : env_->CallObjectMethodA(recv, mid, a);
+                return to_guest_ref(r);
+            }
+            case 'Z':
+                return (is_static ? env_->CallStaticBooleanMethodA(cls, mid, a)
+                                  : env_->CallBooleanMethodA(recv, mid, a)) ? JNI_TRUE : JNI_FALSE;
+            case 'B':
+                return static_cast<uint32_t>(static_cast<int8_t>(
+                    is_static ? env_->CallStaticByteMethodA(cls, mid, a)
+                              : env_->CallByteMethodA(recv, mid, a)));
+            case 'C':
+                return static_cast<uint32_t>(is_static ? env_->CallStaticCharMethodA(cls, mid, a)
+                                                       : env_->CallCharMethodA(recv, mid, a));
+            case 'S':
+                return static_cast<uint32_t>(static_cast<int16_t>(
+                    is_static ? env_->CallStaticShortMethodA(cls, mid, a)
+                              : env_->CallShortMethodA(recv, mid, a)));
+            case 'I':
+                return static_cast<uint32_t>(is_static ? env_->CallStaticIntMethodA(cls, mid, a)
+                                                       : env_->CallIntMethodA(recv, mid, a));
+            case 'J':
+                return ret_i64(static_cast<int64_t>(is_static ? env_->CallStaticLongMethodA(cls, mid, a)
+                                                              : env_->CallLongMethodA(recv, mid, a)));
+            case 'F':
+                return ret_f(is_static ? env_->CallStaticFloatMethodA(cls, mid, a)
+                                       : env_->CallFloatMethodA(recv, mid, a));
+            case 'D':
+                return ret_d(is_static ? env_->CallStaticDoubleMethodA(cls, mid, a)
+                                       : env_->CallDoubleMethodA(recv, mid, a));
+            default:
+                return 0;
+        }
+    }
+
+    uint32_t new_object(int variant) {
+        jclass cls = static_cast<jclass>(from_guest_ref(arg(1)));
+        jmethodID mid = static_cast<jmethodID>(from_guest_ref(arg(2)));
+        if (!cls || !mid) return 0;
+
+        const std::string sig = signature_of(mid);
+        if (sig.empty()) {
+            LOGW("NewObject: no signature cached for constructor %p", mid);
+            return 0;
+        }
+        std::vector<jvalue> args;
+        if (!read_args(sig, variant, args)) return 0;
+        return to_guest_ref(env_->NewObjectA(cls, mid, args.empty() ? nullptr : args.data()));
+    }
+
+    // Minimal JNI signature parser: enough to classify and count arguments.
+    static void parse_signature(const std::string& sig, NativeEntry& e) {
+        size_t i = sig.find('(');
+        if (i == std::string::npos) return;
+        ++i;
+        for (; i < sig.size() && sig[i] != ')'; ++i) {
+            char c = sig[i];
+            if (c == '[') {
+                e.arg_types.push_back('[');
+                while (i + 1 < sig.size() && sig[i + 1] == '[') ++i;
+                if (i + 1 < sig.size() && sig[i + 1] == 'L') {
+                    i = sig.find(';', i);
+                    if (i == std::string::npos) return;
+                } else {
+                    ++i;
+                }
+                continue;
+            }
+            if (c == 'L') {
+                e.arg_types.push_back('L');
+                i = sig.find(';', i);
+                if (i == std::string::npos) return;
+                continue;
+            }
+            e.arg_types.push_back(c);
+        }
+        e.ret_type = (i + 1 < sig.size()) ? sig[i + 1] : 'V';
+    }
+
+    static const char* jni_env_name(int idx);
+    static const char* jni_vm_name(int idx);
+
+    Emulator&    emu_;
+    StaticLinker linker_;
+    JNIEnv*      env_ = nullptr;
+
+    uint32_t env_shadow_ = 0, env_funcs_ = 0;
+    uint32_t vm_shadow_ = 0,  vm_funcs_ = 0;
+
+    std::vector<StubSlot> slots_;
+    std::unordered_map<std::string, uint32_t> import_slots_;
+    std::unordered_map<uint32_t, void*> refs_;
+    std::unordered_map<void*, uint32_t> ref_reverse_;
+    uint32_t next_ref_ = 0x00010000;
+
+    std::vector<NativeEntry> natives_;
+    std::unordered_map<std::string, ImportHandler> import_handlers_;
+    std::unordered_map<uint32_t, size_t> guest_allocs_;
+    std::unordered_map<std::string, uint32_t> data_slots_;
+    std::unordered_set<int> logged_;
+    uc_hook hook_ = 0;
+
+    uint32_t stack_guard_ = 0;      // guest word behind __stack_chk_guard
+    uint32_t errno_cell_ = 0;       // guest word behind __errno
+    uint32_t return_gadget_ = 0;    // guest `mov r0,#0 ; ret` trampoline
+    bool     redirected_ = false;   // a handler already set PC itself
+
+    struct DirHandle {
+        DIR* host = nullptr;
+        uint32_t buf = 0;   // guest copy of the current struct dirent
+    };
+
+    std::unordered_map<uint32_t, int>    fd_map_;      // guest fd -> host fd
+    std::unordered_map<uint32_t, FILE*>  file_map_;    // guest handle -> FILE*
+    std::unordered_map<uint32_t, DirHandle> dir_map_;
+    uint32_t next_handle_ = 0x1000;   // never collides with 0/1/2
+
+    std::unordered_map<void*, std::string> method_sigs_;   // jmethodID -> descriptor
+    std::unordered_map<uint32_t, ArrayPin> pins_;          // guest buffer -> pinned array
+    std::unordered_map<uint32_t, uint32_t> tls_values_;    // pthread key -> value
+    uint32_t next_tls_key_ = 1;
+
+    jobject guest_loader_ = nullptr;    // DexClassLoader over the ingested APK
+    std::vector<JavaExport> pending_;   // Java_* exports awaiting their class
+    std::unordered_map<uint32_t, int> native_calls_;   // trampoline id -> count
+};
+
+// JNIEnv / JavaVM slot names, for diagnostics only.
+const char* JniBridge::jni_env_name(int idx) {
+    switch (idx) {
+        case kIdxGetVersion: return "GetVersion";
+        case kIdxFindClass: return "FindClass";
+        case kIdxGetObjectClass: return "GetObjectClass";
+        case kIdxGetMethodID: return "GetMethodID";
+        case kIdxRegisterNatives: return "RegisterNatives";
+        case kIdxNewStringUTF: return "NewStringUTF";
+        case kIdxGetStringUTFChars: return "GetStringUTFChars";
+        case kIdxExceptionCheck: return "ExceptionCheck";
+        case kIdxGetJavaVM: return "GetJavaVM";
+        default: return "?";
+    }
+}
+
+const char* JniBridge::jni_vm_name(int idx) {
+    switch (idx) {
+        case kIdxVmAttach: return "AttachCurrentThread";
+        case kIdxVmDetach: return "DetachCurrentThread";
+        case kIdxVmGetEnv: return "GetEnv";
+        case kIdxVmDestroy: return "DestroyJavaVM";
+        default: return "?";
+    }
+}
+
+JniBridge* g_bridge = nullptr;
+JavaVM*    g_vm = nullptr;
+
+// One emulator per process: the guest address space is fixed (see the layout
+// at the top of this file), so a second payload set only fits after a teardown
+// that is not implemented yet. GameHostActivity surfaces this as "already
+// running" instead of silently corrupting the first session.
+bool g_session_active = false;
+
+std::string jstring_to_std(JNIEnv* env, jstring s) {
+    if (!s) return {};
+    const char* chars = env->GetStringUTFChars(s, nullptr);
+    if (!chars) return {};
+    std::string out(chars);
+    env->ReleaseStringUTFChars(s, chars);
+    return out;
+}
+
+}  // namespace
+
+// Entry point for every generated ARM64 trampoline: x0 = method id, x1 = spilled
+// x0..x7. Must have C linkage so the `bl` offset is stable.
+extern "C" uint64_t bridge_native_entry(uint32_t id, uint64_t* host_args) {
+    return g_bridge ? g_bridge->native_entry(id, host_args) : 0;
+}
+
+// ===========================================================================
+// 5. JNI entry points
+// ===========================================================================
+namespace {
+
+// Every ARM32 payload staged by the ingestion engine in a game's private
+// directory. The `*32.so` suffix is the only contract: whatever the APK
+// shipped in lib/armeabi-v7a, renamed, gets mapped. Nothing here knows about
+// libapp.so, libNimble.so or libfmodex.so by name.
+std::vector<std::string> discover_payloads(const std::string& dir) {
+    std::vector<std::string> out;
+    const std::string root = dir.empty() ? std::string(".") : dir;
+
+    DIR* d = opendir(root.c_str());
+    if (!d) {
+        LOGE("opendir(%s): %s", root.c_str(), strerror(errno));
+        return out;
+    }
+    const std::string suffix = "32.so";
+    while (struct dirent* e = readdir(d)) {
+        const std::string name = e->d_name;
+        if (name.size() <= suffix.size()) continue;
+        if (name.compare(0, 3, "lib") != 0) continue;
+        if (name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
+        out.push_back(root + "/" + name);
+    }
+    closedir(d);
+
+    // C++ runtime first (every payload imports from it), then the rest by
+    // name, then the application payload last (it imports from all of them).
+    auto rank = [](const std::string& p) {
+        if (p.find("libc++_shared32.so") != std::string::npos) return 0;
+        if (p.find("libapp32.so") != std::string::npos) return 2;
+        return 1;
+    };
+    std::sort(out.begin(), out.end(), [&](const std::string& a, const std::string& b) {
+        const int ra = rank(a), rb = rank(b);
+        return ra != rb ? ra < rb : a < b;
+    });
+    return out;
+}
+
+}  // namespace
+
+extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
+    (void)reserved;
+    g_vm = vm;
+    LOGI("==============================================================");
+    LOGI(" Zai-Bridge translation core (Unicorn backend)");
+    LOGI(" guest: ARM32 / Thumb-2     host: arm64-v8a");
+    LOGI("==============================================================");
+
+    // No payload is mapped at load time: the library is resident before any
+    // game is chosen, and each session is opened explicitly by
+    // GameHostActivity through nativeStartSession().
+    return JNI_VERSION_1_6;
+}
+
+// ---------------------------------------------------------------------------
+// Session entry points
+// ---------------------------------------------------------------------------
+extern "C" JNIEXPORT jint JNICALL
+Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeStartSession(
+        JNIEnv* env, jclass /*clazz*/, jstring game_dir, jstring obb_path,
+        jobject guest_loader) {
+    const std::string dir = jstring_to_std(env, game_dir);
+    const std::string obb = jstring_to_std(env, obb_path);
+
+    LOGI("==============================================================");
+    LOGI(" Zai-Bridge: opening guest session");
+    LOGI("   game dir : %s", dir.c_str());
+    LOGI("   expansion: %s", obb.empty() ? "<none>" : obb.c_str());
+    LOGI("==============================================================");
+
+    if (g_session_active) {
+        LOGW("guest session already active in this process");
+        return 1;
+    }
+    if (dir.empty()) {
+        LOGE("no game directory supplied");
+        return -2;
+    }
+
+    static Emulator emu;
+    g_bridge = new JniBridge(emu);
+    if (!emu.init() || !g_bridge->init(g_vm, env)) {
+        LOGE("bridge initialisation failed");
+        delete g_bridge;
+        g_bridge = nullptr;
+        return -1;
+    }
+
+    // Guest classes (Java_* exports, RegisterNatives targets) must resolve
+    // through the DexClassLoader the host positioned on the ingested APK.
+    if (guest_loader) g_bridge->set_guest_loader(guest_loader);
+
+    // ---- Phase 1: map every ingested ARM32 payload -------------------------
+    const std::string payload_dir = dir + "/payload";
+    const std::vector<std::string> payloads = discover_payloads(payload_dir);
+    if (payloads.empty()) {
+        LOGE("no ARM32 payloads (lib*32.so) in %s", payload_dir.c_str());
+        return -2;
+    }
+    LOGI("discovered %zu ARM32 payloads in %s", payloads.size(), payload_dir.c_str());
+
+    for (size_t i = 0; i < payloads.size(); ++i) {
+        const uint32_t base = kImageBase0 + static_cast<uint32_t>(i) * kImageStride;
+        if (!g_bridge->map_library(payloads[i], base)) {
+            LOGE("failed to map %s", payloads[i].c_str());
+            return -3;
+        }
+    }
+
+    // ---- Phase 2: relocate across the whole link set, then run DT_INIT ----
+    g_bridge->link_all();
+    g_bridge->run_all_constructors();
+
+    // ---- Phase 3: make every Java_* export visible to ART -----------------
+    // Bound before the guests' own JNI_OnLoad runs, so a library that prefers
+    // RegisterNatives still wins for the methods it registers itself.
+    g_bridge->bind_java_exports();
+
+    size_t onloads = 0;
+    for (const auto* lib : g_bridge->libraries()) {
+        const uint32_t onload = JniBridge::export_of(lib, "JNI_OnLoad");
+        if (!onload) continue;
+        uint32_t ret = 0;
+        if (g_bridge->call_onload(onload, ret)) {
+            LOGI("%s: JNI_OnLoad -> %d (0x%08x)", lib->path.c_str(),
+                 static_cast<int>(ret), ret);
+            ++onloads;
+        }
+    }
+    LOGI("called JNI_OnLoad on %zu payload(s)", onloads);
+
+    g_bridge->report_imports();
+    g_session_active = true;
+    LOGI("Zai-Bridge session ready");
+    return 0;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeVersion(JNIEnv* env, jclass /*clazz*/) {
+    unsigned int major = 0, minor = 0;
+    uc_version(&major, &minor);
+    char buf[128];
+    snprintf(buf, sizeof buf, "Unicorn %u.%u - ARM32 guest on arm64-v8a host", major, minor);
+    return env->NewStringUTF(buf);
+}
+
+extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void* reserved) {
+    (void)vm; (void)reserved;
+    LOGI("JNI_OnUnload");
+}

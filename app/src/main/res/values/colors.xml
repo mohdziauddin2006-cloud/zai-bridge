@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="zb_background">#080D15</color>
+    <color name="zb_surface">#111A26</color>
+    <color name="zb_surface_high">#182533</color>
+    <color name="zb_accent">#3BE0F2</color>
+    <color name="zb_accent_deep">#0E7C8C</color>
+    <color name="zb_legacy">#FFB454</color>
+    <color name="zb_text">#EAF2FA</color>
+    <color name="zb_text_dim">#8FA3B8</color>
+    <color name="zb_outline">#22303F</color>
+    <color name="zb_black">#000000</color>
+    <color name="ic_launcher_background">#080D15</color>
+</resources>
