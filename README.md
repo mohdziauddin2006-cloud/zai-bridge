@@ -20,7 +20,7 @@ Engine translation core that executes the original ARM32 libraries inside the
         │  GameHostActivity (NoTitleBar.Fullscreen + IMMERSIVE_STICKY)                            │
         │      │  DexClassLoader(game.apk)              │  UnicornBridge.nativeStartSession()      │
         │      │                                        ▼                                        │
-        │      │                              wrapper_arm64.so ──► libunicorn.a (static)          │
+        │      │                              libwrapper.so ─────► libunicorn.a (static)          │
         │      │                                        │                                        │
         │      │                    maps ELF32 payloads, relocates, runs DT_INIT,                 │
         │      │                    binds Java_* exports to 64-bit trampolines,                   │
@@ -40,7 +40,7 @@ zai-bridge/
 │       ├── AndroidManifest.xml          # MANAGE_EXTERNAL_STORAGE, FGS, GameHost theme
 │       ├── cpp/
 │       │   ├── CMakeLists.txt           # links libunicorn.a statically
-│       │   ├── wrapper_arm64.cpp        # the translation core (ELF loader + JNI bridge)
+│       │   ├── wrapper.cpp              # the translation core (ELF loader + JNI bridge)
 │       │   └── prebuilt/arm64-v8a/      # libunicorn.a + Unicorn headers
 │       ├── java/com/ziauddin/zaibridge/
 │       │   ├── MainActivity.java        # all-files access, APK/OBB pickers, grid
@@ -126,7 +126,7 @@ host application's loader.
 
 ## 4. The translation core
 
-`wrapper_arm64.cpp` (migrated from the earlier single-APK harness) is now
+`wrapper.cpp` is
 session-based. `JNI_OnLoad` only captures the `JavaVM`; the payload set is
 opened on demand by:
 
@@ -193,46 +193,94 @@ cd zai-bridge
 # → app/build/outputs/apk/debug/app-debug.apk
 ```
 
-The APK contains exactly two native libraries, both `arm64-v8a`:
-`libwrapper_arm64.so` (bridge + statically linked Unicorn) and
-`libc++_shared.so`. Unicorn's TCG/softmmu symbols are excluded from the dynamic
-symbol table with `-Wl,--exclude-libs,ALL`.
+The universal APK contains, per 64-bit ABI, `libwrapper.so` (bridge +
+statically linked Unicorn) and `libc++_shared.so`:
 
-To rebuild the emulator core (ARM32/Thumb guest only):
+```
+lib/arm64-v8a/libwrapper.so
+lib/x86_64/libwrapper.so
+```
+
+Unicorn's TCG/softmmu symbols are excluded from the dynamic symbol table with
+`-Wl,--exclude-libs,ALL`.
+
+To rebuild the emulator core (ARM32/Thumb guest only) for either host ABI:
 
 ```bash
-./vendor/build_unicorn_android.sh     # stages vendor/unicorn/android/<abi>/
-# then copy <abi>/{include,lib} into app/src/main/cpp/prebuilt/<abi>/
+UNICORN_ABI=arm64-v8a ./vendor/build_unicorn_android.sh
+UNICORN_ABI=x86_64    ./vendor/build_unicorn_android.sh
+# stage prebuilt/<abi>/{lib/libunicorn.a,include/unicorn/} into app/src/main/cpp/
 ```
 
 ---
 
+## Universal device support
+
+| Host process | Execution path |
+|---|---|
+| `arm64-v8a` | native host, Unicorn `arm-softmmu` translating the ARM32 guest |
+| `x86_64` | native host, same ARM32 Unicorn backend |
+| `armeabi-v7a` | 32-bit host: no translator, the guest `.so` runs directly |
+
+`UnicornBridge` selects the mode from `Build.SUPPORTED_ABIS[0]`. The universal
+APK ships `lib/arm64-v8a/libwrapper.so` and `lib/x86_64/libwrapper.so`; the
+32-bit passthrough is a code path rather than a third shipped ABI in this build.
+Imports with no `lib/armeabi*/*.so` skip Unicorn entirely and host the guest
+Activity directly.
+
+Host dispatch is compiled per architecture: the JNI trampolines are emitted as
+AArch64 instruction words on `__aarch64__` and as System V AMD64 stubs on
+`__x86_64__`, so Unicorn translates the ARM32 guest natively on ARM phones and
+on x86 devices/emulators.
+
+Display and resources: `GameHostActivity` sets
+`LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES`, `AspectRatioFrameLayout` letterboxes
+4:3/16:9 content on tall panels, guest resources are merged through
+`AssetManager.addAssetPath(game.apk)`, and imported dex files are stored
+read-only for Android 14+ ART.
+
+## Runtime status
+
+Verified on a clean `x86_64` Android 14 emulator with the genuine, unmodified
+F-Droid build **Tux Rider 1.0.9** (`com.drodin.tuxrider`, only
+`lib/armeabi/libtuxrider.so`, no arm64 directory):
+
+* the universal APK installs the x86_64 variant, and `libwrapper.so` loads
+  natively with no ARM translation layer involved;
+* the ARM32 payload maps, applies 3693 relocations, runs its constructor and
+  `JNI_OnLoad`, which calls `RegisterNatives` for `resize(II)V` and
+  `render(IIDIZZ)I` through the new x86_64 host trampolines;
+* guest resources merge, the guest Activity is constructed, and the reflective
+  framework attach sets ActivityThread, Instrumentation, ActivityInfo and the
+  window token; the aspect container measures 1080x1440 for the 16:9 window;
+* the earlier NFS payload still reaches `nativeOnCreate`,
+  `nativeSurfaceCreated`/`Changed` and its shader pipeline on both host ABIs.
+
+**Where it stops:** the guest `Activity.onCreate` throws
+`IllegalStateException: No activity` from the framework fragment controller,
+because `attach()` also wires fragment/application listeners that private
+reflection cannot reconstruct. The guest's renderer therefore never starts, no
+`eglSwapBuffers` is issued, and no frame is presented yet. On the NFS payload,
+`nativeOnRunLoopTick` still faults in its own network/telemetry startup.
+
 ## Current limitations
 
-This repository is the container scaffold: ingestion, storage isolation, the
-launcher, immersive hosting, dex loading and the native session lifecycle are
-implemented and build cleanly. The remaining work is inside the bridge and the
-presentation path, and it is deliberately called out rather than hidden:
-
-* **Guest Activity lifecycle / rendering.** The guest's dex is loaded and its
-  launcher class is resolved, but its `Activity` is not yet instantiated inside
-  the host, and EGL/`ANativeWindow` calls from the guest are forwarded only as
-  far as the logging stubs. A game's own frames therefore do not reach the host
-  `SurfaceView` yet; that needs a guest-accelerated `Surface`/EGL bridge.
-* **Single session per process.** The guest address space is fixed, so a second
-  game launch in the same process reports `SESSION_ALREADY_RUNNING`. Teardown
-  (`uc_close`, freeing the trampoline pool and guest loader) is still to come.
-* **OBB redirection.** The expansion file is hidden and tracked, but the guest
-  is not yet given a redirected `getObbDir()`/`/sdcard/Android/obb` view.
-* **Syscall coverage.** Only the libc memory/string/stdio/file/time/pthread
-  surface is forwarded; `mmap`, `mprotect`, `dlopen`, timers and EGL still fall
-  through to the report-only stubs.
-* **JNI ABI gaps.** 64-bit (`long`/`double`) arguments and float/double returns
-  across the boundary, ARM32 TLS and exception unwinding remain unimplemented.
-* **Performance.** Interpretation, not JIT: expect a frame-rate ceiling well
-  below native, and no multi-threaded guest scheduling.
-
----
+* **Guest Activity attach is incomplete.** Fields can be injected, but
+  `Activity.onCreate` needs the fragment controller and application dispatch
+  hooks created inside `attach()`. A real fix is a proxy Activity in the
+  manifest plus `Instrumentation` substitution, not reflection.
+* **Engine drive is game-specific.** `drive_render_loop()` targets
+  `GameActivityMain`/`RunLoop`; payloads that register their own natives (SDL's
+  `resize`/`render`) need a per-engine driver.
+* **GLES marshalling** covers the shader/program pipeline, buffers, textures,
+  client vertex arrays and uniforms, but `glMapBufferOES`, compressed uploads and
+  `glGetActiveUniform/Attrib` remain stubs.
+* **Surface recreation.** Guest EGL surfaces are bound to the window captured at
+  creation; rotation/backgrounding is not automated yet.
+* **Single session per process.** A second launch reports
+  `SESSION_ALREADY_RUNNING`; teardown is not implemented.
+* **Performance.** Interpretation, not JIT: frame-rate ceiling well below native,
+  and no multi-threaded guest scheduling.
 
 ## Third-party
 

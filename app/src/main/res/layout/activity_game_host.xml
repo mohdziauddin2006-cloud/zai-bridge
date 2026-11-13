@@ -4,11 +4,19 @@
     android:layout_height="match_parent"
     android:background="@color/zb_black">
 
-    <!-- The guest presents into this surface once the bridge is up. -->
-    <SurfaceView
-        android:id="@+id/game_surface"
+    <!-- Legacy games keep their own aspect ratio; the container letterboxes. -->
+    <com.ziauddin.zaibridge.AspectRatioFrameLayout
+        android:id="@+id/game_aspect"
         android:layout_width="match_parent"
-        android:layout_height="match_parent" />
+        android:layout_height="match_parent">
+
+        <!-- The guest presents into this surface once the bridge is up. -->
+        <SurfaceView
+            android:id="@+id/game_surface"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent" />
+
+    </com.ziauddin.zaibridge.AspectRatioFrameLayout>
 
     <LinearLayout
         android:id="@+id/status_wrap"

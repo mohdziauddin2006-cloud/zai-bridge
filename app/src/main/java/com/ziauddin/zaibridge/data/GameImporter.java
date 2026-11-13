@@ -68,6 +68,10 @@ public final class GameImporter {
             step(progress, "Copying APK");
             File apk = new File(staging, "game.apk");
             copyUri(context, apkUri, apk);
+            // ART refuses to open a writable dex source ("Writable dex file is
+            // not allowed"), so the archive must be read-only before it is
+            // handed to DexClassLoader.
+            makeReadOnly(apk);
 
             PackageManager pm = context.getPackageManager();
             PackageInfo info = pm.getPackageArchiveInfo(apk.getAbsolutePath(),
@@ -162,7 +166,9 @@ public final class GameImporter {
                 if (entry.isDirectory()) continue;
                 String name = entry.getName();
 
-                if (name.startsWith("lib/armeabi-v7a/") || name.startsWith("lib/arm/")) {
+                if (name.startsWith("lib/armeabi-v7a/")
+                        || name.startsWith("lib/armeabi/")
+                        || name.startsWith("lib/arm/")) {
                     if (!name.endsWith(".so")) continue;   // gdbserver, etc.
                     String base = name.substring(name.lastIndexOf('/') + 1);
                     if (!base.startsWith("lib")) continue;
@@ -172,7 +178,9 @@ public final class GameImporter {
                             + " (" + out.length() + " bytes)");
                     ++libs;
                 } else if (isDex(name)) {
-                    copyStream(zip.getInputStream(entry), new File(dexDir, name));
+                    File dex = new File(dexDir, name);
+                    copyStream(zip.getInputStream(entry), dex);
+                    makeReadOnly(dex);
                 }
             }
         }
@@ -304,6 +312,13 @@ public final class GameImporter {
             byte[] buf = new byte[1 << 20];
             int n;
             while ((n = is.read(buf)) > 0) os.write(buf, 0, n);
+        }
+    }
+
+    private static void makeReadOnly(File file) {
+        if (file.isFile()) {
+            file.setReadable(true, false);
+            file.setWritable(false, false);
         }
     }
 

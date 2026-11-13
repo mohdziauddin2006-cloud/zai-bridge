@@ -1,6 +1,8 @@
 package com.ziauddin.zaibridge.core;
 
+import android.os.Build;
 import android.util.Log;
+import android.view.Surface;
 
 /**
  * The Java face of the Unicorn translation core.
@@ -10,6 +12,10 @@ import android.util.Log;
  * applies their relocations, runs their constructors, binds every
  * {@code Java_*} export to ART through 64-bit trampolines, and finally calls the
  * guests' {@code JNI_OnLoad}. It does not know any game by name.
+ *
+ * <p>Graphics are forwarded to the real host EGL/GLES drivers. The guest's
+ * opaque EGL objects are exchanged for 32-bit handles, and window surfaces are
+ * bound to the {@link Surface} handed to {@link #setSurface(Surface)}.
  */
 public final class UnicornBridge {
 
@@ -22,20 +28,40 @@ public final class UnicornBridge {
     public static final int SESSION_INIT_FAILED = -1;
     public static final int SESSION_NO_PAYLOAD = -2;
     public static final int SESSION_LINK_FAILED = -3;
+    /** The host process is 32-bit; the guest libraries run without a bridge. */
+    public static final int SESSION_PASSTHROUGH = -4;
+
+    /** Primary ABI of the process this code is running in. */
+    public static final String HOST_ABI = Build.SUPPORTED_ABIS.length > 0
+            ? Build.SUPPORTED_ABIS[0] : "unknown";
 
     private static final boolean CORE_LOADED;
 
     static {
-        boolean loaded;
-        try {
-            System.loadLibrary("wrapper_arm64");
-            loaded = true;
-            Log.i(TAG, "Unicorn core loaded");
-        } catch (UnsatisfiedLinkError e) {
-            loaded = false;
-            Log.e(TAG, "Unicorn core missing for this ABI", e);
+        boolean loaded = false;
+        if (!isPassthrough()) {
+            try {
+                System.loadLibrary("wrapper");
+                loaded = true;
+                Log.i(TAG, "Unicorn core loaded for " + HOST_ABI);
+            } catch (UnsatisfiedLinkError e) {
+                Log.e(TAG, "Unicorn core missing for " + HOST_ABI, e);
+            }
         }
         CORE_LOADED = loaded;
+    }
+
+    /**
+     * A 32-bit host process (armeabi-v7a) already runs the guest libraries, so
+     * the translator is not loaded and the guest is started directly. The
+     * 64-bit APK variants (arm64-v8a, x86_64) always use the Unicorn backend.
+     */
+    public static boolean isPassthrough() {
+        return HOST_ABI.startsWith("armeabi");
+    }
+
+    public static boolean isEmulated() {
+        return CORE_LOADED;
     }
 
     private UnicornBridge() {
@@ -50,17 +76,37 @@ public final class UnicornBridge {
      *
      * @param gameDir     private game directory (contains {@code payload/} and {@code game.apk})
      * @param obbPath     absolute path of the expansion file, or null
+     * @param packageName guest package, used to rewrite its hardcoded storage paths
      * @param guestLoader DexClassLoader positioned on the guest APK, so guest
      *                    classes resolve by their real names
+     * @param guestActivity the guest Activity instance, used as the {@code this}
+     *                    the engine's native side calls back into
      */
-    public static int startSession(String gameDir, String obbPath, ClassLoader guestLoader) {
+    public static int startSession(String gameDir, String obbPath, String packageName,
+                                   ClassLoader guestLoader, Object guestActivity) {
+        if (isPassthrough()) {
+            Log.i(TAG, "32-bit host: guest libraries run natively (passthrough)");
+            return SESSION_PASSTHROUGH;
+        }
         if (!CORE_LOADED) return SESSION_INIT_FAILED;
-        return nativeStartSession(gameDir, obbPath, guestLoader);
+        return nativeStartSession(gameDir, obbPath, packageName, guestLoader, guestActivity);
     }
 
-    /** Unicorn version and guest/host architecture, for the host HUD. */
+    /**
+     * Hands the host's SurfaceView window to the core. Call with null when the
+     * surface is destroyed; EGL keeps its own reference while a surface exists.
+     */
+    public static void setSurface(Surface surface) {
+        if (!CORE_LOADED) return;
+        nativeSetSurface(surface);
+    }
+
+    /** Unicorn version and guest/host architecture, for diagnostics. */
     public static native String nativeVersion();
 
     private static native int nativeStartSession(String gameDir, String obbPath,
-                                                 ClassLoader guestLoader);
+                                                 String packageName, ClassLoader guestLoader,
+                                                 Object guestActivity);
+
+    private static native void nativeSetSurface(Surface surface);
 }

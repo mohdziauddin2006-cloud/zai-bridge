@@ -48,6 +48,10 @@
 #include <jni.h>
 #include <unicorn/unicorn.h>
 #include <android/log.h>
+#include <android/native_window.h>
+#include <android/native_window_jni.h>
+#include <EGL/egl.h>
+#include <GLES2/gl2.h>
 
 #include <dirent.h>
 #include <dlfcn.h>
@@ -55,9 +59,11 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <cmath>
@@ -66,6 +72,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <chrono>
+#include <thread>
 #include <cstring>
 #include <ctime>
 #include <functional>
@@ -88,6 +95,9 @@ extern "C" uint64_t bridge_native_entry(uint32_t id, uint64_t* host_args);
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved);
 
 namespace {
+
+// Name of the import handler currently running, for crash diagnostics.
+std::string g_last_import;
 
 // ---------------------------------------------------------------------------
 // Guest address space
@@ -127,10 +137,10 @@ constexpr uint32_t kPageSize = 4096u;
 // ARM64 stub that spills x0-x7 into an array, calls the common C handler with
 // (id, args), and returns whatever the handler leaves in x0.
 // ===========================================================================
-class Arm64Trampolines {
+class HostTrampolines {
 public:
-    // 16 words: 11 instructions of code plus an 8-byte-aligned literal pool
-    // entry (a 64-bit `ldr` literal must be naturally aligned).
+    // 64 bytes is enough for both host ABIs: the ARM64 stub is 11 instructions
+    // plus a literal pool, the x86_64 stub is 53 bytes of straight-line code.
     static constexpr size_t kStubSize = 64;
     static constexpr size_t kPoolSize = 64 * 1024;
 
@@ -152,7 +162,9 @@ public:
     static void* emit(uint32_t id, void* target) {
         if (!pool_ || used_ + kStubSize > kPoolSize) return nullptr;
         uintptr_t base = reinterpret_cast<uintptr_t>(pool_ + used_);
+        std::memset(reinterpret_cast<void*>(base), 0, kStubSize);
 
+#if defined(__aarch64__)
         uint32_t* w = reinterpret_cast<uint32_t*>(base);
         w[0] = 0xD10103FFu;  // sub  sp, sp, #64
         w[1] = 0xA90007E0u;  // stp  x0, x1, [sp, #0]
@@ -174,6 +186,46 @@ public:
         w[13] = static_cast<uint32_t>(t >> 32);
         w[14] = 0xD503201Fu; // padding
         w[15] = 0xD503201Fu; // padding
+#elif defined(__x86_64__)
+        // System V AMD64: JNIEnv*, jobject, then the Java arguments in
+        // rdi, rsi, rdx, rcx, r8, r9. Spill them, pass (id, args) to the C
+        // handler, and return its rax.
+        uint8_t* b = reinterpret_cast<uint8_t*>(base);
+        size_t at = 0;
+        const uint8_t prologue[] = {
+                0x48, 0x83, 0xEC, 0x38,              // sub  rsp, 0x38
+                0x48, 0x89, 0x3C, 0x24,              // mov  [rsp+0x00], rdi
+                0x48, 0x89, 0x74, 0x24, 0x08,        // mov  [rsp+0x08], rsi
+                0x48, 0x89, 0x54, 0x24, 0x10,        // mov  [rsp+0x10], rdx
+                0x48, 0x89, 0x4C, 0x24, 0x18,        // mov  [rsp+0x18], rcx
+                0x4C, 0x89, 0x44, 0x24, 0x20,        // mov  [rsp+0x20], r8
+                0x4C, 0x89, 0x4C, 0x24, 0x28,        // mov  [rsp+0x28], r9
+        };
+        std::memcpy(b + at, prologue, sizeof prologue);
+        at += sizeof prologue;
+        b[at++] = 0xBF;                              // mov edi, imm32
+        std::memcpy(b + at, &id, sizeof id);
+        at += sizeof id;
+        const uint8_t call_seq[] = {
+                0x48, 0x89, 0xE6,                    // mov  rsi, rsp
+                0x48, 0xB8,                          // mov  rax, imm64
+        };
+        std::memcpy(b + at, call_seq, sizeof call_seq);
+        at += sizeof call_seq;
+        const uint64_t t64 = reinterpret_cast<uintptr_t>(target);
+        std::memcpy(b + at, &t64, sizeof t64);
+        at += sizeof t64;
+        const uint8_t epilogue[] = {
+                0xFF, 0xD0,                          // call rax
+                0x48, 0x83, 0xC4, 0x38,              // add  rsp, 0x38
+                0xC3,                                // ret
+        };
+        std::memcpy(b + at, epilogue, sizeof epilogue);
+        at += sizeof epilogue;
+        (void)at;
+#else
+#error "Zai-Bridge: unsupported host architecture"
+#endif
 
         __builtin___clear_cache(reinterpret_cast<char*>(base),
                                 reinterpret_cast<char*>(base + kStubSize));
@@ -186,8 +238,8 @@ private:
     static size_t   used_;
 };
 
-uint8_t* Arm64Trampolines::pool_ = nullptr;
-size_t   Arm64Trampolines::used_ = 0;
+uint8_t* HostTrampolines::pool_ = nullptr;
+size_t   HostTrampolines::used_ = 0;
 
 // ===========================================================================
 // 2. Emulator: one ARM32 Unicorn instance + guest memory helpers
@@ -433,11 +485,19 @@ public:
         if (err == UC_ERR_OK) {
             ok = reg_read(UC_ARM_REG_R0, ret);
         } else {
-            uint32_t pc = 0, lr = 0;
+            uint32_t pc = 0, lr = 0, sp = 0;
+            uint32_t r0 = 0, r1 = 0, r2 = 0, r3 = 0;
             reg_read(UC_ARM_REG_PC, pc);
             reg_read(UC_ARM_REG_LR, lr);
-            LOGE("call(%s) @%08x aborted: %s (pc=%08x lr=%08x)", what, entry,
-                 uc_strerror(err), pc, lr);
+            reg_read(UC_ARM_REG_SP, sp);
+            reg_read(UC_ARM_REG_R0, r0);
+            reg_read(UC_ARM_REG_R1, r1);
+            reg_read(UC_ARM_REG_R2, r2);
+            reg_read(UC_ARM_REG_R3, r3);
+            LOGE("call(%s) @%08x aborted: %s (pc=%08x lr=%08x sp=%08x "
+                 "r0=%08x r1=%08x r2=%08x r3=%08x last_import=%s)",
+                 what, entry, uc_strerror(err), pc, lr, sp, r0, r1, r2, r3,
+                 g_last_import.c_str());
         }
 
         uc_context_restore(uc_, saved);
@@ -480,6 +540,11 @@ struct LoadedLibrary {
     // after linking, not at map time.
     uint32_t init_array_v = 0;
     uint32_t init_array_sz = 0;
+
+    // Relocations are applied exactly once. Runtime dlopen() adds libraries to
+    // an already-linked set, and re-running R_ARM_RELATIVE would add the bias
+    // a second time and corrupt every pointer in the earlier payloads.
+    bool linked = false;
 };
 
 // A `Java_<class>_<method>` export found in a guest library: the host ART must
@@ -583,6 +648,7 @@ public:
     // guest libraries plus the host routing table cannot satisfy.
     void link_all() {
         for (auto* lib : libs_) {
+            if (lib->linked) continue;
             size_t applied = 0, failed = 0;
             apply_relocs(*lib, lib->symtab, lib->strtab, lib->strsz,
                          lib->rel, lib->relsz, applied, failed);
@@ -601,6 +667,7 @@ public:
                     lib->init_array.push_back(fn);
                 }
             }
+            lib->linked = true;
         }
     }
 
@@ -963,7 +1030,7 @@ public:
 
     bool init(JavaVM* /*vm*/, JNIEnv* env) {
         env_ = env;
-        if (!Arm64Trampolines::init()) return false;
+        if (!HostTrampolines::init()) return false;
 
         linker_.set_import_resolver([this](const std::string& name) {
             return import_stub(name);
@@ -971,6 +1038,9 @@ public:
 
         // Host routing table for the imports every libc-linked ARM32 binary
         // needs. Anything absent here still gets a stub and is reported.
+        // The host graphics libraries must be resolved first: the EGL/GLES
+        // handler table is only installed when libEGL is actually loaded.
+        open_host_graphics();
         install_import_handlers();
 
         // Data imports (address-of, not a call) get real guest memory instead
@@ -1091,6 +1161,12 @@ public:
     // JNI_OnLoad is usually available once the app has started.
     void retry_pending_bindings() {
         if (pending_.empty()) return;
+        // A guest callback that threw leaves an exception pending; resolving a
+        // class while one is pending aborts the process under CheckJNI.
+        if (env_->ExceptionCheck()) {
+            LOGW("deferred binding: clearing pending exception");
+            env_->ExceptionClear();
+        }
         std::vector<JavaExport> still;
         for (const auto& e : pending_) {
             if (!bind_one(e)) still.push_back(e);
@@ -1118,9 +1194,171 @@ public:
     uint32_t env_shadow() const { return env_shadow_; }
     uint32_t vm_shadow() const { return vm_shadow_; }
 
+    uint32_t entry_point(const std::string& cls, const std::string& name) const {
+        auto it = entry_points_.find(cls + "." + name);
+        return it == entry_points_.end() ? 0u : it->second;
+    }
+
+    // =====================================================================
+    // Guest engine drive
+    //
+    // ART cannot be the caller here: the registered implementations are
+    // generated ARM64 trampolines in an anonymous executable mapping, and the
+    // ARM translator used on x86_64 hosts faults inside
+    // ndk_translation_HandleNoExec as soon as such a page is executed. The
+    // engine is therefore entered from this thread, with a host EGL context
+    // current, and its renderer callbacks are issued as direct Unicorn calls.
+    // =====================================================================
+    bool drive_render_loop() {
+        const uint32_t onCreate =
+                entry_point("com/ea/ironmonkey/GameActivityMain", "nativeOnCreate");
+        const uint32_t onSurfaceCreated =
+                entry_point("com/ea/ironmonkey/GameActivityMain", "nativeSurfaceCreated");
+        const uint32_t onSurfaceChanged =
+                entry_point("com/ea/ironmonkey/GameActivityMain", "nativeSurfaceChanged");
+        const uint32_t onTick =
+                entry_point("com/ea/ironmonkey/RunLoop", "nativeOnRunLoopTick");
+
+        if (!onCreate || !onTick) {
+            LOGW("render drive: entry points missing (onCreate=%08x tick=%08x)",
+                 onCreate, onTick);
+            return false;
+        }
+
+        // The guest's `this` for every callback: the Activity instance the Java
+        // side created from the guest dex.
+        const uint32_t thiz = to_guest_ref(guest_thiz_);
+        uint32_t ret = 0;
+        LOGI("render drive: guest nativeOnCreate @%08x (thiz=%08x)", onCreate, thiz);
+        if (!emu_.call(onCreate, {env_shadow_, thiz}, ret, "nativeOnCreate")) {
+            LOGW("render drive: nativeOnCreate did not return cleanly");
+        }
+
+        EGLDisplay dpy = EGL_NO_DISPLAY;
+        EGLSurface surface = EGL_NO_SURFACE;
+        EGLContext context = EGL_NO_CONTEXT;
+        EGLConfig config = nullptr;
+        bool own_surface = false;
+        ANativeWindow* window = host_window_;
+
+        // If the engine created its own window surface through the forwarded
+        // EGL entry points, it also owns presentation and this loop only ticks.
+        if (egl_window_surfaces_ == 0 && window) {
+            auto getDisplay =
+                    gl_proc<EGLDisplay (*)(EGLNativeDisplayType)>("eglGetDisplay");
+            auto initialize = gl_proc<EGLBoolean (*)(EGLDisplay, EGLint*, EGLint*)>(
+                    "eglInitialize");
+            auto chooseConfig =
+                    gl_proc<EGLBoolean (*)(EGLDisplay, const EGLint*, EGLConfig*, EGLint,
+                                           EGLint*)>("eglChooseConfig");
+            auto createWindowSurface =
+                    gl_proc<EGLSurface (*)(EGLDisplay, EGLConfig, EGLNativeWindowType,
+                                           const EGLint*)>("eglCreateWindowSurface");
+            auto createContext =
+                    gl_proc<EGLContext (*)(EGLDisplay, EGLConfig, EGLContext, const EGLint*)>(
+                            "eglCreateContext");
+            auto makeCurrent = gl_proc<EGLBoolean (*)(EGLDisplay, EGLSurface, EGLSurface,
+                                                      EGLContext)>("eglMakeCurrent");
+
+            if (getDisplay && initialize && chooseConfig && createWindowSurface &&
+                createContext && makeCurrent) {
+                dpy = getDisplay(EGL_DEFAULT_DISPLAY);
+                EGLint major = 0, minor = 0;
+                if (dpy != EGL_NO_DISPLAY && initialize(dpy, &major, &minor)) {
+                    const EGLint cfg_attrs[] = {
+                            EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+                            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+                            EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
+                            EGL_ALPHA_SIZE, 8, EGL_DEPTH_SIZE, 16, EGL_NONE};
+                    EGLint count = 0;
+                    if (chooseConfig(dpy, cfg_attrs, &config, 1, &count) && count > 0) {
+                        const EGLint sattrs[] = {EGL_NONE};
+                        surface = createWindowSurface(
+                                dpy, config,
+                                reinterpret_cast<EGLNativeWindowType>(window), sattrs);
+                        const EGLint cattrs[] = {
+                                EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
+                        if (surface != EGL_NO_SURFACE) {
+                            context = createContext(dpy, config, EGL_NO_CONTEXT, cattrs);
+                        }
+                        if (context != EGL_NO_CONTEXT &&
+                            makeCurrent(dpy, surface, surface, context)) {
+                            own_surface = true;
+                        }
+                        LOGI("render drive: host EGL %dx%d surface=%p context=%p (own=%d)",
+                             0, 0, surface, context, own_surface ? 1 : 0);
+                    } else {
+                        LOGE("render drive: eglChooseConfig found no ES2 config");
+                    }
+                }
+            } else {
+                LOGE("render drive: host EGL entry points unavailable");
+            }
+        }
+
+        if (onSurfaceCreated) {
+            LOGI("render drive: guest nativeSurfaceCreated @%08x", onSurfaceCreated);
+            emu_.call(onSurfaceCreated, {env_shadow_, thiz, 0, 0}, ret,
+                      "nativeSurfaceCreated");
+        }
+
+        const int width = window ? ANativeWindow_getWidth(window) : 0;
+        const int height = window ? ANativeWindow_getHeight(window) : 0;
+        if (onSurfaceChanged) {
+            LOGI("render drive: guest nativeSurfaceChanged %dx%d", width, height);
+            emu_.call(onSurfaceChanged,
+                      {env_shadow_, thiz, 0, static_cast<uint32_t>(width),
+                       static_cast<uint32_t>(height)},
+                      ret, "nativeSurfaceChanged");
+        }
+
+        auto swapBuffers = gl_proc<EGLBoolean (*)(EGLDisplay, EGLSurface)>("eglSwapBuffers");
+        int ticks = 0;
+        int swaps = 0;
+        while (host_window_ && ticks < 200000) {
+            if (!emu_.call(onTick, {env_shadow_, thiz}, ret, "nativeOnRunLoopTick")) {
+                LOGW("render drive: tick failed after %d ticks / %d swaps", ticks, swaps);
+                break;
+            }
+            ++ticks;
+            if (own_surface && swapBuffers) {
+                swapBuffers(dpy, surface);
+                ++swaps;
+                if (swaps <= 3 || swaps % 120 == 0) {
+                    LOGI("render drive: host swap #%d (eglSwapBuffers)", swaps);
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+        }
+        LOGI("render drive: stopped after %d ticks, %d host swaps", ticks, swaps);
+        return swaps > 0 || ticks > 0;
+    }
+
     // The guest dex loader supplied by GameHostActivity. Kept as a plain
     // reference: the Java side holds the loader for the whole session.
     void set_guest_loader(jobject loader) { guest_loader_ = loader; }
+    void set_guest_activity(jobject activity) { guest_thiz_ = activity; }
+
+    // Per-session filesystem context. Everything the guest believes it can see
+    // outside the sandbox is folded back into the game's private directory.
+    void set_game_context(const std::string& root, const std::string& package_name) {
+        game_root_ = root;
+        package_ = package_name;
+        payload_dir_ = root + "/payload";
+        obb_dir_ = root + "/obb";
+        data_dir_ = root + "/data";
+        ::mkdir(game_root_.c_str(), 0700);
+        ::mkdir(obb_dir_.c_str(), 0700);
+        ::mkdir(data_dir_.c_str(), 0700);
+        ::mkdir((game_root_ + "/cache").c_str(), 0700);
+        translate_log_.clear();
+    }
+
+    void set_host_window(ANativeWindow* window) { host_window_ = window; }
+
+    // Guest images 0..n-1 are the payloads mapped at session start; anything
+    // dlopen()ed later takes the next slot.
+    void reserve_image_slots(size_t used) { next_runtime_slot_ = static_cast<uint32_t>(used); }
 
     // ---- 64-bit -> 32-bit reference map -----------------------------------
     uint32_t to_guest_ref(void* p) {
@@ -1212,7 +1450,7 @@ private:
         ne.sig = sig;
         parse_signature(sig, ne);
 
-        void* code = Arm64Trampolines::emit(ne.id, reinterpret_cast<void*>(&bridge_native_entry));
+        void* code = HostTrampolines::emit(ne.id, reinterpret_cast<void*>(&bridge_native_entry));
         if (!code) {
             env_->DeleteLocalRef(cls);
             return false;
@@ -1229,6 +1467,7 @@ private:
             return false;
         }
 
+        entry_points_[e.class_path + "." + e.method] = e.fn;
         LOGI("  bound %s.%s%s -> guest %08x", e.class_path.c_str(), e.method.c_str(),
              sig.c_str(), e.fn);
         env_->DeleteLocalRef(cls);
@@ -1429,7 +1668,274 @@ private:
         return v;
     }
 
+    // =====================================================================
+    // Filesystem redirection
+    //
+    // A legacy game hardcodes /sdcard/Android/obb/<package>/... and friends.
+    // This process can never open those paths (scoped storage, and no shared
+    // storage grant on many devices), so every path that names the package is
+    // rewritten onto the ingested copy before it reaches the host.
+    // =====================================================================
+    std::string translate_path(const std::string& in, const char* why) {
+        if (in.empty()) return in;
+
+        std::string out = in;
+        bool changed = false;
+
+        if (!package_.empty()) {
+            auto fold = [&](const std::string& marker, const std::string& target) {
+                const size_t at = in.find(marker);
+                if (at == std::string::npos) return false;
+                const size_t rest = at + marker.size();
+                if (rest < in.size() && in[rest] != '/') return false;
+                out = target + in.substr(rest);
+                changed = true;
+                return true;
+            };
+
+            changed = fold("/Android/obb/" + package_, obb_dir_);
+            if (!changed) changed = fold("/Android/data/" + package_, data_dir_ + "/external");
+            if (!changed) changed = fold("/data/data/" + package_, data_dir_);
+            if (!changed) changed = fold("/data/user/0/" + package_, data_dir_);
+            if (!changed) changed = fold("/data/user_de/0/" + package_, data_dir_);
+
+            // Any other absolute path under shared storage that mentions the
+            // package: keep only its basename inside our private data dir.
+            if (!changed && !in.empty() && in[0] == '/' &&
+                in.find(package_) != std::string::npos &&
+                (in.compare(0, 7, "/sdcard") == 0 ||
+                 in.compare(0, 8, "/storage") == 0 ||
+                 in.compare(0, 11, "/mnt/sdcard") == 0)) {
+                const size_t slash = in.find_last_of('/');
+                out = data_dir_ + "/" + in.substr(slash + 1);
+                changed = true;
+            }
+        }
+
+        if (changed && translate_log_.insert(in).second) {
+            LOGI("%s: %s -> %s", why, in.c_str(), out.c_str());
+        }
+        return out;
+    }
+
+    // =====================================================================
+    // Runtime dlopen / dlsym
+    //
+    // A guest that loads another 32-bit library must get it mapped into the
+    // emulated address space, never handed to the host linker. The guest sees
+    // an opaque 32-bit handle; the real object is a LoadedLibrary.
+    // =====================================================================
+    std::string payload_library_path(const std::string& name) {
+        std::string base = name;
+        const size_t slash = base.find_last_of('/');
+        if (slash != std::string::npos) base = base.substr(slash + 1);
+        if (base.empty()) return {};
+        if (name[0] == '/') return translate_path(name, "dlopen");
+
+        std::string tagged = base;
+        if (tagged.size() > 3 && tagged.compare(tagged.size() - 3, 3, ".so") == 0) {
+            tagged = tagged.substr(0, tagged.size() - 3) + "32.so";
+        }
+        const std::string candidate = payload_dir_ + "/" + tagged;
+        if (::access(candidate.c_str(), R_OK) == 0) return candidate;
+        return payload_dir_ + "/" + base;
+    }
+
+    uint32_t guest_dlopen(const std::string& name) {
+        if (name.empty()) return 0;
+        auto known = dl_handles_.find(name);
+        if (known != dl_handles_.end()) return known->second;
+
+        const std::string path = payload_library_path(name);
+        if (path.empty() || ::access(path.c_str(), R_OK) != 0) {
+            LOGW("dlopen(%s): no ingested payload named %s", name.c_str(), path.c_str());
+            return 0;
+        }
+
+        // Guest images live between kImageBase0 and the stack top. There are
+        // at most 60 usable 16 MB slots before that would collide with the
+        // stack, so a runaway dlopen loop is refused rather than corrupting
+        // the address space.
+        if (next_runtime_slot_ >= (kStackTop - kImageBase0) / kImageStride) {
+            LOGE("dlopen(%s): no free guest image slots", name.c_str());
+            return 0;
+        }
+        const uint32_t base = kImageBase0 + (next_runtime_slot_++) * kImageStride;
+        LoadedLibrary* lib = linker_.load(path, base);
+        if (!lib) return 0;
+
+        linker_.link_all();   // relocates only the newly loaded object
+        run_constructors(*lib);
+        bind_exports_of(lib);
+
+        const uint32_t onload = export_of(lib, "JNI_OnLoad");
+        if (onload) {
+            uint32_t ret = 0;
+            call_onload(onload, ret);
+        }
+
+        const uint32_t handle = to_guest_ref(
+            reinterpret_cast<void*>(static_cast<uintptr_t>(base)));
+        dl_handles_[name] = handle;
+        dl_libs_[base] = lib;
+        LOGI("dlopen(%s) -> %s @ %08x (guest handle %08x)", name.c_str(), path.c_str(),
+             base, handle);
+        return handle;
+    }
+
+    uint32_t guest_dlsym(uint32_t handle, const std::string& symbol) {
+        if (symbol.empty()) return 0;
+        auto lookup = [&symbol](const LoadedLibrary* lib) -> uint32_t {
+            if (!lib) return 0;
+            auto it = lib->exports.find(symbol);
+            return it == lib->exports.end() ? 0u : it->second;
+        };
+
+        if (handle) {
+            const uint32_t base = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(
+                from_guest_ref(handle)));
+            auto it = dl_libs_.find(base);
+            if (it != dl_libs_.end()) return lookup(it->second);
+        }
+        for (const auto* lib : linker_.libs()) {
+            const uint32_t at = lookup(lib);
+            if (at) return at;
+        }
+        LOGW("dlsym(handle %08x, %s) not found in any mapped payload", handle,
+             symbol.c_str());
+        return 0;
+    }
+
+    void bind_exports_of(LoadedLibrary* lib) {
+        if (!lib) return;
+        size_t bound = 0;
+        for (const auto& kv : lib->exports) {
+            JavaExport e;
+            if (!StaticLinker::parse_java_symbol(kv.first, e.class_path, e.method)) continue;
+            e.fn = kv.second;
+            if (bind_one(e)) ++bound;
+            else pending_.push_back(e);
+        }
+        if (bound) {
+            LOGI("%s: %zu Java_* exports bound after runtime load", lib->path.c_str(), bound);
+        }
+    }
+
+    // =====================================================================
+    // mmap / munmap
+    //
+    // Anonymous mappings come from the guest heap; file-backed mappings are
+    // read into guest memory. The guest never receives a host address, and no
+    // host page is mapped into the emulator.
+    // =====================================================================
+    static constexpr uint32_t kMapFailed = 0xFFFFFFFFu;
+
+    // AAPCS puts arguments 0..3 in r0..r3 and everything after that on the
+    // stack. arg() only reads registers, so the 5th/6th arguments of calls like
+    // mmap() must be fetched from [sp].
+    uint32_t stacked_arg(size_t i) {
+        if (i < 4) return arg(i);
+        uint32_t sp = 0;
+        emu_.reg_read(UC_ARM_REG_SP, sp);
+        return emu_.read_u32(sp + static_cast<uint32_t>((i - 4) * 4));
+    }
+
+    float stacked_f_arg(size_t i) {
+        const uint32_t bits = stacked_arg(i);
+        float f;
+        std::memcpy(&f, &bits, sizeof f);
+        return f;
+    }
+
+    uint32_t imp_mmap(bool mmap64) {
+        (void)mmap64;
+        const uint32_t len = arg(1);
+        if (len == 0) return kMapFailed;
+
+        const int fd = static_cast<int>(stacked_arg(4));
+        const uint32_t off = stacked_arg(5);
+        const uint32_t p = emu_.alloc(len, kPageSize);
+        if (!p) {
+            LOGE("mmap(%u) failed: guest heap exhausted", len);
+            return kMapFailed;
+        }
+
+        if (fd >= 0) {
+            const int hfd = host_fd(static_cast<uint32_t>(fd));
+            if (hfd >= 0) {
+                std::vector<uint8_t> buf(1u << 20);
+                size_t done = 0;
+                while (done < len) {
+                    const size_t want = std::min(buf.size(), len - done);
+                    const ssize_t n = ::pread(hfd, buf.data(), want, off + done);
+                    if (n <= 0) break;
+                    emu_.write(p + static_cast<uint32_t>(done), buf.data(),
+                               static_cast<size_t>(n));
+                    done += static_cast<size_t>(n);
+                }
+            } else {
+                LOGW("mmap: guest fd %d is not open", fd);
+            }
+        }
+        LOGI("mmap(len=%u, fd=%d, off=%u) -> guest %08x", len, fd, off, p);
+        return p;
+    }
+
+    uint32_t imp_munmap() {
+        emu_.release(arg(0), arg(1));
+        return 0u;
+    }
+
+    // =====================================================================
+    // EGL / GLES forwarding
+    //
+    // The guest calls the real host EGL and GLES drivers, but every opaque
+    // 64-bit object pointer (display, config, context, surface) is exchanged
+    // for a 32-bit guest handle. Window surfaces are re-pointed at the
+    // ANativeWindow that GameHostActivity's SurfaceView produced, which is what
+    // puts the guest's frames on the actual screen.
+    // =====================================================================
+    void* host_gl_symbol(const char* name) {
+        auto it = host_syms_.find(name);
+        if (it != host_syms_.end()) return it->second;
+
+        void* sym = nullptr;
+        if (egl_lib_) sym = ::dlsym(egl_lib_, name);
+        if (!sym && gles_lib_) sym = ::dlsym(gles_lib_, name);
+        host_syms_[name] = sym;
+        return sym;
+    }
+
+    template <typename T>
+    T gl_proc(const char* name) {
+        return reinterpret_cast<T>(host_gl_symbol(name));
+    }
+
+    EGLDisplay guest_display(uint32_t handle) {
+        return static_cast<EGLDisplay>(from_guest_ref(handle));
+    }
+
+    std::vector<EGLint> read_egl_ints(uint32_t addr) {
+        std::vector<EGLint> out;
+        if (!addr) return out;
+        for (int i = 0; i < 256; ++i) {
+            bool ok = false;
+            const uint32_t v = emu_.read_u32(addr + static_cast<uint32_t>(i * 4), &ok);
+            if (!ok) break;
+            out.push_back(static_cast<EGLint>(v));
+            if (v == EGL_NONE) break;
+        }
+        return out;
+    }
+
+    void open_host_graphics() {
+        egl_lib_ = ::dlopen("libEGL.so", RTLD_NOW | RTLD_LOCAL);
+        gles_lib_ = ::dlopen("libGLESv2.so", RTLD_NOW | RTLD_LOCAL);
+        LOGI("host graphics: libEGL=%p libGLESv2=%p", egl_lib_, gles_lib_);
+    }
+
     uint32_t dispatch_import(size_t slot, const StubSlot& s) {
+        g_last_import = s.name;
         auto it = import_handlers_.find(s.name);
         if (it != import_handlers_.end()) return it->second();
 
@@ -1449,7 +1955,17 @@ private:
 
             case kIdxFindClass: {
                 const std::string name = guest_string(arg(1));
-                jclass c = env_->FindClass(name.c_str());
+                // CheckJNI turns a FindClass with a pending exception into a
+                // process abort. A guest callback that threw has already been
+                // reported; drop the exception so the bridge can continue.
+                if (env_->ExceptionCheck()) {
+                    LOGW("FindClass(%s) with a pending exception; clearing", name.c_str());
+                    env_->ExceptionClear();
+                }
+                // Must resolve through the guest DexClassLoader: env_->FindClass
+                // uses the host application's loader, where the game's classes
+                // do not exist.
+                jclass c = find_class_through(env_, guest_loader_, name);
                 if (!c) { env_->ExceptionClear(); LOGE("FindClass(%s) failed", name.c_str()); }
                 return to_guest_ref(c);
             }
@@ -1459,9 +1975,10 @@ private:
                 return o ? to_guest_ref(env_->GetObjectClass(o)) : 0;
             }
 
-            case kIdxGetSuperclass:
-                return to_guest_ref(env_->GetSuperclass(
-                    static_cast<jclass>(from_guest_ref(arg(1)))));
+            case kIdxGetSuperclass: {
+                auto* c = static_cast<jclass>(from_guest_ref(arg(1)));
+                return c ? to_guest_ref(env_->GetSuperclass(c)) : 0;
+            }
 
             case kIdxGetMethodID: {
                 auto* c = static_cast<jclass>(from_guest_ref(arg(1)));
@@ -1478,8 +1995,15 @@ private:
             case kIdxGetStaticMethodID: {
                 const std::string name = guest_string(arg(2));
                 const std::string sig = guest_string(arg(3));
-                jmethodID m = env_->GetStaticMethodID(static_cast<jclass>(from_guest_ref(arg(1))),
-                                                      name.c_str(), sig.c_str());
+                auto* c = static_cast<jclass>(from_guest_ref(arg(1)));
+                // CheckJNI aborts the process on a null class, so this has to be
+                // a logged miss: a guest class that failed FindClass must not
+                // take the whole bridge down.
+                if (!c) {
+                    LOGW("GetStaticMethodID(%s%s) on null class", name.c_str(), sig.c_str());
+                    return 0;
+                }
+                jmethodID m = env_->GetStaticMethodID(c, name.c_str(), sig.c_str());
                 if (!m) { env_->ExceptionClear(); LOGW("GetStaticMethodID(%s%s) failed", name.c_str(), sig.c_str()); }
                 else method_sigs_[static_cast<void*>(m)] = sig;
                 return to_guest_ref(m);
@@ -1488,8 +2012,12 @@ private:
             case kIdxGetFieldID: {
                 const std::string name = guest_string(arg(2));
                 const std::string sig = guest_string(arg(3));
-                return to_guest_ref(env_->GetFieldID(static_cast<jclass>(from_guest_ref(arg(1))),
-                                                     name.c_str(), sig.c_str()));
+                auto* c = static_cast<jclass>(from_guest_ref(arg(1)));
+                if (!c) {
+                    LOGW("GetFieldID(%s%s) on null class", name.c_str(), sig.c_str());
+                    return 0;
+                }
+                return to_guest_ref(env_->GetFieldID(c, name.c_str(), sig.c_str()));
             }
 
             case kIdxNewStringUTF: {
@@ -1497,9 +2025,10 @@ private:
                 return to_guest_ref(env_->NewStringUTF(s.c_str()));
             }
 
-            case kIdxGetStringUTFLength:
-                return static_cast<uint32_t>(env_->GetStringUTFLength(
-                    static_cast<jstring>(from_guest_ref(arg(1)))));
+            case kIdxGetStringUTFLength: {
+                auto* s = static_cast<jstring>(from_guest_ref(arg(1)));
+                return s ? static_cast<uint32_t>(env_->GetStringUTFLength(s)) : 0u;
+            }
 
             case kIdxGetStringUTFChars: {
                 auto* str = static_cast<jstring>(from_guest_ref(arg(1)));
@@ -1559,10 +2088,11 @@ private:
             case kIdxRegisterNatives:
                 return register_natives();
 
-            case kIdxIsInstanceOf:
-                return env_->IsInstanceOf(static_cast<jobject>(from_guest_ref(arg(1))),
-                                          static_cast<jclass>(from_guest_ref(arg(2))))
-                           ? JNI_TRUE : JNI_FALSE;
+            case kIdxIsInstanceOf: {
+                auto* o = static_cast<jobject>(from_guest_ref(arg(1)));
+                auto* c = static_cast<jclass>(from_guest_ref(arg(2)));
+                return (o && c && env_->IsInstanceOf(o, c)) ? JNI_TRUE : JNI_FALSE;
+            }
 
             case kIdxIsAssignableFrom:
                 return env_->IsAssignableFrom(static_cast<jclass>(from_guest_ref(arg(1))),
@@ -1788,7 +2318,7 @@ private:
     }
 
     uint32_t imp_open() {
-        const std::string path = guest_string(arg(0));
+        const std::string path = translate_path(guest_string(arg(0)), "open");
         const int fd = ::open(path.c_str(), static_cast<int>(arg(1)),
                               static_cast<int>(arg(2)));
         if (fd < 0) {
@@ -1865,7 +2395,7 @@ private:
             if (fd < 0) return static_cast<uint32_t>(-1);
             rc = ::fstat(fd, &st);
         } else {
-            rc = ::stat(guest_string(arg(0)).c_str(), &st);
+            rc = ::stat(translate_path(guest_string(arg(0)), "stat").c_str(), &st);
         }
         if (rc != 0) return static_cast<uint32_t>(-1);
         write_guest_stat(out, st);
@@ -1873,7 +2403,7 @@ private:
     }
 
     uint32_t imp_fopen() {
-        const std::string path = guest_string(arg(0));
+        const std::string path = translate_path(guest_string(arg(0)), "fopen");
         const std::string mode = guest_string(arg(1));
         FILE* f = ::fopen(path.c_str(), mode.c_str());
         if (!f) {
@@ -1910,7 +2440,7 @@ private:
     }
 
     uint32_t imp_opendir() {
-        const std::string path = guest_string(arg(0));
+        const std::string path = translate_path(guest_string(arg(0)), "opendir");
         DIR* d = ::opendir(path.c_str());
         if (!d) return 0;
         const uint32_t h = next_handle_++;
@@ -1970,9 +2500,1088 @@ private:
         }
     }
 
+    // bionic ARM32 struct statfs, filled from the host's statvfs.
+    uint32_t imp_statfs() {
+        const std::string path = translate_path(guest_string(arg(0)), "statfs");
+        const uint32_t out = arg(1);
+        if (!out) return static_cast<uint32_t>(-1);
+
+        struct statvfs vfs {};
+        if (::statvfs(path.c_str(), &vfs) != 0) return static_cast<uint32_t>(-1);
+
+        std::vector<uint8_t> buf(84, 0);   // sizeof(struct statfs) on arm32 bionic
+        auto put64 = [&](size_t off, uint64_t v) { std::memcpy(&buf[off], &v, 8); };
+        auto put32 = [&](size_t off, uint32_t v) { std::memcpy(&buf[off], &v, 4); };
+        put64(0, vfs.f_bsize);      // f_type: value is not inspected for storage checks
+        put64(8, vfs.f_bsize);
+        put64(16, vfs.f_blocks);
+        put64(24, vfs.f_bfree);
+        put64(32, vfs.f_bavail);
+        put64(40, vfs.f_files);
+        put64(48, vfs.f_ffree);
+        put64(64, vfs.f_namemax);
+        put32(72, static_cast<uint32_t>(vfs.f_frsize));
+        emu_.write(out, buf.data(), buf.size());
+        return 0u;
+    }
+
+    // =====================================================================
+    // EGL / GLES entry points
+    //
+    // EGLDisplay / EGLConfig / EGLContext / EGLSurface are 64-bit opaque
+    // pointers on the host. The guest gets a 32-bit handle from the same ref
+    // map JNI uses, so a guest register never has to hold a truncated pointer.
+    // =====================================================================
+    // ---- GLES guest-memory marshalling ------------------------------------
+    //
+    // The host driver only reads 64-bit process memory. Every GLES call that
+    // points at a buffer is staged: the guest bytes are copied into host
+    // scratch memory, the host call runs, and the scratch is dropped. Client
+    // vertex arrays are re-staged at draw time, because the driver dereferences
+    // those pointers only when the draw executes.
+    struct ClientAttribute {
+        bool set = false;
+        GLint size = 4;
+        GLenum type = GL_FLOAT;
+        GLboolean normalized = GL_FALSE;
+        GLsizei stride = 0;
+        uint32_t ptr = 0;
+    };
+
+    ClientAttribute client_attributes_[16] = {};
+    GLuint bound_array_buffer_ = 0;
+    GLuint bound_element_buffer_ = 0;
+    uint32_t brk_base_ = 0;
+    uint32_t brk_used_ = 0;
+    uint32_t tm_guest_ = 0;
+
+    static size_t gl_type_bytes(GLenum type) {
+        switch (type) {
+            case GL_UNSIGNED_BYTE:
+            case GL_BYTE:
+                return 1;
+            case GL_UNSIGNED_SHORT:
+            case GL_SHORT:
+                return 2;
+            default:
+                return 4;
+        }
+    }
+
+    // Components per pixel for the formats the engine uploads, times the
+    // element size, with the packed 16/32-bit types handled explicitly.
+    static size_t gl_pixel_bytes(GLenum format, GLenum type) {
+        constexpr GLenum kUnsignedShort565 = 0x8363;
+        constexpr GLenum kUnsignedShort4444 = 0x8033;
+        constexpr GLenum kUnsignedShort5551 = 0x8034;
+        constexpr GLenum kUnsignedInt2101010 = 0x8368;
+        constexpr GLenum kUnsignedInt248 = 0x84FA;
+        if (type == kUnsignedShort565 || type == kUnsignedShort4444 ||
+            type == kUnsignedShort5551) {
+            return 2;
+        }
+        if (type == kUnsignedInt2101010 || type == kUnsignedInt248) return 4;
+
+        size_t components = 4;
+        switch (format) {
+            case GL_ALPHA:
+            case GL_LUMINANCE:
+            case GL_DEPTH_COMPONENT:
+                components = 1;
+                break;
+            case GL_LUMINANCE_ALPHA:
+                components = 2;
+                break;
+            case GL_RGB:
+                components = 3;
+                break;
+            default:
+                components = 4;
+                break;
+        }
+        return components * gl_type_bytes(type);
+    }
+
+    bool stage_guest(uint32_t addr, size_t len, std::vector<uint8_t>& out) {
+        out.clear();
+        if (len == 0) return true;
+        constexpr size_t kMaxStage = 64u * 1024u * 1024u;
+        if (len > kMaxStage) {
+            LOGW("GLES marshalling: %zu bytes exceeds the stage cap", len);
+            return false;
+        }
+        out.resize(len);
+        if (!emu_.read(addr, out.data(), len)) {
+            out.clear();
+            return false;
+        }
+        return true;
+    }
+
+    // Re-issues glVertexAttribPointer for every client-side attribute with a
+    // host copy of the guest range the draw will touch.
+    void stage_client_attributes(size_t vertex_count,
+                                 std::vector<std::vector<uint8_t>>& storage) {
+        auto fn = gl_proc<void (*)(GLuint, GLint, GLenum, GLboolean, GLsizei,
+                                   const void*)>("glVertexAttribPointer");
+        if (!fn || bound_array_buffer_ != 0) return;
+        storage.reserve(16);
+        for (size_t i = 0; i < 16; ++i) {
+            ClientAttribute& a = client_attributes_[i];
+            if (!a.set) continue;
+            const size_t elem = static_cast<size_t>(a.size) * gl_type_bytes(a.type);
+            const size_t stride = a.stride ? static_cast<size_t>(a.stride) : elem;
+            if (elem == 0 || stride == 0) continue;
+            const size_t bytes = stride * vertex_count + elem;
+            storage.emplace_back();
+            if (!stage_guest(a.ptr, bytes, storage.back())) {
+                storage.pop_back();
+                continue;
+            }
+            fn(static_cast<GLuint>(i), a.size, a.type, a.normalized,
+               static_cast<GLsizei>(stride), storage.back().data());
+        }
+    }
+
+    void install_graphics_handlers() {
+        if (!egl_lib_) {
+            LOGW("graphics: host libEGL.so unavailable; EGL imports stay stubbed");
+            return;
+        }
+
+        import_handlers_["eglGetDisplay"] = [this] {
+            auto fn = gl_proc<EGLDisplay (*)(EGLNativeDisplayType)>("eglGetDisplay");
+            if (!fn) return 0u;
+            EGLDisplay d = fn(reinterpret_cast<EGLNativeDisplayType>(
+                static_cast<uintptr_t>(arg(0))));
+            return to_guest_ref(d);
+        };
+
+        import_handlers_["eglInitialize"] = [this] {
+            auto fn = gl_proc<EGLBoolean (*)(EGLDisplay, EGLint*, EGLint*)>("eglInitialize");
+            if (!fn) return 0u;
+            EGLint major = 0, minor = 0;
+            const EGLBoolean ok = fn(guest_display(arg(0)), &major, &minor);
+            if (arg(1)) emu_.write_u32(arg(1), static_cast<uint32_t>(major));
+            if (arg(2)) emu_.write_u32(arg(2), static_cast<uint32_t>(minor));
+            LOGI("eglInitialize -> %d (EGL %d.%d)", ok, major, minor);
+            return static_cast<uint32_t>(ok);
+        };
+
+        import_handlers_["eglTerminate"] = [this] {
+            auto fn = gl_proc<EGLBoolean (*)(EGLDisplay)>("eglTerminate");
+            return fn ? static_cast<uint32_t>(fn(guest_display(arg(0)))) : 0u;
+        };
+
+        import_handlers_["eglQueryString"] = [this] {
+            auto fn = gl_proc<const char* (*)(EGLDisplay, EGLint)>("eglQueryString");
+            if (!fn) return 0u;
+            const char* s = fn(guest_display(arg(0)), static_cast<EGLint>(arg(1)));
+            return s ? guest_str(s) : 0u;
+        };
+
+        import_handlers_["eglGetConfigs"] = [this] {
+            auto fn = gl_proc<EGLBoolean (*)(EGLDisplay, EGLConfig*, EGLint, EGLint*)>(
+                "eglGetConfigs");
+            if (!fn) return 0u;
+            const EGLint want = static_cast<EGLint>(arg(2));
+            std::vector<EGLConfig> configs(want > 0 ? static_cast<size_t>(want) : 1);
+            EGLint num = 0;
+            const EGLBoolean ok = fn(guest_display(arg(0)), configs.data(), want, &num);
+            if (arg(3)) emu_.write_u32(arg(3), static_cast<uint32_t>(num));
+            if (arg(1) && want > 0) {
+                for (EGLint i = 0; i < std::min(num, want); ++i) {
+                    emu_.write_u32(arg(1) + static_cast<uint32_t>(i * 4),
+                                   to_guest_ref(configs[static_cast<size_t>(i)]));
+                }
+            }
+            return static_cast<uint32_t>(ok);
+        };
+
+        import_handlers_["eglChooseConfig"] = [this] {
+            auto fn = gl_proc<EGLBoolean (*)(EGLDisplay, const EGLint*, EGLConfig*,
+                                             EGLint, EGLint*)>("eglChooseConfig");
+            if (!fn) return 0u;
+            std::vector<EGLint> attribs = read_egl_ints(arg(1));
+            const EGLint want = static_cast<EGLint>(arg(3));
+            std::vector<EGLConfig> configs(want > 0 ? static_cast<size_t>(want) : 1);
+            EGLint num = 0;
+            const EGLBoolean ok = fn(guest_display(arg(0)), attribs.data(),
+                                     configs.data(), want, &num);
+            if (arg(4)) emu_.write_u32(arg(4), static_cast<uint32_t>(num));
+            if (arg(2) && want > 0) {
+                for (EGLint i = 0; i < std::min(num, want); ++i) {
+                    emu_.write_u32(arg(2) + static_cast<uint32_t>(i * 4),
+                                   to_guest_ref(configs[static_cast<size_t>(i)]));
+                }
+            }
+            LOGI("eglChooseConfig -> %d (%d configs)", ok, num);
+            return static_cast<uint32_t>(ok);
+        };
+
+        import_handlers_["eglGetConfigAttrib"] = [this] {
+            auto fn = gl_proc<EGLBoolean (*)(EGLDisplay, EGLConfig, EGLint, EGLint*)>(
+                "eglGetConfigAttrib");
+            if (!fn) return 0u;
+            EGLint value = 0;
+            const EGLBoolean ok = fn(guest_display(arg(0)),
+                                     static_cast<EGLConfig>(from_guest_ref(arg(1))),
+                                     static_cast<EGLint>(arg(2)), &value);
+            if (arg(3)) emu_.write_u32(arg(3), static_cast<uint32_t>(value));
+            return static_cast<uint32_t>(ok);
+        };
+
+        import_handlers_["eglCreateContext"] = [this] {
+            auto fn = gl_proc<EGLContext (*)(EGLDisplay, EGLConfig, EGLContext,
+                                             const EGLint*)>("eglCreateContext");
+            if (!fn) return 0u;
+            std::vector<EGLint> attribs = read_egl_ints(arg(3));
+            EGLContext ctx = fn(guest_display(arg(0)),
+                                static_cast<EGLConfig>(from_guest_ref(arg(1))),
+                                static_cast<EGLContext>(from_guest_ref(arg(2))),
+                                attribs.data());
+            LOGI("eglCreateContext -> %p", ctx);
+            return to_guest_ref(ctx);
+        };
+
+        // The single most important call in the whole bridge: it binds the
+        // guest's rendering to the real ANativeWindow behind the host's
+        // SurfaceView, which is what makes frames visible.
+        import_handlers_["eglCreateWindowSurface"] = [this] {
+            auto fn = gl_proc<EGLSurface (*)(EGLDisplay, EGLConfig, EGLNativeWindowType,
+                                             const EGLint*)>("eglCreateWindowSurface");
+            if (!fn) return 0u;
+
+            ANativeWindow* window = static_cast<ANativeWindow*>(from_guest_ref(arg(2)));
+            if (!window) window = host_window_;
+            if (!window) {
+                LOGE("eglCreateWindowSurface: no host ANativeWindow; "
+                     "did GameHostActivity attach its Surface?");
+                return 0u;
+            }
+
+            std::vector<EGLint> attribs = read_egl_ints(arg(3));
+            EGLSurface surface = fn(guest_display(arg(0)),
+                                    static_cast<EGLConfig>(from_guest_ref(arg(1))),
+                                    reinterpret_cast<EGLNativeWindowType>(window),
+                                    attribs.data());
+            if (surface) ++egl_window_surfaces_;
+            LOGI("eglCreateWindowSurface(window=%p) -> %p", window, surface);
+            return to_guest_ref(surface);
+        };
+
+        import_handlers_["eglCreatePbufferSurface"] = [this] {
+            auto fn = gl_proc<EGLSurface (*)(EGLDisplay, EGLConfig, const EGLint*)>(
+                "eglCreatePbufferSurface");
+            if (!fn) return 0u;
+            std::vector<EGLint> attribs = read_egl_ints(arg(2));
+            EGLSurface s = fn(guest_display(arg(0)),
+                              static_cast<EGLConfig>(from_guest_ref(arg(1))),
+                              attribs.data());
+            return to_guest_ref(s);
+        };
+
+        import_handlers_["eglMakeCurrent"] = [this] {
+            auto fn = gl_proc<EGLBoolean (*)(EGLDisplay, EGLSurface, EGLSurface,
+                                             EGLContext)>("eglMakeCurrent");
+            if (!fn) return 0u;
+            const EGLBoolean ok = fn(guest_display(arg(0)),
+                                     static_cast<EGLSurface>(from_guest_ref(arg(1))),
+                                     static_cast<EGLSurface>(from_guest_ref(arg(2))),
+                                     static_cast<EGLContext>(from_guest_ref(arg(3))));
+            LOGI("eglMakeCurrent -> %d", ok);
+            return static_cast<uint32_t>(ok);
+        };
+
+        import_handlers_["eglSwapBuffers"] = [this] {
+            auto fn = gl_proc<EGLBoolean (*)(EGLDisplay, EGLSurface)>("eglSwapBuffers");
+            if (!fn) return 0u;
+            const EGLBoolean ok = fn(guest_display(arg(0)),
+                                     static_cast<EGLSurface>(from_guest_ref(arg(1))));
+            if (++swap_count_ <= 5 || swap_count_ % 120 == 0) {
+                LOGI("eglSwapBuffers #%u -> %d", swap_count_, ok);
+            }
+            return static_cast<uint32_t>(ok);
+        };
+
+        import_handlers_["eglSwapInterval"] = [this] {
+            auto fn = gl_proc<EGLBoolean (*)(EGLDisplay, EGLint)>("eglSwapInterval");
+            return fn ? static_cast<uint32_t>(
+                            fn(guest_display(arg(0)), static_cast<EGLint>(arg(1))))
+                      : 0u;
+        };
+
+        import_handlers_["eglQuerySurface"] = [this] {
+            auto fn = gl_proc<EGLBoolean (*)(EGLDisplay, EGLSurface, EGLint, EGLint*)>(
+                "eglQuerySurface");
+            if (!fn) return 0u;
+            EGLint value = 0;
+            const EGLBoolean ok = fn(guest_display(arg(0)),
+                                     static_cast<EGLSurface>(from_guest_ref(arg(1))),
+                                     static_cast<EGLint>(arg(2)), &value);
+            if (arg(3)) emu_.write_u32(arg(3), static_cast<uint32_t>(value));
+            return static_cast<uint32_t>(ok);
+        };
+
+        import_handlers_["eglSurfaceAttrib"] = [this] {
+            auto fn = gl_proc<EGLBoolean (*)(EGLDisplay, EGLSurface, EGLint, EGLint)>(
+                "eglSurfaceAttrib");
+            return fn ? static_cast<uint32_t>(fn(guest_display(arg(0)),
+                                                 static_cast<EGLSurface>(from_guest_ref(arg(1))),
+                                                 static_cast<EGLint>(arg(2)),
+                                                 static_cast<EGLint>(arg(3))))
+                      : 0u;
+        };
+
+        import_handlers_["eglDestroySurface"] = [this] {
+            auto fn = gl_proc<EGLBoolean (*)(EGLDisplay, EGLSurface)>("eglDestroySurface");
+            if (!fn) return 0u;
+            const EGLBoolean ok = fn(guest_display(arg(0)),
+                                     static_cast<EGLSurface>(from_guest_ref(arg(1))));
+            if (ok && egl_window_surfaces_) --egl_window_surfaces_;
+            return static_cast<uint32_t>(ok);
+        };
+
+        import_handlers_["eglDestroyContext"] = [this] {
+            auto fn = gl_proc<EGLBoolean (*)(EGLDisplay, EGLContext)>("eglDestroyContext");
+            return fn ? static_cast<uint32_t>(fn(guest_display(arg(0)),
+                                                 static_cast<EGLContext>(from_guest_ref(arg(1)))))
+                      : 0u;
+        };
+
+        import_handlers_["eglGetError"] = [this] {
+            auto fn = gl_proc<EGLint (*)()>("eglGetError");
+            return fn ? static_cast<uint32_t>(fn()) : 0u;
+        };
+
+        import_handlers_["eglBindAPI"] = [this] {
+            auto fn = gl_proc<EGLBoolean (*)(EGLenum)>("eglBindAPI");
+            return fn ? static_cast<uint32_t>(fn(static_cast<EGLenum>(arg(0)))) : 0u;
+        };
+
+        import_handlers_["eglQueryAPI"] = [this] {
+            auto fn = gl_proc<EGLenum (*)()>("eglQueryAPI");
+            return fn ? static_cast<uint32_t>(fn()) : 0u;
+        };
+
+        import_handlers_["eglGetCurrentContext"] = [this] {
+            auto fn = gl_proc<EGLContext (*)()>("eglGetCurrentContext");
+            return fn ? to_guest_ref(fn()) : 0u;
+        };
+        import_handlers_["eglGetCurrentDisplay"] = [this] {
+            auto fn = gl_proc<EGLDisplay (*)()>("eglGetCurrentDisplay");
+            return fn ? to_guest_ref(fn()) : 0u;
+        };
+        import_handlers_["eglGetCurrentSurface"] = [this] {
+            auto fn = gl_proc<EGLSurface (*)(EGLint)>("eglGetCurrentSurface");
+            return fn ? to_guest_ref(fn(static_cast<EGLint>(arg(0)))) : 0u;
+        };
+        import_handlers_["eglReleaseThread"] = [] { return 0u; };
+        import_handlers_["eglWaitGL"] = [] { return 1u; };
+        import_handlers_["eglWaitClient"] = [] { return 1u; };
+
+        // Resolving through the guest's own eglGetProcAddress must hand back a
+        // guest-callable address, not a host pointer. A trap-page stub looks up
+        // the same handler table by name.
+        import_handlers_["eglGetProcAddress"] = [this] {
+            const std::string name = guest_string(arg(0));
+            if (name.empty()) return 0u;
+            return make_stub(kStubImport, 0, name);
+        };
+
+        // ---- GLES2 surface clearing / state subset ----------------------
+        // Only calls whose arguments are scalars are forwarded directly. Any
+        // call that takes a guest-memory pointer (glDrawElements, glTexImage2D,
+        // glBufferData, glShaderSource, ...) must be marshalled first, so it is
+        // deliberately left to the report-only stub.
+#define ZB_GL_V(name, sig, call)                                  \
+    import_handlers_[name] = [this] {                             \
+        auto fn = gl_proc<void (*) sig>(name);                    \
+        if (fn) fn call;                                          \
+        return 0u;                                                \
+    };
+#define ZB_GL_R(name, sig, call)                                  \
+    import_handlers_[name] = [this] {                             \
+        auto fn = gl_proc<GLenum (*) sig>(name);                  \
+        return fn ? static_cast<uint32_t>(fn call) : 0u;          \
+    };
+
+        ZB_GL_V("glClearColor", (GLfloat, GLfloat, GLfloat, GLfloat),
+                (f_arg(0), f_arg(1), f_arg(2), f_arg(3)));
+        ZB_GL_V("glClear", (GLbitfield), (static_cast<GLbitfield>(arg(0))));
+        ZB_GL_V("glViewport", (GLint, GLint, GLint, GLint),
+                (static_cast<GLint>(arg(0)), static_cast<GLint>(arg(1)),
+                 static_cast<GLint>(arg(2)), static_cast<GLint>(arg(3))));
+        ZB_GL_V("glScissor", (GLint, GLint, GLint, GLint),
+                (static_cast<GLint>(arg(0)), static_cast<GLint>(arg(1)),
+                 static_cast<GLint>(arg(2)), static_cast<GLint>(arg(3))));
+        ZB_GL_V("glEnable", (GLenum), (static_cast<GLenum>(arg(0))));
+        ZB_GL_V("glDisable", (GLenum), (static_cast<GLenum>(arg(0))));
+        ZB_GL_V("glBlendFunc", (GLenum, GLenum),
+                (static_cast<GLenum>(arg(0)), static_cast<GLenum>(arg(1))));
+        ZB_GL_V("glBlendFuncSeparate", (GLenum, GLenum, GLenum, GLenum),
+                (static_cast<GLenum>(arg(0)), static_cast<GLenum>(arg(1)),
+                 static_cast<GLenum>(arg(2)), static_cast<GLenum>(arg(3))));
+        ZB_GL_V("glDepthFunc", (GLenum), (static_cast<GLenum>(arg(0))));
+        ZB_GL_V("glDepthMask", (GLboolean), (static_cast<GLboolean>(arg(0) & 1u)));
+        ZB_GL_V("glColorMask", (GLboolean, GLboolean, GLboolean, GLboolean),
+                (static_cast<GLboolean>(arg(0) & 1u), static_cast<GLboolean>(arg(1) & 1u),
+                 static_cast<GLboolean>(arg(2) & 1u), static_cast<GLboolean>(arg(3) & 1u)));
+        ZB_GL_V("glCullFace", (GLenum), (static_cast<GLenum>(arg(0))));
+        ZB_GL_V("glFrontFace", (GLenum), (static_cast<GLenum>(arg(0))));
+        ZB_GL_V("glLineWidth", (GLfloat), (f_arg(0)));
+        ZB_GL_V("glClearDepthf", (GLfloat), (f_arg(0)));
+        ZB_GL_V("glDepthRangef", (GLfloat, GLfloat), (f_arg(0), f_arg(1)));
+        ZB_GL_V("glPolygonOffset", (GLfloat, GLfloat), (f_arg(0), f_arg(1)));
+        ZB_GL_V("glPixelStorei", (GLenum, GLint),
+                (static_cast<GLenum>(arg(0)), static_cast<GLint>(arg(1))));
+        ZB_GL_V("glUseProgram", (GLuint), (static_cast<GLuint>(arg(0))));
+        ZB_GL_V("glBindBuffer", (GLenum, GLuint),
+                (static_cast<GLenum>(arg(0)), static_cast<GLuint>(arg(1))));
+        ZB_GL_V("glBindTexture", (GLenum, GLuint),
+                (static_cast<GLenum>(arg(0)), static_cast<GLuint>(arg(1))));
+        ZB_GL_V("glBindFramebuffer", (GLenum, GLuint),
+                (static_cast<GLenum>(arg(0)), static_cast<GLuint>(arg(1))));
+        ZB_GL_V("glBindRenderbuffer", (GLenum, GLuint),
+                (static_cast<GLenum>(arg(0)), static_cast<GLuint>(arg(1))));
+        ZB_GL_V("glActiveTexture", (GLenum), (static_cast<GLenum>(arg(0))));
+        ZB_GL_V("glDrawArrays", (GLenum, GLint, GLsizei),
+                (static_cast<GLenum>(arg(0)), static_cast<GLint>(arg(1)),
+                 static_cast<GLsizei>(arg(2))));
+        ZB_GL_V("glTexParameteri", (GLenum, GLenum, GLint),
+                (static_cast<GLenum>(arg(0)), static_cast<GLenum>(arg(1)),
+                 static_cast<GLint>(arg(2))));
+        ZB_GL_V("glTexParameterf", (GLenum, GLenum, GLfloat),
+                (static_cast<GLenum>(arg(0)), static_cast<GLenum>(arg(1)), f_arg(2)));
+        ZB_GL_V("glGenerateMipmap", (GLenum), (static_cast<GLenum>(arg(0))));
+        ZB_GL_V("glEnableVertexAttribArray", (GLuint), (static_cast<GLuint>(arg(0))));
+        ZB_GL_V("glDisableVertexAttribArray", (GLuint), (static_cast<GLuint>(arg(0))));
+        ZB_GL_V("glStencilMask", (GLuint), (static_cast<GLuint>(arg(0))));
+        ZB_GL_V("glStencilFunc", (GLenum, GLint, GLuint),
+                (static_cast<GLenum>(arg(0)), static_cast<GLint>(arg(1)),
+                 static_cast<GLuint>(arg(2))));
+        ZB_GL_V("glStencilOp", (GLenum, GLenum, GLenum),
+                (static_cast<GLenum>(arg(0)), static_cast<GLenum>(arg(1)),
+                 static_cast<GLenum>(arg(2))));
+        ZB_GL_V("glSampleCoverage", (GLfloat, GLboolean),
+                (f_arg(0), static_cast<GLboolean>(arg(1) & 1u)));
+        ZB_GL_V("glUniform1i", (GLint, GLint),
+                (static_cast<GLint>(arg(0)), static_cast<GLint>(arg(1))));
+        ZB_GL_V("glUniform1f", (GLint, GLfloat),
+                (static_cast<GLint>(arg(0)), f_arg(1)));
+        ZB_GL_V("glUniform2f", (GLint, GLfloat, GLfloat),
+                (static_cast<GLint>(arg(0)), f_arg(1), f_arg(2)));
+        ZB_GL_V("glUniform3f", (GLint, GLfloat, GLfloat, GLfloat),
+                (static_cast<GLint>(arg(0)), f_arg(1), f_arg(2), f_arg(3)));
+        ZB_GL_V("glUniform4f", (GLint, GLfloat, GLfloat, GLfloat, GLfloat),
+                (static_cast<GLint>(arg(0)), f_arg(1), f_arg(2), f_arg(3),
+                 stacked_f_arg(4)));
+        ZB_GL_V("glUniform2i", (GLint, GLint, GLint),
+                (static_cast<GLint>(arg(0)), static_cast<GLint>(arg(1)),
+                 static_cast<GLint>(arg(2))));
+        ZB_GL_V("glUniform3i", (GLint, GLint, GLint, GLint),
+                (static_cast<GLint>(arg(0)), static_cast<GLint>(arg(1)),
+                 static_cast<GLint>(arg(2)), static_cast<GLint>(arg(3))));
+        ZB_GL_V("glUniform4i", (GLint, GLint, GLint, GLint, GLint),
+                (static_cast<GLint>(arg(0)), static_cast<GLint>(arg(1)),
+                 static_cast<GLint>(arg(2)), static_cast<GLint>(arg(3)),
+                 static_cast<GLint>(stacked_arg(4))));
+        ZB_GL_V("glFlush", (), ());
+        ZB_GL_V("glFinish", (), ());
+        ZB_GL_R("glGetError", (), ());
+        ZB_GL_R("glCheckFramebufferStatus", (GLenum), (static_cast<GLenum>(arg(0))));
+
+#undef ZB_GL_V
+#undef ZB_GL_R
+
+        // Strings come from the host driver as 64-bit pointers; copy them into
+        // guest memory instead of truncating them into R0.
+        import_handlers_["glGetString"] = [this] {
+            auto fn = gl_proc<const GLubyte* (*)(GLenum)>("glGetString");
+            if (!fn) return 0u;
+            const char* s = reinterpret_cast<const char*>(fn(static_cast<GLenum>(arg(0))));
+            return s ? guest_str(s) : 0u;
+        };
+
+        import_handlers_["glGetIntegerv"] = [this] {
+            auto fn = gl_proc<void (*)(GLenum, GLint*)>("glGetIntegerv");
+            const uint32_t out = arg(1);
+            if (!fn || !out) return 0u;
+            GLint values[16] = {0};
+            fn(static_cast<GLenum>(arg(0)), values);
+            size_t count = 1;
+            switch (static_cast<GLenum>(arg(0))) {
+                case GL_VIEWPORT:
+                case GL_SCISSOR_BOX:
+                case GL_COLOR_CLEAR_VALUE:
+                    count = 4;
+                    break;
+                case GL_MAX_VIEWPORT_DIMS:
+                    count = 2;
+                    break;
+                default:
+                    break;
+            }
+            emu_.write(out, values, count * sizeof(GLint));
+            return 0u;
+        };
+
+        import_handlers_["glGetFloatv"] = [this] {
+            auto fn = gl_proc<void (*)(GLenum, GLfloat*)>("glGetFloatv");
+            const uint32_t out = arg(1);
+            if (!fn || !out) return 0u;
+            GLfloat values[16] = {0};
+            fn(static_cast<GLenum>(arg(0)), values);
+            emu_.write(out, values, sizeof(GLfloat));
+            return 0u;
+        };
+
+        // ---- shader / program pipeline --------------------------------
+        import_handlers_["glCreateShader"] = [this] {
+            auto fn = gl_proc<GLuint (*)(GLenum)>("glCreateShader");
+            return fn ? static_cast<uint32_t>(fn(static_cast<GLenum>(arg(0)))) : 0u;
+        };
+        import_handlers_["glCreateProgram"] = [this] {
+            auto fn = gl_proc<GLuint (*)()>("glCreateProgram");
+            return fn ? static_cast<uint32_t>(fn()) : 0u;
+        };
+
+        auto one_uint = [this](const char* name) {
+            import_handlers_[name] = [this, name] {
+                auto fn = gl_proc<void (*)(GLuint)>(name);
+                if (fn) fn(static_cast<GLuint>(arg(0)));
+                return 0u;
+            };
+        };
+        one_uint("glCompileShader");
+        one_uint("glLinkProgram");
+        one_uint("glValidateProgram");
+        one_uint("glDeleteShader");
+        one_uint("glDeleteProgram");
+
+        auto two_uints = [this](const char* name) {
+            import_handlers_[name] = [this, name] {
+                auto fn = gl_proc<void (*)(GLuint, GLuint)>(name);
+                if (fn) fn(static_cast<GLuint>(arg(0)), static_cast<GLuint>(arg(1)));
+                return 0u;
+            };
+        };
+        two_uints("glAttachShader");
+        two_uints("glDetachShader");
+
+        auto get_iv = [this](const char* name) {
+            import_handlers_[name] = [this, name] {
+                auto fn = gl_proc<void (*)(GLuint, GLenum, GLint*)>(name);
+                const uint32_t out = arg(2);
+                if (!fn || !out) return 0u;
+                GLint value = 0;
+                fn(static_cast<GLuint>(arg(0)), static_cast<GLenum>(arg(1)), &value);
+                emu_.write(out, &value, sizeof value);
+                return 0u;
+            };
+        };
+        get_iv("glGetShaderiv");
+        get_iv("glGetProgramiv");
+
+        auto info_log = [this](const char* name) {
+            import_handlers_[name] = [this, name] {
+                auto fn = gl_proc<void (*)(GLuint, GLsizei, GLsizei*, GLchar*)>(name);
+                const GLsizei capacity = static_cast<GLsizei>(arg(1));
+                const uint32_t length_out = arg(2);
+                const uint32_t buffer = arg(3);
+                if (!fn || !buffer) return 0u;
+                std::vector<char> text(capacity > 0 ? static_cast<size_t>(capacity) : 1u, '\0');
+                GLsizei written = 0;
+                fn(static_cast<GLuint>(arg(0)), capacity, &written, text.data());
+                if (written < 0) written = 0;
+                if (written > capacity) written = capacity;
+                emu_.write(buffer, text.data(), static_cast<size_t>(written));
+                if (length_out) emu_.write(length_out, &written, sizeof written);
+                return 0u;
+            };
+        };
+        info_log("glGetShaderInfoLog");
+        info_log("glGetProgramInfoLog");
+
+        import_handlers_["glShaderSource"] = [this] {
+            auto fn = gl_proc<void (*)(GLuint, GLsizei, const GLchar* const*,
+                                       const GLint*)>("glShaderSource");
+            if (!fn) return 0u;
+            const GLsizei count = static_cast<GLsizei>(arg(1));
+            if (count <= 0 || count > 64) return 0u;
+            std::vector<uint32_t> pointers(static_cast<size_t>(count), 0);
+            if (!emu_.read(arg(2), pointers.data(), pointers.size() * sizeof(uint32_t))) {
+                return 0u;
+            }
+            std::vector<std::vector<char>> storage(static_cast<size_t>(count));
+            std::vector<const GLchar*> strings(static_cast<size_t>(count), nullptr);
+            for (GLsizei i = 0; i < count; ++i) {
+                const size_t slot = static_cast<size_t>(i);
+                int32_t declared = -1;
+                if (arg(3)) {
+                    emu_.read(arg(3) + static_cast<uint32_t>(slot) * 4, &declared, 4);
+                }
+                if (declared <= 0) {
+                    const std::string s = emu_.read_cstr(pointers[slot], 1u << 20);
+                    storage[slot].assign(s.begin(), s.end());
+                } else {
+                    storage[slot].resize(static_cast<size_t>(declared));
+                    emu_.read(pointers[slot], storage[slot].data(),
+                              static_cast<size_t>(declared));
+                }
+                strings[slot] = storage[slot].data();
+            }
+            fn(static_cast<GLuint>(arg(0)), count, strings.data(), nullptr);
+            return 0u;
+        };
+
+        import_handlers_["glBindAttribLocation"] = [this] {
+            auto fn = gl_proc<void (*)(GLuint, GLuint, const GLchar*)>(
+                    "glBindAttribLocation");
+            if (!fn) return 0u;
+            const std::string name = guest_string(arg(2));
+            fn(static_cast<GLuint>(arg(0)), static_cast<GLuint>(arg(1)), name.c_str());
+            return 0u;
+        };
+
+        auto get_location = [this](const char* name) {
+            import_handlers_[name] = [this, name] {
+                auto fn = gl_proc<GLint (*)(GLuint, const GLchar*)>(name);
+                if (!fn) return 0u;
+                const std::string symbol = guest_string(arg(1));
+                return static_cast<uint32_t>(fn(static_cast<GLuint>(arg(0)),
+                                                 symbol.c_str()));
+            };
+        };
+        get_location("glGetUniformLocation");
+        get_location("glGetAttribLocation");
+
+        import_handlers_["glGetShaderSource"] = [this] {
+            auto fn = gl_proc<void (*)(GLuint, GLsizei, GLsizei*, GLchar*)>(
+                    "glGetShaderSource");
+            const GLsizei capacity = static_cast<GLsizei>(arg(1));
+            const uint32_t length_out = arg(2);
+            const uint32_t buffer = arg(3);
+            if (!fn || !buffer) return 0u;
+            std::vector<char> text(capacity > 0 ? static_cast<size_t>(capacity) : 1u, '\0');
+            GLsizei written = 0;
+            fn(static_cast<GLuint>(arg(0)), capacity, &written, text.data());
+            if (written < 0) written = 0;
+            if (written > capacity) written = capacity;
+            emu_.write(buffer, text.data(), static_cast<size_t>(written));
+            if (length_out) emu_.write(length_out, &written, sizeof written);
+            return 0u;
+        };
+
+        // ---- buffer objects ------------------------------------------
+        import_handlers_["glBindBuffer"] = [this] {
+            auto fn = gl_proc<void (*)(GLenum, GLuint)>("glBindBuffer");
+            const GLenum target = static_cast<GLenum>(arg(0));
+            const GLuint id = static_cast<GLuint>(arg(1));
+            if (target == GL_ARRAY_BUFFER) bound_array_buffer_ = id;
+            if (target == GL_ELEMENT_ARRAY_BUFFER) bound_element_buffer_ = id;
+            if (fn) fn(target, id);
+            return 0u;
+        };
+
+        import_handlers_["glBufferData"] = [this] {
+            auto fn = gl_proc<void (*)(GLenum, GLsizeiptr, const void*, GLenum)>(
+                    "glBufferData");
+            const GLsizeiptr size = static_cast<GLsizeiptr>(arg(1));
+            std::vector<uint8_t> staged;
+            if (fn && size > 0 && arg(2) &&
+                stage_guest(arg(2), static_cast<size_t>(size), staged)) {
+                fn(static_cast<GLenum>(arg(0)), size, staged.data(),
+                   static_cast<GLenum>(arg(3)));
+            } else if (fn) {
+                fn(static_cast<GLenum>(arg(0)), size, nullptr, static_cast<GLenum>(arg(3)));
+            }
+            return 0u;
+        };
+
+        import_handlers_["glBufferSubData"] = [this] {
+            auto fn = gl_proc<void (*)(GLenum, GLintptr, GLsizeiptr, const void*)>(
+                    "glBufferSubData");
+            const GLsizeiptr size = static_cast<GLsizeiptr>(arg(2));
+            std::vector<uint8_t> staged;
+            if (fn && size > 0 && stage_guest(arg(3), static_cast<size_t>(size), staged)) {
+                fn(static_cast<GLenum>(arg(0)), static_cast<GLintptr>(arg(1)), size,
+                   staged.data());
+            }
+            return 0u;
+        };
+
+        auto gen_names = [this](const char* name) {
+            import_handlers_[name] = [this, name] {
+                auto fn = gl_proc<void (*)(GLsizei, GLuint*)>(name);
+                const GLsizei count = static_cast<GLsizei>(arg(0));
+                const uint32_t out = arg(1);
+                if (!fn || !out || count <= 0 || count > 1024) return 0u;
+                std::vector<GLuint> ids(static_cast<size_t>(count), 0);
+                fn(count, ids.data());
+                emu_.write(out, ids.data(), ids.size() * sizeof(GLuint));
+                return 0u;
+            };
+        };
+        gen_names("glGenTextures");
+        gen_names("glGenBuffers");
+        gen_names("glGenFramebuffers");
+        gen_names("glGenRenderbuffers");
+
+        auto delete_names = [this](const char* name) {
+            import_handlers_[name] = [this, name] {
+                auto fn = gl_proc<void (*)(GLsizei, const GLuint*)>(name);
+                const GLsizei count = static_cast<GLsizei>(arg(0));
+                if (!fn || count <= 0 || count > 4096) return 0u;
+                std::vector<GLuint> ids(static_cast<size_t>(count), 0);
+                if (!emu_.read(arg(1), ids.data(), ids.size() * sizeof(GLuint))) return 0u;
+                fn(count, ids.data());
+                return 0u;
+            };
+        };
+        delete_names("glDeleteTextures");
+        delete_names("glDeleteBuffers");
+        delete_names("glDeleteFramebuffers");
+        delete_names("glDeleteRenderbuffers");
+
+        // ---- textures -------------------------------------------------
+        import_handlers_["glTexImage2D"] = [this] {
+            auto fn = gl_proc<void (*)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint,
+                                       GLenum, GLenum, const void*)>("glTexImage2D");
+            if (!fn) return 0u;
+            const GLsizei width = static_cast<GLsizei>(stacked_arg(4));
+            const GLsizei height = static_cast<GLsizei>(stacked_arg(5));
+            const GLenum format = static_cast<GLenum>(stacked_arg(6));
+            const GLenum type = static_cast<GLenum>(stacked_arg(7));
+            const uint32_t pixels = stacked_arg(8);
+            std::vector<uint8_t> staged;
+            if (pixels && width > 0 && height > 0) {
+                stage_guest(pixels, static_cast<size_t>(width) *
+                                             static_cast<size_t>(height) *
+                                             gl_pixel_bytes(format, type),
+                             staged);
+            }
+            fn(static_cast<GLenum>(arg(0)), static_cast<GLint>(arg(1)),
+               static_cast<GLint>(arg(2)), width, height, static_cast<GLint>(stacked_arg(5)),
+               format, type, staged.empty() ? nullptr : staged.data());
+            return 0u;
+        };
+
+        import_handlers_["glTexSubImage2D"] = [this] {
+            auto fn = gl_proc<void (*)(GLenum, GLint, GLint, GLint, GLsizei, GLsizei,
+                                       GLenum, GLenum, const void*)>("glTexSubImage2D");
+            if (!fn) return 0u;
+            const GLsizei width = static_cast<GLsizei>(stacked_arg(4));
+            const GLsizei height = static_cast<GLsizei>(stacked_arg(5));
+            const GLenum format = static_cast<GLenum>(stacked_arg(6));
+            const GLenum type = static_cast<GLenum>(stacked_arg(7));
+            const uint32_t pixels = stacked_arg(8);
+            std::vector<uint8_t> staged;
+            if (pixels && width > 0 && height > 0) {
+                stage_guest(pixels, static_cast<size_t>(width) *
+                                             static_cast<size_t>(height) *
+                                             gl_pixel_bytes(format, type),
+                             staged);
+            }
+            fn(static_cast<GLenum>(arg(0)), static_cast<GLint>(arg(1)),
+               static_cast<GLint>(arg(2)), static_cast<GLint>(arg(3)), width, height,
+               format, type, staged.empty() ? nullptr : staged.data());
+            return 0u;
+        };
+
+        import_handlers_["glTexParameterfv"] = [this] {
+            auto fn = gl_proc<void (*)(GLenum, GLenum, const GLfloat*)>("glTexParameterfv");
+            std::vector<uint8_t> staged;
+            if (fn && stage_guest(arg(2), 4 * sizeof(GLfloat), staged)) {
+                fn(static_cast<GLenum>(arg(0)), static_cast<GLenum>(arg(1)),
+                   reinterpret_cast<const GLfloat*>(staged.data()));
+            }
+            return 0u;
+        };
+
+        import_handlers_["glReadPixels"] = [this] {
+            auto fn = gl_proc<void (*)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum,
+                                       void*)>("glReadPixels");
+            const GLsizei width = static_cast<GLsizei>(arg(2));
+            const GLsizei height = static_cast<GLsizei>(arg(3));
+            const GLenum format = static_cast<GLenum>(stacked_arg(4));
+            const GLenum type = static_cast<GLenum>(stacked_arg(5));
+            const uint32_t pixels = stacked_arg(6);
+            if (!fn || !pixels || width <= 0 || height <= 0) return 0u;
+            const size_t bytes = static_cast<size_t>(width) * static_cast<size_t>(height) *
+                                 gl_pixel_bytes(format, type);
+            std::vector<uint8_t> staged(bytes, 0);
+            fn(static_cast<GLint>(arg(0)), static_cast<GLint>(arg(1)), width, height,
+               format, type, staged.data());
+            emu_.write(pixels, staged.data(), bytes);
+            return 0u;
+        };
+
+        // ---- vertex attributes and draws -------------------------------
+        import_handlers_["glVertexAttribPointer"] = [this] {
+            const GLuint index = static_cast<GLuint>(arg(0));
+            if (index >= 16) return 0u;
+            ClientAttribute& a = client_attributes_[index];
+            a.size = static_cast<GLint>(arg(1));
+            a.type = static_cast<GLenum>(arg(2));
+            a.normalized = static_cast<GLboolean>(arg(3) & 1u);
+            a.stride = static_cast<GLsizei>(stacked_arg(4));
+            a.ptr = stacked_arg(5);
+            a.set = bound_array_buffer_ == 0;
+            if (bound_array_buffer_ != 0) {
+                auto fn = gl_proc<void (*)(GLuint, GLint, GLenum, GLboolean, GLsizei,
+                                           const void*)>("glVertexAttribPointer");
+                if (fn) fn(index, a.size, a.type, a.normalized, a.stride,
+                           reinterpret_cast<const void*>(
+                                   static_cast<uintptr_t>(a.ptr)));
+            }
+            return 0u;
+        };
+
+        auto attrib_scalar = [this](const char* name, int components) {
+            import_handlers_[name] = [this, name, components] {
+                auto fn = gl_proc<void (*)(GLuint, GLfloat, GLfloat, GLfloat, GLfloat)>(name);
+                if (!fn) return 0u;
+                GLfloat v[4] = {f_arg(1), f_arg(2), f_arg(3), stacked_f_arg(4)};
+                fn(static_cast<GLuint>(arg(0)), v[0], v[1], v[2], v[3]);
+                (void)components;
+                return 0u;
+            };
+        };
+        attrib_scalar("glVertexAttrib1f", 1);
+        attrib_scalar("glVertexAttrib2f", 2);
+        attrib_scalar("glVertexAttrib3f", 3);
+
+        import_handlers_["glVertexAttrib4fv"] = [this] {
+            auto fn = gl_proc<void (*)(GLuint, const GLfloat*)>("glVertexAttrib4fv");
+            std::vector<uint8_t> staged;
+            if (fn && stage_guest(arg(1), 4 * sizeof(GLfloat), staged)) {
+                fn(static_cast<GLuint>(arg(0)),
+                   reinterpret_cast<const GLfloat*>(staged.data()));
+            }
+            return 0u;
+        };
+        import_handlers_["glVertexAttrib2fv"] = [this] {
+            auto fn = gl_proc<void (*)(GLuint, const GLfloat*)>("glVertexAttrib2fv");
+            std::vector<uint8_t> staged;
+            if (fn && stage_guest(arg(1), 2 * sizeof(GLfloat), staged)) {
+                fn(static_cast<GLuint>(arg(0)),
+                   reinterpret_cast<const GLfloat*>(staged.data()));
+            }
+            return 0u;
+        };
+        import_handlers_["glVertexAttrib3fv"] = [this] {
+            auto fn = gl_proc<void (*)(GLuint, const GLfloat*)>("glVertexAttrib3fv");
+            std::vector<uint8_t> staged;
+            if (fn && stage_guest(arg(1), 3 * sizeof(GLfloat), staged)) {
+                fn(static_cast<GLuint>(arg(0)),
+                   reinterpret_cast<const GLfloat*>(staged.data()));
+            }
+            return 0u;
+        };
+
+        import_handlers_["glDrawArrays"] = [this] {
+            auto fn = gl_proc<void (*)(GLenum, GLint, GLsizei)>("glDrawArrays");
+            if (!fn) return 0u;
+            const GLint first = static_cast<GLint>(arg(1));
+            const GLsizei count = static_cast<GLsizei>(arg(2));
+            std::vector<std::vector<uint8_t>> storage;
+            if (count > 0) {
+                stage_client_attributes(static_cast<size_t>(first) +
+                                        static_cast<size_t>(count), storage);
+            }
+            fn(static_cast<GLenum>(arg(0)), first, count);
+            return 0u;
+        };
+
+        import_handlers_["glDrawElements"] = [this] {
+            auto fn = gl_proc<void (*)(GLenum, GLsizei, GLenum, const void*)>(
+                    "glDrawElements");
+            if (!fn) return 0u;
+            const GLsizei count = static_cast<GLsizei>(arg(1));
+            const GLenum type = static_cast<GLenum>(arg(2));
+            const uint32_t indices = arg(3);
+            if (count <= 0) return 0u;
+
+            if (bound_element_buffer_ != 0) {
+                fn(static_cast<GLenum>(arg(0)), count, type,
+                   reinterpret_cast<const void*>(static_cast<uintptr_t>(indices)));
+                return 0u;
+            }
+
+            const size_t index_bytes = static_cast<size_t>(count) * gl_type_bytes(type);
+            std::vector<uint8_t> staged_index;
+            if (!stage_guest(indices, index_bytes, staged_index)) {
+                LOGW("glDrawElements: indices %08x not readable", indices);
+                return 0u;
+            }
+
+            // The largest index determines how much vertex data the driver
+            // will touch, so stage exactly that range.
+            uint32_t max_index = 0;
+            for (GLsizei i = 0; i < count; ++i) {
+                uint32_t v = 0;
+                if (type == GL_UNSIGNED_BYTE) {
+                    v = staged_index[static_cast<size_t>(i)];
+                } else if (type == GL_UNSIGNED_SHORT) {
+                    v = reinterpret_cast<const uint16_t*>(staged_index.data())[
+                            static_cast<size_t>(i)];
+                } else {
+                    v = reinterpret_cast<const uint32_t*>(staged_index.data())[
+                            static_cast<size_t>(i)];
+                }
+                if (v > max_index) max_index = v;
+            }
+
+            std::vector<std::vector<uint8_t>> storage;
+            stage_client_attributes(static_cast<size_t>(max_index) + 1, storage);
+            fn(static_cast<GLenum>(arg(0)), count, type, staged_index.data());
+            return 0u;
+        };
+
+        // ---- uniform arrays -------------------------------------------
+        auto uniform_floats = [this](const char* name, int components) {
+            import_handlers_[name] = [this, name, components] {
+                auto fn = gl_proc<void (*)(GLint, GLsizei, const GLfloat*)>(name);
+                const GLsizei count = static_cast<GLsizei>(arg(1));
+                std::vector<uint8_t> staged;
+                if (fn && count > 0 &&
+                    stage_guest(arg(2), static_cast<size_t>(count) * components *
+                                                 sizeof(GLfloat), staged)) {
+                    fn(static_cast<GLint>(arg(0)), count,
+                       reinterpret_cast<const GLfloat*>(staged.data()));
+                }
+                return 0u;
+            };
+        };
+        uniform_floats("glUniform1fv", 1);
+        uniform_floats("glUniform2fv", 2);
+        uniform_floats("glUniform3fv", 3);
+        uniform_floats("glUniform4fv", 4);
+
+        auto uniform_matrix = [this](const char* name, int order) {
+            import_handlers_[name] = [this, name, order] {
+                auto fn = gl_proc<void (*)(GLint, GLsizei, GLboolean, const GLfloat*)>(name);
+                const GLsizei count = static_cast<GLsizei>(arg(1));
+                const size_t floats = static_cast<size_t>(order) * order;
+                std::vector<uint8_t> staged;
+                if (fn && count > 0 &&
+                    stage_guest(arg(3), static_cast<size_t>(count) * floats *
+                                                 sizeof(GLfloat), staged)) {
+                    fn(static_cast<GLint>(arg(0)), count,
+                       static_cast<GLboolean>(arg(2) & 1u),
+                       reinterpret_cast<const GLfloat*>(staged.data()));
+                }
+                return 0u;
+            };
+        };
+        uniform_matrix("glUniformMatrix2fv", 2);
+        uniform_matrix("glUniformMatrix3fv", 3);
+        uniform_matrix("glUniformMatrix4fv", 4);
+
+        auto uniform_ints = [this](const char* name, int components) {
+            import_handlers_[name] = [this, name, components] {
+                auto fn = gl_proc<void (*)(GLint, GLsizei, const GLint*)>(name);
+                const GLsizei count = static_cast<GLsizei>(arg(1));
+                std::vector<uint8_t> staged;
+                if (fn && count > 0 &&
+                    stage_guest(arg(2), static_cast<size_t>(count) * components *
+                                                 sizeof(GLint), staged)) {
+                    fn(static_cast<GLint>(arg(0)), count,
+                       reinterpret_cast<const GLint*>(staged.data()));
+                }
+                return 0u;
+            };
+        };
+        uniform_ints("glUniform2iv", 2);
+        uniform_ints("glUniform3iv", 3);
+        uniform_ints("glUniform4iv", 4);
+
+        // ---- misc state ------------------------------------------------
+        import_handlers_["glStencilOpSeparate"] = [this] {
+            auto fn = gl_proc<void (*)(GLenum, GLenum, GLenum, GLenum)>(
+                    "glStencilOpSeparate");
+            if (fn) {
+                fn(static_cast<GLenum>(arg(0)), static_cast<GLenum>(arg(1)),
+                   static_cast<GLenum>(arg(2)), static_cast<GLenum>(arg(3)));
+            }
+            return 0u;
+        };
+        import_handlers_["glBlendEquation"] = [this] {
+            auto fn = gl_proc<void (*)(GLenum)>("glBlendEquation");
+            if (fn) fn(static_cast<GLenum>(arg(0)));
+            return 0u;
+        };
+        import_handlers_["glBlendEquationSeparate"] = [this] {
+            auto fn = gl_proc<void (*)(GLenum, GLenum)>("glBlendEquationSeparate");
+            if (fn) fn(static_cast<GLenum>(arg(0)), static_cast<GLenum>(arg(1)));
+            return 0u;
+        };
+        import_handlers_["glRenderbufferStorage"] = [this] {
+            auto fn = gl_proc<void (*)(GLenum, GLenum, GLsizei, GLsizei)>(
+                    "glRenderbufferStorage");
+            if (fn) {
+                fn(static_cast<GLenum>(arg(0)), static_cast<GLenum>(arg(1)),
+                   static_cast<GLsizei>(arg(2)), static_cast<GLsizei>(arg(3)));
+            }
+            return 0u;
+        };
+        import_handlers_["glFramebufferTexture2D"] = [this] {
+            auto fn = gl_proc<void (*)(GLenum, GLenum, GLenum, GLuint, GLint)>(
+                    "glFramebufferTexture2D");
+            if (fn) {
+                fn(static_cast<GLenum>(arg(0)), static_cast<GLenum>(arg(1)),
+                   static_cast<GLenum>(arg(2)), static_cast<GLuint>(arg(3)),
+                   static_cast<GLint>(stacked_arg(4)));
+            }
+            return 0u;
+        };
+        import_handlers_["glFramebufferRenderbuffer"] = [this] {
+            auto fn = gl_proc<void (*)(GLenum, GLenum, GLenum, GLuint)>(
+                    "glFramebufferRenderbuffer");
+            if (fn) {
+                fn(static_cast<GLenum>(arg(0)), static_cast<GLenum>(arg(1)),
+                   static_cast<GLenum>(arg(2)), static_cast<GLuint>(arg(3)));
+            }
+            return 0u;
+        };
+        auto is_query = [this](const char* name) {
+            import_handlers_[name] = [this, name] {
+                auto fn = gl_proc<GLboolean (*)(GLuint)>(name);
+                return fn ? static_cast<uint32_t>(fn(static_cast<GLuint>(arg(0)))) : 0u;
+            };
+        };
+        is_query("glIsFramebuffer");
+        is_query("glIsRenderbuffer");
+        is_query("glIsTexture");
+        is_query("glIsBuffer");
+        is_query("glIsProgram");
+        is_query("glIsShader");
+        is_query("glIsEnabled");
+
+        // ---- client vertex arrays in a draw ------------------------------
+        // glVertexAttribPointer never reached the driver for client arrays; the
+        // staging happens inside glDrawArrays / glDrawElements above.
+    }
+
     void install_import_handlers() {
         // ---------------- memory ---------------------------------------
         import_handlers_["malloc"]  = [this] { return imp_malloc(); };
+        // brk-style heap for payloads that allocate before malloc is usable.
+        import_handlers_["sbrk"] = [this] {
+            constexpr size_t kSbrkSize = 16u * 1024u * 1024u;
+            if (!brk_base_) {
+                brk_base_ = emu_.alloc(kSbrkSize, 4096);
+                brk_used_ = 0;
+            }
+            if (!brk_base_) return 0xFFFFFFFFu;
+            const uint32_t previous = brk_base_ + brk_used_;
+            const int64_t next = static_cast<int64_t>(brk_used_) +
+                                 static_cast<int32_t>(arg(0));
+            if (next < 0 || next > static_cast<int64_t>(kSbrkSize)) return 0xFFFFFFFFu;
+            brk_used_ = static_cast<uint32_t>(next);
+            return previous;
+        };
         import_handlers_["calloc"]  = [this] { return imp_calloc(); };
         import_handlers_["realloc"] = [this] { return imp_realloc(); };
         import_handlers_["free"]    = [this] { return imp_free(); };
@@ -1997,6 +3606,23 @@ private:
             copy_guest(arg(0), arg(1), arg(2));
             return 0u;
         };
+        // struct tm is narrower on 32-bit; the guest gets the bionic layout.
+        import_handlers_["gmtime"] = [this] {
+            int32_t seconds = 0;
+            if (!emu_.read(arg(0), &seconds, sizeof seconds)) return 0u;
+            time_t t = static_cast<time_t>(seconds);
+            struct tm out {};
+            if (!::gmtime_r(&t, &out)) return 0u;
+            if (!tm_guest_) tm_guest_ = emu_.alloc(64, 8);
+            if (!tm_guest_) return 0u;
+            const int32_t fields[11] = {
+                    out.tm_sec, out.tm_min, out.tm_hour, out.tm_mday, out.tm_mon,
+                    out.tm_year, out.tm_wday, out.tm_yday, out.tm_isdst,
+                    static_cast<int32_t>(out.tm_gmtoff), 0};
+            emu_.write(tm_guest_, fields, sizeof fields);
+            return tm_guest_;
+        };
+
         import_handlers_["memchr"] = [this] {
             uint32_t p = arg(0);
             const uint8_t want = static_cast<uint8_t>(arg(1) & 0xFFu);
@@ -2011,6 +3637,10 @@ private:
         };
 
         // ---------------- strings --------------------------------------
+        import_handlers_["puts"] = [this] {
+            LOGI("guest: %s", guest_string(arg(0)).c_str());
+            return 0u;
+        };
         import_handlers_["strlen"] = [this] { return imp_strlen(); };
         import_handlers_["strcpy"] = [this] { return imp_strcpy(); };
         import_handlers_["strcmp"] = [this] { return imp_strcmp(); };
@@ -2292,7 +3922,20 @@ private:
         import_handlers_["sched_yield"] = [] { return 0u; };
 
         // ---------------- file / stdio ----------------------------------
+        // Every path-taking entry point goes through translate_path(), so an
+        // OBB under /sdcard/Android/obb/<pkg>/ resolves to the ingested copy.
         import_handlers_["open"]    = [this] { return imp_open(); };
+        import_handlers_["open64"]  = [this] { return imp_open(); };
+        import_handlers_["__open_2"] = [this] { return imp_open(); };
+        import_handlers_["openat"] = [this] {
+            const std::string p = translate_path(guest_string(arg(1)), "openat");
+            const int fd = ::openat(static_cast<int>(arg(0)), p.c_str(),
+                                    static_cast<int>(arg(2)), static_cast<int>(arg(3)));
+            if (fd < 0) return static_cast<uint32_t>(-1);
+            const uint32_t g = next_handle_++;
+            fd_map_[g] = fd;
+            return g;
+        };
         import_handlers_["close"]   = [this] { return imp_close(); };
         import_handlers_["read"]    = [this] { return imp_read(); };
         import_handlers_["write"]   = [this] { return imp_write(); };
@@ -2300,27 +3943,42 @@ private:
         import_handlers_["lseek64"] = [this] { return imp_lseek(); };
         import_handlers_["fstat"]   = [this] { return imp_stat_common(true); };
         import_handlers_["stat"]    = [this] { return imp_stat_common(false); };
+        import_handlers_["stat64"]  = [this] { return imp_stat_common(false); };
+        import_handlers_["lstat"]   = [this] { return imp_stat_common(false); };
+        import_handlers_["lstat64"] = [this] { return imp_stat_common(false); };
+        import_handlers_["statfs"]  = [this] { return imp_statfs(); };
+        import_handlers_["__statfs"] = [this] { return imp_statfs(); };
         import_handlers_["access"]  = [this] {
-            const std::string p = guest_string(arg(0));
+            const std::string p = translate_path(guest_string(arg(0)), "access");
             return ::access(p.c_str(), static_cast<int>(arg(1))) == 0 ? 0u
                                                                       : static_cast<uint32_t>(-1);
         };
+        import_handlers_["faccessat"] = [this] {
+            const std::string p = translate_path(guest_string(arg(1)), "faccessat");
+            return ::faccessat(static_cast<int>(arg(0)), p.c_str(), static_cast<int>(arg(2)), 0) == 0
+                       ? 0u : static_cast<uint32_t>(-1);
+        };
         import_handlers_["unlink"] = [this] {
-            return ::unlink(guest_string(arg(0)).c_str()) == 0 ? 0u : static_cast<uint32_t>(-1);
+            return ::unlink(translate_path(guest_string(arg(0)), "unlink").c_str()) == 0
+                       ? 0u : static_cast<uint32_t>(-1);
         };
         import_handlers_["rename"] = [this] {
-            return ::rename(guest_string(arg(0)).c_str(), guest_string(arg(1)).c_str()) == 0
+            return ::rename(translate_path(guest_string(arg(0)), "rename").c_str(),
+                            translate_path(guest_string(arg(1)), "rename").c_str()) == 0
                        ? 0u : static_cast<uint32_t>(-1);
         };
         import_handlers_["mkdir"] = [this] {
-            return ::mkdir(guest_string(arg(0)).c_str(), static_cast<mode_t>(arg(1))) == 0
+            return ::mkdir(translate_path(guest_string(arg(0)), "mkdir").c_str(),
+                           static_cast<mode_t>(arg(1))) == 0
                        ? 0u : static_cast<uint32_t>(-1);
         };
         import_handlers_["rmdir"] = [this] {
-            return ::rmdir(guest_string(arg(0)).c_str()) == 0 ? 0u : static_cast<uint32_t>(-1);
+            return ::rmdir(translate_path(guest_string(arg(0)), "rmdir").c_str()) == 0
+                       ? 0u : static_cast<uint32_t>(-1);
         };
         import_handlers_["chmod"] = [this] {
-            return ::chmod(guest_string(arg(0)).c_str(), static_cast<mode_t>(arg(1))) == 0
+            return ::chmod(translate_path(guest_string(arg(0)), "chmod").c_str(),
+                           static_cast<mode_t>(arg(1))) == 0
                        ? 0u : static_cast<uint32_t>(-1);
         };
         import_handlers_["ftruncate"] = [this] {
@@ -2339,6 +3997,7 @@ private:
         import_handlers_["closedir"] = [this] { return imp_closedir(); };
 
         import_handlers_["fopen"]  = [this] { return imp_fopen(); };
+        import_handlers_["fopen64"] = [this] { return imp_fopen(); };
         import_handlers_["fread"]  = [this] { return imp_fread(); };
         import_handlers_["fwrite"] = [this] { return imp_fwrite(); };
         import_handlers_["fclose"] = [this] {
@@ -2510,13 +4169,62 @@ private:
         import_handlers_["__cxa_atexit"] = [] { return 0u; };
         import_handlers_["__cxa_finalize"] = [] { return 0u; };
         import_handlers_["dlopen"] = [this] {
-            LOGW("dlopen(%s) unsupported in guest", guest_string(arg(0)).c_str());
-            return 0u;
+            const std::string name = guest_string(arg(0));
+            const uint32_t handle = guest_dlopen(name);
+            return handle;
         };
-        import_handlers_["dlsym"] = [] { return 0u; };
-        import_handlers_["dlclose"] = [] { return 0u; };
+        import_handlers_["dlsym"] = [this] {
+            return guest_dlsym(arg(0), guest_string(arg(1)));
+        };
+        import_handlers_["dlclose"] = [] { return 0u; };   // objects stay mapped
         import_handlers_["dlerror"] = [] { return 0u; };
         import_handlers_["dladdr"] = [] { return 0u; };
+
+        // ---------------- memory mapping -------------------------------
+        import_handlers_["mmap"]   = [this] { return imp_mmap(false); };
+        import_handlers_["mmap64"] = [this] { return imp_mmap(true); };
+        import_handlers_["munmap"] = [this] { return imp_munmap(); };
+        import_handlers_["mprotect"] = [] { return 0u; };
+        import_handlers_["msync"] = [] { return 0u; };
+        import_handlers_["madvise"] = [] { return 0u; };
+
+        // ---------------- Android NDK surface glue ----------------------
+        import_handlers_["ANativeWindow_fromSurface"] = [this] {
+            jobject surface = static_cast<jobject>(from_guest_ref(arg(1)));
+            if (!surface) return 0u;
+            ANativeWindow* window = ANativeWindow_fromSurface(env_, surface);
+            if (!window) {
+                LOGE("ANativeWindow_fromSurface failed");
+                return 0u;
+            }
+            LOGI("ANativeWindow_fromSurface -> %p", window);
+            return to_guest_ref(window);   // same handle EGL will map back
+        };
+        import_handlers_["ANativeWindow_acquire"] = [] { return 0u; };
+        import_handlers_["ANativeWindow_release"] = [] { return 0u; };
+        import_handlers_["ANativeWindow_getWidth"] = [this] {
+            ANativeWindow* w = static_cast<ANativeWindow*>(from_guest_ref(arg(0)));
+            if (!w) w = host_window_;
+            return w ? static_cast<uint32_t>(ANativeWindow_getWidth(w)) : 0u;
+        };
+        import_handlers_["ANativeWindow_getHeight"] = [this] {
+            ANativeWindow* w = static_cast<ANativeWindow*>(from_guest_ref(arg(0)));
+            if (!w) w = host_window_;
+            return w ? static_cast<uint32_t>(ANativeWindow_getHeight(w)) : 0u;
+        };
+        import_handlers_["ANativeWindow_getFormat"] = [this] {
+            ANativeWindow* w = static_cast<ANativeWindow*>(from_guest_ref(arg(0)));
+            if (!w) w = host_window_;
+            return w ? static_cast<uint32_t>(ANativeWindow_getFormat(w)) : 0u;
+        };
+        import_handlers_["ANativeWindow_setBuffersGeometry"] = [this] {
+            ANativeWindow* w = static_cast<ANativeWindow*>(from_guest_ref(arg(0)));
+            if (!w) w = host_window_;
+            if (!w) return static_cast<uint32_t>(-1);
+            return static_cast<uint32_t>(ANativeWindow_setBuffersGeometry(
+                w, static_cast<int32_t>(arg(1)), static_cast<int32_t>(arg(2)),
+                static_cast<int32_t>(arg(3))));
+        };
         import_handlers_["__gnu_Unwind_Find_exidx"] = [] { return 0u; };
         import_handlers_["fork"] = [] { return static_cast<uint32_t>(-1); };
         import_handlers_["execv"] = [] { return static_cast<uint32_t>(-1); };
@@ -2548,6 +4256,8 @@ private:
             return 0u;
         };
         import_handlers_["__android_log_vprint"] = [this] { return imp_log_print(); };
+
+        install_graphics_handlers();
     }
 
     // malloc'd copy of a guest string, owned by the guest heap.
@@ -2936,7 +4646,7 @@ private:
             e.sig = sig;
             parse_signature(sig, e);
 
-            void* code = Arm64Trampolines::emit(e.id, reinterpret_cast<void*>(&bridge_native_entry));
+            void* code = HostTrampolines::emit(e.id, reinterpret_cast<void*>(&bridge_native_entry));
             if (!code) {
                 LOGE("RegisterNatives: trampoline pool exhausted");
                 return JNI_ERR;
@@ -3347,6 +5057,23 @@ private:
     std::unordered_map<uint32_t, DirHandle> dir_map_;
     uint32_t next_handle_ = 0x1000;   // never collides with 0/1/2
 
+    // guest filesystem / runtime-loading context
+    std::string game_root_, package_, payload_dir_, obb_dir_, data_dir_;
+    std::unordered_set<std::string> translate_log_;
+    std::unordered_map<std::string, uint32_t> dl_handles_;
+    std::unordered_map<uint32_t, LoadedLibrary*> dl_libs_;
+    uint32_t next_runtime_slot_ = 0;
+
+    // host graphics
+    void* egl_lib_ = nullptr;
+    void* gles_lib_ = nullptr;
+    ANativeWindow* host_window_ = nullptr;
+    std::unordered_map<std::string, void*> host_syms_;
+    uint32_t swap_count_ = 0;
+    uint32_t egl_window_surfaces_ = 0;
+    std::map<std::string, uint32_t> entry_points_;
+    jobject guest_thiz_ = nullptr;
+
     std::unordered_map<void*, std::string> method_sigs_;   // jmethodID -> descriptor
     std::unordered_map<uint32_t, ArrayPin> pins_;          // guest buffer -> pinned array
     std::unordered_map<uint32_t, uint32_t> tls_values_;    // pthread key -> value
@@ -3391,6 +5118,10 @@ JavaVM*    g_vm = nullptr;
 // that is not implemented yet. GameHostActivity surfaces this as "already
 // running" instead of silently corrupting the first session.
 bool g_session_active = false;
+
+// The window behind GameHostActivity's SurfaceView. Set from the UI thread,
+// consumed by the guest's EGL calls, which run on the emulation thread.
+std::atomic<ANativeWindow*> g_host_window{nullptr};
 
 std::string jstring_to_std(JNIEnv* env, jstring s) {
     if (!s) return {};
@@ -3473,9 +5204,10 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
 extern "C" JNIEXPORT jint JNICALL
 Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeStartSession(
         JNIEnv* env, jclass /*clazz*/, jstring game_dir, jstring obb_path,
-        jobject guest_loader) {
+        jstring package_name, jobject guest_loader, jobject guest_activity) {
     const std::string dir = jstring_to_std(env, game_dir);
     const std::string obb = jstring_to_std(env, obb_path);
+    const std::string pkg = jstring_to_std(env, package_name);
 
     LOGI("==============================================================");
     LOGI(" Zai-Bridge: opening guest session");
@@ -3504,6 +5236,16 @@ Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeStartSession(
     // Guest classes (Java_* exports, RegisterNatives targets) must resolve
     // through the DexClassLoader the host positioned on the ingested APK.
     if (guest_loader) g_bridge->set_guest_loader(guest_loader);
+    // The engine's native side calls back into Java through the Activity it was
+    // handed, so it needs a real object, not null, as the JNI `this`.
+    if (guest_activity) {
+        g_bridge->set_guest_activity(static_cast<jobject>(env->NewGlobalRef(guest_activity)));
+    }
+
+    // Filesystem redirection root, and the ANativeWindow the SurfaceView has
+    // already produced. Both are consumed by the EGL window-surface handler.
+    g_bridge->set_game_context(dir, pkg);
+    g_bridge->set_host_window(g_host_window.load());
 
     // ---- Phase 1: map every ingested ARM32 payload -------------------------
     const std::string payload_dir = dir + "/payload";
@@ -3513,6 +5255,7 @@ Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeStartSession(
         return -2;
     }
     LOGI("discovered %zu ARM32 payloads in %s", payloads.size(), payload_dir.c_str());
+    g_bridge->reserve_image_slots(payloads.size());
 
     for (size_t i = 0; i < payloads.size(); ++i) {
         const uint32_t base = kImageBase0 + static_cast<uint32_t>(i) * kImageStride;
@@ -3547,7 +5290,42 @@ Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeStartSession(
     g_bridge->report_imports();
     g_session_active = true;
     LOGI("Zai-Bridge session ready");
+
+    // The session thread is the only thread with a valid JNIEnv for the guest's
+    // callbacks, and it is already a dedicated worker on the Java side, so the
+    // engine is driven here until the host surface goes away.
+    if (g_host_window.load()) {
+        g_bridge->drive_render_loop();
+    } else {
+        LOGW("no host window; render drive not started");
+    }
     return 0;
+}
+
+// Attaches or clears the host surface. Safe to call on every SurfaceHolder
+// callback: replacing the window keeps the EGL surface pointed at the live one.
+extern "C" JNIEXPORT void JNICALL
+Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeSetSurface(
+        JNIEnv* env, jclass /*clazz*/, jobject surface) {
+    ANativeWindow* previous = g_host_window.exchange(nullptr);
+    if (surface) {
+        ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
+        g_host_window.store(window);
+        if (g_bridge) g_bridge->set_host_window(window);
+        if (window) {
+            LOGI("host Surface attached: %p (%dx%d)", window,
+                 ANativeWindow_getWidth(window), ANativeWindow_getHeight(window));
+        } else {
+            LOGE("ANativeWindow_fromSurface returned null");
+        }
+    } else {
+        if (g_bridge) g_bridge->set_host_window(nullptr);
+        LOGI("host Surface detached");
+    }
+
+    // EGL retains its own reference to a window once a surface is created from
+    // it, so dropping ours here is safe and avoids leaking per rotation.
+    if (previous) ANativeWindow_release(previous);
 }
 
 extern "C" JNIEXPORT jstring JNICALL

@@ -8,9 +8,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # =============================================================================
 # Unicorn execution backend (statically linked)
 #
-# The core is cross-compiled for the Android NDK as ARM32/Thumb guest only and
-# staged at prebuilt/<abi>/lib/libunicorn.a with its headers beside it. Only
-# arm64-v8a is shipped: the host process is the 64-bit side of the bridge.
+# arm-softmmu is the only guest compiled; the host half is whatever 64-bit ABI
+# the APK is being built for. Each ABI needs its own archive at
+# prebuilt/<abi>/lib/libunicorn.a, produced by vendor/build_unicorn_android.sh.
 # =============================================================================
 if(NOT ANDROID_ABI)
     set(ANDROID_ABI "arm64-v8a")
@@ -22,7 +22,8 @@ set(UNICORN_ARCHIVE "${UNICORN_PREFIX}/lib/libunicorn.a")
 if(NOT EXISTS "${UNICORN_ARCHIVE}")
     message(FATAL_ERROR
         "libunicorn.a not found at ${UNICORN_ARCHIVE}\n"
-        "Stage the ARM32-guest Unicorn build for ${ANDROID_ABI} before building.")
+        "Stage the ARM32-guest Unicorn build for ${ANDROID_ABI} "
+        "(UNICORN_ABI=${ANDROID_ABI} ./vendor/build_unicorn_android.sh).")
 endif()
 
 add_library(unicorn_core STATIC IMPORTED)
@@ -37,11 +38,11 @@ set_target_properties(unicorn_core PROPERTIES
 # The payloads it maps are not compiled in and not fixed at build time; they are
 # read per session from the ingested game's private directory.
 # =============================================================================
-add_library(wrapper_arm64 SHARED
-    wrapper_arm64.cpp
+add_library(wrapper SHARED
+    wrapper.cpp
 )
 
-target_link_libraries(wrapper_arm64 PRIVATE
+target_link_libraries(wrapper PRIVATE
     unicorn_core
     android
     log
@@ -51,4 +52,4 @@ target_link_libraries(wrapper_arm64 PRIVATE
 
 # Unicorn's internal (TCG / softmmu) symbols must stay out of the exported
 # dynamic symbol table: only JNI_OnLoad and the JNI thunks should be exported.
-target_link_options(wrapper_arm64 PRIVATE "-Wl,--exclude-libs,ALL")
+target_link_options(wrapper PRIVATE "-Wl,--exclude-libs,ALL")
