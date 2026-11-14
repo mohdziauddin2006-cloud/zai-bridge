@@ -17,14 +17,18 @@ Engine translation core that executes the original ARM32 libraries inside the
  OBB ──►│      └─ IngestionService ──► filesDir/games/<pkg>/{game.apk,payload/*32.so,obb/…}       │
         │                                     │                                                  │
         │                                     ▼                                                  │
-        │  GameHostActivity (NoTitleBar.Fullscreen + IMMERSIVE_STICKY)                            │
-        │      │  DexClassLoader(game.apk)              │  UnicornBridge.nativeStartSession()      │
-        │      │                                        ▼                                        │
-        │      │                              libwrapper.so ─────► libunicorn.a (static)          │
+        │  ProxyGameActivity (real, manifest-declared, framework window + InputChannel)           │
+        │      │  newActivity() ──► BridgeInstrumentation ──► guest Activity from DexClassLoader   │
         │      │                                        │                                        │
-        │      │                    maps ELF32 payloads, relocates, runs DT_INIT,                 │
-        │      │                    binds Java_* exports to 64-bit trampolines,                   │
-        │      └──────────────────► feeds guest JNI through a shadow JNIEnv                       │
+        │      │                              ActivityThread.attach(): Window, DecorView,          │
+        │      │                              FragmentController, InputChannel — all native        │
+        │      ▼                                        ▼                                        │
+        │  guest Activity (real lifecycle, real input, own GLSurfaceView renderer)                │
+        │      │  eglSwapBuffers / RegisterNatives                                                │
+        │      ▼                                                                                  │
+        │  libwrapper.so ─────► libunicorn.a (static)                                             │
+        │      maps ELF32 payloads, relocates, runs DT_INIT, binds Java_* / RegisterNatives,      │
+        │      forwards EGL/GLES1/GLES2/GLES3, ALooper/AAssetManager/AInputQueue and OpenSL ES    │
         └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -35,18 +39,32 @@ Engine translation core that executes the original ARM32 libraries inside the
 ```
 zai-bridge/
 ├── app/
-│   ├── build.gradle                     # AGP 8.13, compileSdk/targetSdk 34, arm64-v8a only
+│   ├── build.gradle                     # AGP 8.13, 4 ABIs, legacy jniLibs packaging
 │   └── src/main/
-│       ├── AndroidManifest.xml          # MANAGE_EXTERNAL_STORAGE, FGS, GameHost theme
+│       ├── AndroidManifest.xml          # BridgeApplication, ProxyGameActivity, guest permissions
+│       ├── assets/runtime/
+│       │   ├── sysroot_arm32/           # bundled 32-bit ARM compatibility libraries
+│       │   ├── sysroot_x86/             # bundled 32-bit x86 compatibility libraries
+│       │   └── legacy/                  # org.apache.http.legacy.jar
 │       ├── cpp/
-│       │   ├── CMakeLists.txt           # links libunicorn.a statically
-│       │   ├── wrapper.cpp              # the translation core (ELF loader + JNI bridge)
-│       │   └── prebuilt/arm64-v8a/      # libunicorn.a + Unicorn headers
+│       │   ├── CMakeLists.txt           # translating vs passthrough backend per ABI
+│       │   ├── wrapper.cpp              # the translation core (ELF loader + JNI/EGL/GLES/OpenSL bridge)
+│       │   ├── wrapper_passthrough.cpp  # 32-bit host backend (no translation)
+│       │   └── prebuilt/<abi>/          # libunicorn.a + Unicorn headers (arm64-v8a, x86_64)
 │       ├── java/com/ziauddin/zaibridge/
 │       │   ├── MainActivity.java        # all-files access, APK/OBB pickers, grid
-│       │   ├── GameHostActivity.java    # immersive host, DexClassLoader, session start
-│       │   ├── core/UnicornBridge.java  # Java facade over the native core
-│       │   ├── data/                    # Game, GameRepository, GameAdapter, GameImporter
+│       │   ├── GameHostActivity.java    # direct host surface, used only if the hook is unavailable
+│       │   ├── core/
+│       │   │   ├── BridgeApplication.java    # attachBaseContext: hidden-API exemption + hook install
+│       │   │   ├── BridgeInstrumentation.java# mInstrumentation replacement (Activity virtualization)
+│       │   │   ├── GuestLauncher.java       # session open, guest instantiation, surface + input wiring
+│       │   │   ├── GuestContext.java         # merged assets, redirected files/cache/obb
+│       │   │   ├── GuestDexLoader.java       # guest dex + System.loadLibrary served by the bridge
+│       │   │   ├── HiddenApi.java            # VMRuntime.setHiddenApiExemptions (double reflection)
+│       │   │   ├── RuntimeAssets.java        # assets/runtime → files/runtime/<v>/
+│       │   │   └── UnicornBridge.java        # Java facade over the native core
+│       │   ├── proxy/ProxyGameActivity.java  # the manifest-declared Activity that is virtualized
+│       │   ├── data/                         # Game, GameRepository, GameAdapter, GameImporter
 │       │   └── service/IngestionService.java
 │       └── res/                         # dark launcher theme, grid cells, adaptive icon
 ├── gradle/wrapper/                      # Gradle 8.14.3 wrapper
@@ -68,76 +86,72 @@ launcher never sees a half-imported game:
 
 ```
 files/games/<package>/
-  game.apk             original archive (DexClassLoader source)
+  game.apk             original archive (DexClassLoader source, read-only)
   icon.png             icon rendered from the guest manifest
   meta.json            label, package, launcher, ABI, OBB name, timestamp, size
   payload/
     libfoo32.so        every lib/armeabi-v7a/*.so, renamed with a 32 tag
-    dex/classes*.dex   extracted dex (archived for inspection / future use)
+  native/              per-name bridge aliases for System.loadLibrary
   obb/<name>.obb       expansion data
 ```
 
 * `.so` extraction accepts `lib/armeabi-v7a/` and the ancient `lib/arm/`.
 * The `libfoo.so → libfoo32.so` rename is the **only** contract between the
   ingestion engine and the native core; no game or symbol name is hardcoded.
-* `meta.json` is the sole source of what the grid renders. The OBB directory is
-  never read by the UI and lives in app-private storage, so it is invisible both
-  to the launcher and to other apps.
 
 ---
 
-## 2. The launcher
+## 2. Real Activity virtualization (`Instrumentation`)
 
-`MainActivity` is a framework-only Material dark screen: name, tagline, a
-permission banner, a `GridView` with an auto-fit column width, and an import
-button. Each cell shows the icon and the manifest-derived label plus a
-`32-bit · OBB` badge — nothing else about the imported files is exposed.
+The previous build instantiated the guest Activity and attached it with
+reflection. That cannot work: `Activity.attach()` also builds the fragment
+controller and the application dispatch hooks, so the first line of the guest's
+`onCreate` threw `IllegalStateException: No activity`.
+
+The container now lets Android do the attaching:
+
+1. **`BridgeApplication.attachBaseContext`** applies the double-reflection
+   hidden-API exemption (`VMRuntime.getRuntime().setHiddenApiExemptions({"L"})`)
+   and replaces `ActivityThread.mInstrumentation` with
+   `BridgeInstrumentation`.
+2. **`ProxyGameActivity`** is a real `<activity>` in the manifest with
+   `hardwareAccelerated="true"`, `launchMode="singleTask"` and the full
+   `configChanges` set, so rotation/density/UI-mode changes are delivered to the
+   guest instead of recreating it.
+3. **`BridgeInstrumentation.newActivity`** recognises a bridge launch and
+   returns an instance of the imported game's Activity, loaded through its own
+   `DexClassLoader`. `ActivityThread.performLaunchActivity` then calls the real
+   `activity.attach(...)`: genuine `PhoneWindow`, `DecorView`,
+   `FragmentController`, window token and touch/key `InputChannel`.
+4. **`callActivityOnCreate`** rebases the guest on `GuestContext` (merged
+   `AssetManager.addAssetPath(game.apk)`, redirected `files`/`cache`/`obb`), and
+   falls back to Holo (pre-21 guests) or Material (21+) when the guest theme
+   cannot be resolved.
+5. Touch, keys, sensors, lifecycle and configuration are **not forwarded**: the
+   guest is a normal framework Activity, so the system dispatches to it.
+
+Two supporting details make this work in practice:
+
+* `GuestDexLoader.findLibrary` answers `System.loadLibrary("game")` with a
+  per-name **copy** of `libwrapper.so` in `files/games/<pkg>/native/`. ART
+  refuses to dlopen one path from two class loaders, and the copy's
+  `JNI_OnLoad` is harmless. The payload itself is already mapped inside Unicorn
+  and its `RegisterNatives` bindings are installed before the guest class is
+  initialised, which is why the session is opened in `newActivity`.
+* The native downcall path captures **the calling thread's** `JNIEnv` on every
+  trampoline entry. A renderer runs on `GLThread`, not on the thread that opened
+  the session, and reusing the session's `JNIEnv` aborts under CheckJNI.
 
 ---
 
-## 3. Immersive execution
+## 3. The translation core
 
-`GameHostActivity` is declared with `@style/Theme.ZaiBridge.GameHost`, whose
-parent is `@android:style/Theme.NoTitleBar.Fullscreen`; it additionally sets
-`Window.FEATURE_NO_TITLE`, `FLAG_FULLSCREEN`, `FLAG_KEEP_SCREEN_ON`, and the
-legacy immersive flags:
-
-```
-SYSTEM_UI_FLAG_IMMERSIVE_STICKY | FULLSCREEN | HIDE_NAVIGATION |
-LAYOUT_STABLE | LAYOUT_FULLSCREEN | LAYOUT_HIDE_NAVIGATION
-```
-
-On API 30+ it also calls `Window.setDecorFitsSystemWindows(false)` and hides both
-insets through `WindowInsetsController` with transient-bars-by-swipe behaviour.
-The flags are re-applied in `onResume` and whenever the window regains focus, so
-a swiped-in bar cannot leave the game letterboxed.
-
-The guest dex is loaded with
-
-```java
-new DexClassLoader(game.apk, codeCacheDir/guest-<pkg>, payload/, hostClassLoader)
-```
-
-and installed as the thread's context class loader, so the native core can bind
-the APK's `Java_*` exports by their real names instead of falling back to the
-host application's loader.
-
----
-
-## 4. The translation core
-
-`wrapper.cpp` is
-session-based. `JNI_OnLoad` only captures the `JavaVM`; the payload set is
-opened on demand by:
-
-```
-Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeStartSession(
-        JNIEnv*, jclass, jstring gameDir, jstring obbPath, jobject guestLoader)
-```
-
-which maps `<gameDir>/payload/lib*32.so`, links them, runs constructors, binds
-exports, and calls the guest `JNI_OnLoad`. It returns `0` on success, `1` if a
-session is already live, and negative codes for init/payload/map failures.
+`wrapper.cpp` is session-based and **engine-agnostic**. `nativeStartSession()`
+maps the payload set, links it, runs constructors, binds exports, calls the
+guests' `JNI_OnLoad` and returns. Nothing drives frames from the native side:
+the guest's own `GLSurfaceView.Renderer`, `NativeActivity` or SDL loop calls its
+natives from ART, and the guest's `eglSwapBuffers` is forwarded to the real
+driver bound to the Activity's window.
 
 ### Guest address space
 
@@ -145,36 +159,52 @@ session is already live, and negative codes for init/payload/map failures.
 |---|---|
 | `0x3000_0000` + 64 MB | guest heap (first-fit allocator with coalescing) |
 | `0x4000_0000`, +16 MB per library | mapped ELF32 images |
-| `0x5000_0000` | trap page: JNI + import stubs |
+| `0x5000_0000` | trap page: JNI + import stubs + guest-callable host callbacks |
 | `0x500F_0000` | unmapped return sentinel for `uc_emu_start` |
 | `0x7FE0_0000`–`0x7FF0_0000` | 1 MB downward-growing guest stack |
 
-### What the core maintains
+### What the core bridges
 
-* **FPU bring-up** — CPACR grants CP10/CP11 and FPEXC.EN is set before any guest
-  code runs, because Unicorn leaves VFP disabled and every Android ARMv7 binary
-  assumes the kernel enabled it.
-* **JNI shadow pointers** — the guest sees a 32-bit `JNIEnv*` whose only word
-  points at a table of 32-bit `bx lr` stubs. A `UC_HOOK_CODE` hook over the trap
-  page turns each stub into the real 64-bit JNI call and returns through `LR`.
-* **Reverse direction** — each `Java_*` method registered with ART gets a
-  generated ARM64 trampoline that spills `x0–x7`, calls back into C++, and
-  re-enters the emulator at the guest function.
-* **Host routing table** — `libc`/`libm`/`pthread` imports are forwarded to the
-  host by name (`malloc` served from guest memory, `pthread_once` run in-guest,
-  `stat`/`dirent` marshalled between 32- and 64-bit layouts, softfp `float`/
-  `double` ABI handled explicitly). Unimplemented imports resolve to logging
-  stubs instead of jumping into garbage.
+* **JNI** in both directions: a 32-bit shadow `JNIEnv*` whose slots are trap-page
+  stubs, and generated 64-bit trampolines so ART can call ARM32 implementations.
+* **EGL / GLES** — ES 1.x fixed-function (`glVertexPointer`, `glTexCoordPointer`,
+  `glColorPointer`, `glNormalPointer`, `glMatrixMode`, `glLoadMatrixf`,
+  client-array staging at draw time) and ES 2.0/3.0 (`glVertexAttribPointer`,
+  `glDrawElements`, `glTexImage2D`, `glBufferData`, `glGenTextures`,
+  `glBindTexture`, FBOs, shaders, uniforms). Every guest pointer is copied into a
+  host buffer; no 32-bit address ever reaches the driver.
+* **`libandroid`** — `ALooper_*`, `AAssetManager_*` / `AAsset_*`,
+  `AConfiguration_*`, `AInputQueue_*` and the `AInputEvent`/`AKeyEvent`/
+  `AMotionEvent` getters, so native input and asset loops work.
+* **OpenSL ES** — `slCreateEngine` and the object/engine/play/buffer-queue
+  interfaces are rebuilt guest-side as trap-page vtables backed by real host
+  `libOpenSLES.so` objects, so PCM enqueued by the guest is played by the host
+  queue.
+* **`libc`/`libm`/`pthread`** — `malloc` is served from guest memory, `pthread_once`
+  runs in-guest, `stat`/`dirent` are marshalled between 32- and 64-bit layouts,
+  softfp `float`/`double` handled explicitly.
 
 ---
 
-## 5. Icon
+## 4. The universal build
 
-The adaptive icon is an infinity loop split down the middle: the left lobe is
-legacy amber (`#FFB454`), the right lobe is modern cyan (`#3BE0F2`), and a thin
-deck with two pylons underneath turns the loop into a bridge between the two
-architectures. It exists as an adaptive icon (`mipmap-anydpi-v26`) and a
-flattened vector fallback (`mipmap-anydpi`) for API 24/25.
+```
+lib/arm64-v8a/libwrapper.so     Unicorn ARM32 translation core
+lib/armeabi-v7a/libwrapper.so   passthrough (guest payload is native)
+lib/x86_64/libwrapper.so        Unicorn ARM32 translation core
+lib/x86/libwrapper.so           passthrough (guest payload is native)
+```
+
+`CMakeLists.txt` selects the backend per ABI; both variants export the same JNI
+surface so `UnicornBridge` never branches at the call site.
+`jniLibs.useLegacyPackaging = true` keeps every variant extracted on install,
+because the bridge dlopen()s by absolute path.
+
+`assets/runtime/` is unpacked to `files/runtime/<version>/` on first launch and
+passed to the core with `nativeSetRuntimeSysroot`. The guest's DLL/`DT_NEEDED`
+resolver searches, in order: the payload directory, then
+`sysroot_arm32/` (or `sysroot_x86/` on an x86 host). This is what makes an
+import resolve its system libraries offline.
 
 ---
 
@@ -193,18 +223,7 @@ cd zai-bridge
 # → app/build/outputs/apk/debug/app-debug.apk
 ```
 
-The universal APK contains, per 64-bit ABI, `libwrapper.so` (bridge +
-statically linked Unicorn) and `libc++_shared.so`:
-
-```
-lib/arm64-v8a/libwrapper.so
-lib/x86_64/libwrapper.so
-```
-
-Unicorn's TCG/softmmu symbols are excluded from the dynamic symbol table with
-`-Wl,--exclude-libs,ALL`.
-
-To rebuild the emulator core (ARM32/Thumb guest only) for either host ABI:
+To rebuild the emulator core (ARM32/Thumb guest only) for either 64-bit host ABI:
 
 ```bash
 UNICORN_ABI=arm64-v8a ./vendor/build_unicorn_android.sh
@@ -214,73 +233,55 @@ UNICORN_ABI=x86_64    ./vendor/build_unicorn_android.sh
 
 ---
 
-## Universal device support
+## Verification
 
-| Host process | Execution path |
+On a clean `x86_64` Android 14 emulator (API 34, `ZaiBridge_X86_64`) with the
+genuine, unmodified F-Droid build **Tux Rider 1.0.9**
+(`com.drodin.tuxrider`, only `lib/armeabi/libtuxrider.so`):
+
+| Check | Result |
 |---|---|
-| `arm64-v8a` | native host, Unicorn `arm-softmmu` translating the ARM32 guest |
-| `x86_64` | native host, same ARM32 Unicorn backend |
-| `armeabi-v7a` | 32-bit host: no translator, the guest `.so` runs directly |
+| APK installs, 4 ABIs present | yes — `arm64-v8a`, `armeabi-v7a`, `x86_64`, `x86`, 12.3 MB |
+| `BridgeInstrumentation` installed | yes — `ActivityThread.mInstrumentation -> BridgeInstrumentation` |
+| Guest Activity natively attached | yes — `newActivity(ProxyGameActivity) -> com.drodin.tuxrider.MainActivity`, then `onResume` through `Instrumentation.callActivityOnResume` |
+| No `IllegalStateException: No activity` | yes — none in the run |
+| Guest `onCreate` executed its own code | yes — `System.loadLibrary("tuxrider")` served by the bridge, `NativeLib` initialised |
+| ARM32 payload mapped and relocated | yes — 3693 relocations, 0 unresolved, `JNI_OnLoad`, `RegisterNatives` for `resize(II)V` / `render(IIDIZZ)I` |
+| Guest's own renderer drives the loop | yes — 258 `native render` downcalls in 5.1 s (~50/s) on `GLThread` |
+| Guest surface handed to the core | yes — `surface holder hooked on com.drodin.tuxrider.MainView` |
+| Touch reaches the guest window | yes — injected `input tap 540 1200` and `input swipe 300 1200 800 1200` both logged `guest input ACTION_DOWN @ 540,1200` / `@ 300,1200` inside the guest's Activity window; process survives |
+| `eglSwapBuffers` frames presented | **no** |
+| Guest `resize` completes | **no** |
 
-`UnicornBridge` selects the mode from `Build.SUPPORTED_ABIS[0]`. The universal
-APK ships `lib/arm64-v8a/libwrapper.so` and `lib/x86_64/libwrapper.so`; the
-32-bit passthrough is a code path rather than a third shipped ABI in this build.
-Imports with no `lib/armeabi*/*.so` skip Unicorn entirely and host the guest
-Activity directly.
-
-Host dispatch is compiled per architecture: the JNI trampolines are emitted as
-AArch64 instruction words on `__aarch64__` and as System V AMD64 stubs on
-`__x86_64__`, so Unicorn translates the ARM32 guest natively on ARM phones and
-on x86 devices/emulators.
-
-Display and resources: `GameHostActivity` sets
-`LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES`, `AspectRatioFrameLayout` letterboxes
-4:3/16:9 content on tall panels, guest resources are merged through
-`AssetManager.addAssetPath(game.apk)`, and imported dex files are stored
-read-only for Android 14+ ART.
-
-## Runtime status
-
-Verified on a clean `x86_64` Android 14 emulator with the genuine, unmodified
-F-Droid build **Tux Rider 1.0.9** (`com.drodin.tuxrider`, only
-`lib/armeabi/libtuxrider.so`, no arm64 directory):
-
-* the universal APK installs the x86_64 variant, and `libwrapper.so` loads
-  natively with no ARM translation layer involved;
-* the ARM32 payload maps, applies 3693 relocations, runs its constructor and
-  `JNI_OnLoad`, which calls `RegisterNatives` for `resize(II)V` and
-  `render(IIDIZZ)I` through the new x86_64 host trampolines;
-* guest resources merge, the guest Activity is constructed, and the reflective
-  framework attach sets ActivityThread, Instrumentation, ActivityInfo and the
-  window token; the aspect container measures 1080x1440 for the 16:9 window;
-* the earlier NFS payload still reaches `nativeOnCreate`,
-  `nativeSurfaceCreated`/`Changed` and its shader pipeline on both host ABIs.
-
-**Where it stops:** the guest `Activity.onCreate` throws
-`IllegalStateException: No activity` from the framework fragment controller,
-because `attach()` also wires fragment/application listeners that private
-reflection cannot reconstruct. The guest's renderer therefore never starts, no
-`eglSwapBuffers` is issued, and no frame is presented yet. On the NFS payload,
-`nativeOnRunLoopTick` still faults in its own network/telemetry startup.
+**Where it stops:** inside the guest's own SDL initialisation the emulated
+`resize` aborts with `UC_ERR_READ_UNMAPPED` (`pc=40094bd2`, after a `strcmp`
+import). Because that init never completes, the engine never issues
+`eglSwapBuffers`, so nothing is presented yet even though the renderer callback
+loop is live. This is a gap in the emulated bionic surface (the payload expects
+more of `strcmp`/stdio/`__sF` semantics than the bridge provides), not in the
+Activity virtualization: the window, input channel and lifecycle are real.
 
 ## Current limitations
 
-* **Guest Activity attach is incomplete.** Fields can be injected, but
-  `Activity.onCreate` needs the fragment controller and application dispatch
-  hooks created inside `attach()`. A real fix is a proxy Activity in the
-  manifest plus `Instrumentation` substitution, not reflection.
-* **Engine drive is game-specific.** `drive_render_loop()` targets
-  `GameActivityMain`/`RunLoop`; payloads that register their own natives (SDL's
-  `resize`/`render`) need a per-engine driver.
-* **GLES marshalling** covers the shader/program pipeline, buffers, textures,
-  client vertex arrays and uniforms, but `glMapBufferOES`, compressed uploads and
-  `glGetActiveUniform/Attrib` remain stubs.
-* **Surface recreation.** Guest EGL surfaces are bound to the window captured at
-  creation; rotation/backgrounding is not automated yet.
+* **No frames from this payload yet.** See above; the Activity, lifecycle,
+  surface, input channel and renderer loop are verified, presentation is not.
+* **Runtime bundle is small.** `assets/runtime/` holds the NDK's 32-bit
+  compatibility libraries (`libc`, `libm`, `libGLESv1_CM`, `libGLESv2`,
+  `libEGL`, `libOpenSLES`, `libandroid`, `libz`, `libdl`, `liblog`,
+  `libvulkan`, `libstdc++`, `libOpenMAXAL` for both `arm` and `x86`) plus
+  `org.apache.http.legacy.jar`. Those NDK platform libraries are linker stubs,
+  and `android.support.v4` / the Play APK-Expansion classes are not available
+  locally, so they are not bundled. The APK is 12.3 MB, not the 200 MB target:
+  padding it to a size would add nothing a guest can use.
+* **OpenSL ES is interface-complete but not exercised** by the verified payload;
+  buffer-queue callbacks from the host thread are accepted and ignored.
+* **`ALooper_addFd` callbacks** cannot be invoked from the host looper; the fd is
+  registered for polling only.
+* **Some libc surface remains stubbed** (`printf`/`sprintf` families, `qsort`,
+  `mktime`, socket setup); each is logged once as `unimplemented import`.
 * **Single session per process.** A second launch reports
   `SESSION_ALREADY_RUNNING`; teardown is not implemented.
-* **Performance.** Interpretation, not JIT: frame-rate ceiling well below native,
-  and no multi-threaded guest scheduling.
+* **Performance.** Interpretation, not JIT.
 
 ## Third-party
 

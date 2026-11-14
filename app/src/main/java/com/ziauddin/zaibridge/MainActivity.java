@@ -21,9 +21,12 @@ import android.widget.GridView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import com.ziauddin.zaibridge.core.BridgeInstrumentation;
+import com.ziauddin.zaibridge.core.GuestLauncher;
 import com.ziauddin.zaibridge.data.Game;
 import com.ziauddin.zaibridge.data.GameAdapter;
 import com.ziauddin.zaibridge.data.GameRepository;
+import com.ziauddin.zaibridge.proxy.ProxyGameActivity;
 import com.ziauddin.zaibridge.service.IngestionService;
 
 import java.util.List;
@@ -87,10 +90,15 @@ public class MainActivity extends Activity {
     }
 
     private void launch(Game game) {
-        Intent intent = new Intent(this, GameHostActivity.class);
-        intent.putExtra(GameHostActivity.EXTRA_GAME_DIR,
+        final boolean virtualized = BridgeInstrumentation.isInstalled();
+        Intent intent = new Intent(this, virtualized
+                ? ProxyGameActivity.class : GameHostActivity.class);
+        intent.putExtra(GuestLauncher.EXTRA_GAME_DIR,
                 GameRepository.gameDir(this, game.directoryName).getAbsolutePath());
-        intent.putExtra(GameHostActivity.EXTRA_GAME_LABEL, game.label);
+        intent.putExtra(GuestLauncher.EXTRA_GAME_LABEL, game.label);
+        intent.putExtra(GuestLauncher.EXTRA_GUEST_ACTIVITY, game.launcherActivity);
+        Log.i(TAG, "launching " + game.label + " via "
+                + (virtualized ? "ProxyGameActivity (Instrumentation)" : "GameHostActivity"));
         startActivity(intent);
     }
 

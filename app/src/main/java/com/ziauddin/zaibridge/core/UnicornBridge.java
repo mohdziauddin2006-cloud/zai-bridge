@@ -35,6 +35,9 @@ public final class UnicornBridge {
     public static final String HOST_ABI = Build.SUPPORTED_ABIS.length > 0
             ? Build.SUPPORTED_ABIS[0] : "unknown";
 
+    /** Architecture the legacy payloads are compiled for. */
+    public static final String GUEST_ABI = "armeabi-v7a";
+
     private static final boolean CORE_LOADED;
 
     static {
@@ -52,12 +55,12 @@ public final class UnicornBridge {
     }
 
     /**
-     * A 32-bit host process (armeabi-v7a) already runs the guest libraries, so
-     * the translator is not loaded and the guest is started directly. The
-     * 64-bit APK variants (arm64-v8a, x86_64) always use the Unicorn backend.
+     * A 32-bit host process (armeabi-v7a or x86) already runs the guest
+     * libraries, so the translator is not loaded and the guest is started
+     * directly. The 64-bit APK variants (arm64-v8a, x86_64) always use Unicorn.
      */
     public static boolean isPassthrough() {
-        return HOST_ABI.startsWith("armeabi");
+        return HOST_ABI.startsWith("armeabi") || "x86".equals(HOST_ABI);
     }
 
     public static boolean isEmulated() {
@@ -101,6 +104,26 @@ public final class UnicornBridge {
         nativeSetSurface(surface);
     }
 
+    /**
+     * Root of the unpacked 32-bit runtime bundle. The core searches
+     * {@code <root>/sysroot_arm32} (and {@code sysroot_x86}) after the payload
+     * directory when a guest binary requests a library by name.
+     */
+    public static void setRuntimeSysroot(String path) {
+        if (!CORE_LOADED) return;
+        nativeSetRuntimeSysroot(path);
+    }
+
+    /** Attaches the guest Activity instance once it exists. */
+    public static void setGuestActivity(Object activity) {
+        if (!CORE_LOADED) return;
+        nativeSetGuestActivity(activity);
+    }
+
+    public static boolean isSessionActive() {
+        return CORE_LOADED && nativeIsSessionActive();
+    }
+
     /** Unicorn version and guest/host architecture, for diagnostics. */
     public static native String nativeVersion();
 
@@ -109,4 +132,10 @@ public final class UnicornBridge {
                                                  Object guestActivity);
 
     private static native void nativeSetSurface(Surface surface);
+
+    private static native void nativeSetRuntimeSysroot(String path);
+
+    private static native void nativeSetGuestActivity(Object activity);
+
+    private static native boolean nativeIsSessionActive();
 }

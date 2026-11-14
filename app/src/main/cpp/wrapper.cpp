@@ -52,6 +52,8 @@
 #include <android/native_window_jni.h>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
+#include <SLES/OpenSLES.h>
+#include <SLES/OpenSLES_Android.h>
 
 #include <dirent.h>
 #include <dlfcn.h>
@@ -909,7 +911,7 @@ private:
 // ===========================================================================
 // 4. JNI bridge
 // ===========================================================================
-enum StubKind : int { kStubJniEnv = 1, kStubJniVm, kStubImport };
+enum StubKind : int { kStubJniEnv = 1, kStubJniVm, kStubImport, kStubCallback };
 
 struct StubSlot {
     StubKind    kind;
@@ -1028,8 +1030,9 @@ public:
 
     explicit JniBridge(Emulator& emu) : emu_(emu), linker_(emu) {}
 
-    bool init(JavaVM* /*vm*/, JNIEnv* env) {
+    bool init(JavaVM* vm, JNIEnv* env) {
         env_ = env;
+        vm_ = vm;
         if (!HostTrampolines::init()) return false;
 
         linker_.set_import_resolver([this](const std::string& name) {
@@ -1042,6 +1045,7 @@ public:
         // handler table is only installed when libEGL is actually loaded.
         open_host_graphics();
         install_import_handlers();
+        install_platform_handlers();
 
         // Data imports (address-of, not a call) get real guest memory instead
         // of a code stub: the guest dereferences these.
@@ -1054,8 +1058,27 @@ public:
             // mov r0, #0 ; ldr pc, [sp], #4  - a guest `ret` that also clears r0.
             const uint32_t gadget[] = {0xE3A00000u, 0xE49DF004u};
             emu_.write(return_gadget_, gadget, sizeof gadget);
+            // __stack_chk_guard is a real data symbol (the guest loads it), but
+            // __errno is a *function* on ARM bionic: it returns the address of
+            // the thread's errno cell. Registering it as data makes every
+            // guest `__errno()` call branch into a data page.
             data_slots_["__stack_chk_guard"] = stack_guard_;
-            data_slots_["__errno"] = errno_cell_;
+        }
+
+        // Data symbols a legacy payload dereferences rather than calls. They
+        // must be readable guest memory: a code stub here is what turns a
+        // printf() into a wild jump, because the guest loads a FILE* field out
+        // of the address and calls through it.
+        const uint32_t stdio_files = emu_.alloc(3 * 256, 16);   // bionic __sF[3]
+        const uint32_t environ_slot = emu_.alloc(4, 4);
+        if (stdio_files && environ_slot) {
+            emu_.write_u32(environ_slot, 0);
+            data_slots_["__sF"] = stdio_files;
+            data_slots_["stdin"] = stdio_files;
+            data_slots_["stdout"] = stdio_files + 256;
+            data_slots_["stderr"] = stdio_files + 512;
+            data_slots_["environ"] = environ_slot;
+            LOGI("data imports: __sF @%08x, environ @%08x", stdio_files, environ_slot);
         }
 
         // 32-bit JNIEnv shadow: one word pointing at the function table.
@@ -1199,141 +1222,6 @@ public:
         return it == entry_points_.end() ? 0u : it->second;
     }
 
-    // =====================================================================
-    // Guest engine drive
-    //
-    // ART cannot be the caller here: the registered implementations are
-    // generated ARM64 trampolines in an anonymous executable mapping, and the
-    // ARM translator used on x86_64 hosts faults inside
-    // ndk_translation_HandleNoExec as soon as such a page is executed. The
-    // engine is therefore entered from this thread, with a host EGL context
-    // current, and its renderer callbacks are issued as direct Unicorn calls.
-    // =====================================================================
-    bool drive_render_loop() {
-        const uint32_t onCreate =
-                entry_point("com/ea/ironmonkey/GameActivityMain", "nativeOnCreate");
-        const uint32_t onSurfaceCreated =
-                entry_point("com/ea/ironmonkey/GameActivityMain", "nativeSurfaceCreated");
-        const uint32_t onSurfaceChanged =
-                entry_point("com/ea/ironmonkey/GameActivityMain", "nativeSurfaceChanged");
-        const uint32_t onTick =
-                entry_point("com/ea/ironmonkey/RunLoop", "nativeOnRunLoopTick");
-
-        if (!onCreate || !onTick) {
-            LOGW("render drive: entry points missing (onCreate=%08x tick=%08x)",
-                 onCreate, onTick);
-            return false;
-        }
-
-        // The guest's `this` for every callback: the Activity instance the Java
-        // side created from the guest dex.
-        const uint32_t thiz = to_guest_ref(guest_thiz_);
-        uint32_t ret = 0;
-        LOGI("render drive: guest nativeOnCreate @%08x (thiz=%08x)", onCreate, thiz);
-        if (!emu_.call(onCreate, {env_shadow_, thiz}, ret, "nativeOnCreate")) {
-            LOGW("render drive: nativeOnCreate did not return cleanly");
-        }
-
-        EGLDisplay dpy = EGL_NO_DISPLAY;
-        EGLSurface surface = EGL_NO_SURFACE;
-        EGLContext context = EGL_NO_CONTEXT;
-        EGLConfig config = nullptr;
-        bool own_surface = false;
-        ANativeWindow* window = host_window_;
-
-        // If the engine created its own window surface through the forwarded
-        // EGL entry points, it also owns presentation and this loop only ticks.
-        if (egl_window_surfaces_ == 0 && window) {
-            auto getDisplay =
-                    gl_proc<EGLDisplay (*)(EGLNativeDisplayType)>("eglGetDisplay");
-            auto initialize = gl_proc<EGLBoolean (*)(EGLDisplay, EGLint*, EGLint*)>(
-                    "eglInitialize");
-            auto chooseConfig =
-                    gl_proc<EGLBoolean (*)(EGLDisplay, const EGLint*, EGLConfig*, EGLint,
-                                           EGLint*)>("eglChooseConfig");
-            auto createWindowSurface =
-                    gl_proc<EGLSurface (*)(EGLDisplay, EGLConfig, EGLNativeWindowType,
-                                           const EGLint*)>("eglCreateWindowSurface");
-            auto createContext =
-                    gl_proc<EGLContext (*)(EGLDisplay, EGLConfig, EGLContext, const EGLint*)>(
-                            "eglCreateContext");
-            auto makeCurrent = gl_proc<EGLBoolean (*)(EGLDisplay, EGLSurface, EGLSurface,
-                                                      EGLContext)>("eglMakeCurrent");
-
-            if (getDisplay && initialize && chooseConfig && createWindowSurface &&
-                createContext && makeCurrent) {
-                dpy = getDisplay(EGL_DEFAULT_DISPLAY);
-                EGLint major = 0, minor = 0;
-                if (dpy != EGL_NO_DISPLAY && initialize(dpy, &major, &minor)) {
-                    const EGLint cfg_attrs[] = {
-                            EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
-                            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-                            EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
-                            EGL_ALPHA_SIZE, 8, EGL_DEPTH_SIZE, 16, EGL_NONE};
-                    EGLint count = 0;
-                    if (chooseConfig(dpy, cfg_attrs, &config, 1, &count) && count > 0) {
-                        const EGLint sattrs[] = {EGL_NONE};
-                        surface = createWindowSurface(
-                                dpy, config,
-                                reinterpret_cast<EGLNativeWindowType>(window), sattrs);
-                        const EGLint cattrs[] = {
-                                EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
-                        if (surface != EGL_NO_SURFACE) {
-                            context = createContext(dpy, config, EGL_NO_CONTEXT, cattrs);
-                        }
-                        if (context != EGL_NO_CONTEXT &&
-                            makeCurrent(dpy, surface, surface, context)) {
-                            own_surface = true;
-                        }
-                        LOGI("render drive: host EGL %dx%d surface=%p context=%p (own=%d)",
-                             0, 0, surface, context, own_surface ? 1 : 0);
-                    } else {
-                        LOGE("render drive: eglChooseConfig found no ES2 config");
-                    }
-                }
-            } else {
-                LOGE("render drive: host EGL entry points unavailable");
-            }
-        }
-
-        if (onSurfaceCreated) {
-            LOGI("render drive: guest nativeSurfaceCreated @%08x", onSurfaceCreated);
-            emu_.call(onSurfaceCreated, {env_shadow_, thiz, 0, 0}, ret,
-                      "nativeSurfaceCreated");
-        }
-
-        const int width = window ? ANativeWindow_getWidth(window) : 0;
-        const int height = window ? ANativeWindow_getHeight(window) : 0;
-        if (onSurfaceChanged) {
-            LOGI("render drive: guest nativeSurfaceChanged %dx%d", width, height);
-            emu_.call(onSurfaceChanged,
-                      {env_shadow_, thiz, 0, static_cast<uint32_t>(width),
-                       static_cast<uint32_t>(height)},
-                      ret, "nativeSurfaceChanged");
-        }
-
-        auto swapBuffers = gl_proc<EGLBoolean (*)(EGLDisplay, EGLSurface)>("eglSwapBuffers");
-        int ticks = 0;
-        int swaps = 0;
-        while (host_window_ && ticks < 200000) {
-            if (!emu_.call(onTick, {env_shadow_, thiz}, ret, "nativeOnRunLoopTick")) {
-                LOGW("render drive: tick failed after %d ticks / %d swaps", ticks, swaps);
-                break;
-            }
-            ++ticks;
-            if (own_surface && swapBuffers) {
-                swapBuffers(dpy, surface);
-                ++swaps;
-                if (swaps <= 3 || swaps % 120 == 0) {
-                    LOGI("render drive: host swap #%d (eglSwapBuffers)", swaps);
-                }
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(16));
-        }
-        LOGI("render drive: stopped after %d ticks, %d host swaps", ticks, swaps);
-        return swaps > 0 || ticks > 0;
-    }
-
     // The guest dex loader supplied by GameHostActivity. Kept as a plain
     // reference: the Java side holds the loader for the whole session.
     void set_guest_loader(jobject loader) { guest_loader_ = loader; }
@@ -1355,6 +1243,40 @@ public:
     }
 
     void set_host_window(ANativeWindow* window) { host_window_ = window; }
+
+    void set_runtime_root(const std::string& root) { runtime_root_ = root; }
+
+    // Directory that holds the bundled 32-bit compatibility libraries for the
+    // architecture this host is emulating.
+    std::string runtime_sysroot() const {
+        if (runtime_root_.empty()) return {};
+#if defined(__x86_64__)
+        return runtime_root_ + "/sysroot_x86";
+#else
+        return runtime_root_ + "/sysroot_arm32";
+#endif
+    }
+
+    // A system library the guest asks for by name (or by absolute /system path)
+    // is answered from the bundled sysroot when it is there. This is what keeps
+    // imports self-contained and offline: no host system image is required to
+    // satisfy libGLESv1_CM, libOpenSLES, libz, libc++_shared, ...
+    std::string sysroot_library(const std::string& name) const {
+        const std::string root = runtime_sysroot();
+        if (root.empty()) return {};
+
+        std::string base = name;
+        const size_t slash = base.find_last_of('/');
+        if (slash != std::string::npos) base = base.substr(slash + 1);
+        if (base.empty()) return {};
+
+        const char* dirs[] = {"/", "/lib/", "/system/lib/", "/vendor/lib/"};
+        for (const char* d : dirs) {
+            const std::string candidate = root + d + base;
+            if (::access(candidate.c_str(), R_OK) == 0) return candidate;
+        }
+        return {};
+    }
 
     // Guest images 0..n-1 are the payloads mapped at session start; anything
     // dlopen()ed later takes the next slot.
@@ -1383,10 +1305,31 @@ public:
         return at;
     }
 
-    std::string guest_string(uint32_t addr) { return emu_.read_cstr(addr); }
+    std::string guest_string(uint32_t addr) { return emu_.read_cstr(addr); }    // A native method is called from whichever ART thread the guest engine
+    // uses — SDL's GLThread, an audio feeder, the main thread. JNIEnv is
+    // per-thread, so the JNIEnv captured at session start must never be reused
+    // there: CheckJNI aborts with "using JNIEnv* from thread ...". This scope
+    // swaps in the caller's own environment for the duration of the downcall.
+    struct EnvScope {
+        JNIEnv*& slot;
+        JNIEnv*  saved;
+        JNIEnv*  caller = nullptr;
+        explicit EnvScope(JNIEnv*& s, JavaVM* vm) : slot(s), saved(s) {
+            if (!vm) return;
+            if (vm->GetEnv(reinterpret_cast<void**>(&caller), JNI_VERSION_1_6) != JNI_OK) {
+                // Not attached yet: attach for the life of the thread. It is
+                // never detached explicitly; ART does that on thread exit.
+                if (vm->AttachCurrentThread(&caller, nullptr) != JNI_OK) caller = nullptr;
+            }
+            if (caller) slot = caller;
+        }
+        ~EnvScope() { slot = saved; }
+    };
 
     // ---- called from the generated ARM64 trampoline -----------------------
     uint64_t native_entry(uint32_t id, uint64_t* host_args) {
+        EnvScope env_scope(env_, vm_);
+
         if (id >= natives_.size()) return 0;
         const NativeEntry& e = natives_[id];
 
@@ -1594,6 +1537,20 @@ private:
         return kStubBase + static_cast<uint32_t>(slot * kStubStride);
     }
 
+    // A guest-callable trampoline for a host callback. Used wherever the guest
+    // has to invoke a function pointer a host library handed it: OpenSL ES
+    // interface vtables, ALooper callbacks, JNI weak hooks.
+    uint32_t make_callback_stub(std::function<uint32_t()> fn, const std::string& name) {
+        const size_t slot = slots_.size();
+        if (slot >= kStubCount) {
+            LOGE("trap page exhausted (%zu stubs)", kStubCount);
+            return kStubBase;
+        }
+        callbacks_.push_back(std::move(fn));
+        slots_.push_back({kStubCallback, static_cast<int>(callbacks_.size() - 1), name});
+        return kStubBase + static_cast<uint32_t>(slot * kStubStride);
+    }
+
     uint32_t import_stub(const std::string& name) {
         auto it = import_slots_.find(name);
         if (it != import_slots_.end()) return it->second;
@@ -1630,6 +1587,10 @@ private:
             case kStubJniEnv: ret = dispatch_env(s.index); break;
             case kStubJniVm:  ret = dispatch_vm(s.index);  break;
             case kStubImport: ret = dispatch_import(slot, s); break;
+            case kStubCallback:
+                ret = s.index >= 0 && static_cast<size_t>(s.index) < callbacks_.size()
+                          ? callbacks_[static_cast<size_t>(s.index)]() : 0u;
+                break;
         }
 
         // A handler may have re-pointed PC itself (an in-guest call such as
@@ -1726,11 +1687,19 @@ private:
     // an opaque 32-bit handle; the real object is a LoadedLibrary.
     // =====================================================================
     std::string payload_library_path(const std::string& name) {
+        if (name.empty()) return {};
         std::string base = name;
         const size_t slash = base.find_last_of('/');
         if (slash != std::string::npos) base = base.substr(slash + 1);
         if (base.empty()) return {};
-        if (name[0] == '/') return translate_path(name, "dlopen");
+
+        // An absolute request is either a redirected game path or a system
+        // library the guest expects to find on the device.
+        if (name[0] == '/') {
+            const std::string translated = translate_path(name, "dlopen");
+            if (::access(translated.c_str(), R_OK) == 0) return translated;
+            return sysroot_library(base);
+        }
 
         std::string tagged = base;
         if (tagged.size() > 3 && tagged.compare(tagged.size() - 3, 3, ".so") == 0) {
@@ -1738,7 +1707,17 @@ private:
         }
         const std::string candidate = payload_dir_ + "/" + tagged;
         if (::access(candidate.c_str(), R_OK) == 0) return candidate;
-        return payload_dir_ + "/" + base;
+
+        const std::string untagged = payload_dir_ + "/" + base;
+        if (::access(untagged.c_str(), R_OK) == 0) return untagged;
+
+        // Last resort: the bundled 32-bit compatibility sysroot.
+        const std::string from_runtime = sysroot_library(base);
+        if (!from_runtime.empty()) {
+            LOGI("dlopen(%s): resolved from bundled sysroot (%s)", name.c_str(),
+                 from_runtime.c_str());
+        }
+        return from_runtime;
     }
 
     uint32_t guest_dlopen(const std::string& name) {
@@ -1748,7 +1727,7 @@ private:
 
         const std::string path = payload_library_path(name);
         if (path.empty() || ::access(path.c_str(), R_OK) != 0) {
-            LOGW("dlopen(%s): no ingested payload named %s", name.c_str(), path.c_str());
+            LOGW("dlopen(%s): not found in payload/ or the bundled sysroot", name.c_str());
             return 0;
         }
 
@@ -2549,6 +2528,23 @@ private:
     };
 
     ClientAttribute client_attributes_[16] = {};
+
+    // OpenGL ES 1.x fixed-function vertex arrays. GLES1 has no attrib
+    // locations: the engine binds one array per semantic and the driver reads
+    // it at draw time, so the same guest-memory staging applies.
+    enum FixedArrayKind { kVertexArray = 0, kNormalArray, kColorArray, kTexCoordArray,
+                          kFixedArrayCount };
+    struct FixedArray {
+        bool     set = false;
+        bool     enabled = false;
+        GLint    size = 4;
+        GLenum   type = GL_FLOAT;
+        GLsizei  stride = 0;
+        uint32_t ptr = 0;
+        size_t   element = 0;   // bytes per element, from size*type
+    };
+    FixedArray fixed_arrays_[kFixedArrayCount] = {};
+
     GLuint bound_array_buffer_ = 0;
     GLuint bound_element_buffer_ = 0;
     uint32_t brk_base_ = 0;
@@ -3389,6 +3385,8 @@ private:
             if (count > 0) {
                 stage_client_attributes(static_cast<size_t>(first) +
                                         static_cast<size_t>(count), storage);
+                stage_fixed_arrays(static_cast<size_t>(first) +
+                                   static_cast<size_t>(count), storage);
             }
             fn(static_cast<GLenum>(arg(0)), first, count);
             return 0u;
@@ -3435,6 +3433,7 @@ private:
 
             std::vector<std::vector<uint8_t>> storage;
             stage_client_attributes(static_cast<size_t>(max_index) + 1, storage);
+            stage_fixed_arrays(static_cast<size_t>(max_index) + 1, storage);
             fn(static_cast<GLenum>(arg(0)), count, type, staged_index.data());
             return 0u;
         };
@@ -3559,9 +3558,984 @@ private:
         is_query("glIsShader");
         is_query("glIsEnabled");
 
+        // The GLES2 block undefines these; the fixed-function block below needs
+        // the same forwarding shapes, so they are declared again here.
+#define ZB_GL_V(name, sig, call)                                  \
+    import_handlers_[name] = [this] {                             \
+        auto fn = gl_proc<void (*) sig>(name);                    \
+        if (fn) fn call;                                          \
+        return 0u;                                                \
+    };
+#define ZB_GL_R(name, sig, call)                                  \
+    import_handlers_[name] = [this] {                             \
+        auto fn = gl_proc<GLenum (*) sig>(name);                  \
+        return fn ? static_cast<uint32_t>(fn call) : 0u;          \
+    };
+
+        // ---- GLES 1.x fixed-function pipeline ----------------------------
+        // A legacy engine never calls glVertexAttribPointer: it fills host-visible
+        // structs in guest memory, points glVertexPointer / glTexCoordPointer at
+        // them, and draws. The pointer is a 32-bit guest address and can never be
+        // handed to the driver, so the arrays are recorded here and staged into
+        // host buffers immediately before each draw.
+        auto fixed_array = [this](const char* name, FixedArrayKind kind, int default_size) {
+            import_handlers_[name] = [this, name, kind, default_size] {
+                FixedArray& a = fixed_arrays_[kind];
+                a.set = true;
+                a.size = default_size > 0 ? static_cast<GLint>(arg(0)) : 1;
+                a.type = static_cast<GLenum>(arg(default_size > 0 ? 1 : 0));
+                a.stride = static_cast<GLsizei>(arg(default_size > 0 ? 2 : 1));
+                a.ptr = arg(default_size > 0 ? 3 : 2);
+                a.element = static_cast<size_t>(a.size) * gl_type_bytes(a.type);
+                return 0u;
+            };
+        };
+        fixed_array("glVertexPointer", kVertexArray, 3);
+        fixed_array("glColorPointer", kColorArray, 4);
+        fixed_array("glTexCoordPointer", kTexCoordArray, 4);
+        fixed_array("glNormalPointer", kNormalArray, 0);
+
+        import_handlers_["glEnableClientState"] = [this] {
+            const GLenum state = static_cast<GLenum>(arg(0));
+            const int kind = fixed_kind(state);
+            if (kind >= 0) fixed_arrays_[kind].enabled = true;
+            return 0u;
+        };
+        import_handlers_["glDisableClientState"] = [this] {
+            const GLenum state = static_cast<GLenum>(arg(0));
+            const int kind = fixed_kind(state);
+            if (kind >= 0) fixed_arrays_[kind].enabled = false;
+            return 0u;
+        };
+
+        // Matrix stack: the uniforms live in guest memory but the driver keeps
+        // its own state, so every one of these is forwarded as scalars.
+        ZB_GL_V("glMatrixMode", (GLenum), (static_cast<GLenum>(arg(0))));
+        ZB_GL_V("glLoadIdentity", (), ());
+        ZB_GL_V("glPushMatrix", (), ());
+        ZB_GL_V("glPopMatrix", (), ());
+        ZB_GL_V("glTranslatef", (GLfloat, GLfloat, GLfloat),
+                (f_arg(0), f_arg(1), f_arg(2)));
+        ZB_GL_V("glRotatef", (GLfloat, GLfloat, GLfloat, GLfloat),
+                (f_arg(0), f_arg(1), f_arg(2), f_arg(3)));
+        ZB_GL_V("glScalef", (GLfloat, GLfloat, GLfloat),
+                (f_arg(0), f_arg(1), f_arg(2)));
+        ZB_GL_V("glOrthof", (GLfloat, GLfloat, GLfloat, GLfloat, GLfloat, GLfloat),
+                (f_arg(0), f_arg(1), f_arg(2), f_arg(3), f_arg(4), f_arg(5)));
+        ZB_GL_V("glFrustumf", (GLfloat, GLfloat, GLfloat, GLfloat, GLfloat, GLfloat),
+                (f_arg(0), f_arg(1), f_arg(2), f_arg(3), f_arg(4), f_arg(5)));
+        ZB_GL_V("glShadeModel", (GLenum), (static_cast<GLenum>(arg(0))));
+        ZB_GL_V("glAlphaFunc", (GLenum, GLfloat),
+                (static_cast<GLenum>(arg(0)), f_arg(1)));
+        ZB_GL_V("glTexEnvi", (GLenum, GLenum, GLint),
+                (static_cast<GLenum>(arg(0)), static_cast<GLenum>(arg(1)),
+                 static_cast<GLint>(arg(2))));
+        ZB_GL_V("glTexEnvf", (GLenum, GLenum, GLfloat),
+                (static_cast<GLenum>(arg(0)), static_cast<GLenum>(arg(1)), f_arg(2)));
+        ZB_GL_V("glColor4f", (GLfloat, GLfloat, GLfloat, GLfloat),
+                (f_arg(0), f_arg(1), f_arg(2), f_arg(3)));
+        ZB_GL_V("glColor4ub", (GLubyte, GLubyte, GLubyte, GLubyte),
+                (static_cast<GLubyte>(arg(0)), static_cast<GLubyte>(arg(1)),
+                 static_cast<GLubyte>(arg(2)), static_cast<GLubyte>(arg(3))));
+        ZB_GL_V("glNormal3f", (GLfloat, GLfloat, GLfloat),
+                (f_arg(0), f_arg(1), f_arg(2)));
+        ZB_GL_V("glPointSize", (GLfloat), (f_arg(0)));
+        ZB_GL_V("glClientActiveTexture", (GLenum), (static_cast<GLenum>(arg(0))));
+
+        import_handlers_["glLoadMatrixf"] = [this] {
+            auto fn = gl_proc<void (*)(const GLfloat*)>("glLoadMatrixf");
+            std::vector<uint8_t> staged;
+            if (fn && stage_guest(arg(0), 16 * sizeof(GLfloat), staged)) {
+                fn(reinterpret_cast<const GLfloat*>(staged.data()));
+            }
+            return 0u;
+        };
+        import_handlers_["glMultMatrixf"] = [this] {
+            auto fn = gl_proc<void (*)(const GLfloat*)>("glMultMatrixf");
+            std::vector<uint8_t> staged;
+            if (fn && stage_guest(arg(0), 16 * sizeof(GLfloat), staged)) {
+                fn(reinterpret_cast<const GLfloat*>(staged.data()));
+            }
+            return 0u;
+        };
+        import_handlers_["glMaterialfv"] = [this] {
+            auto fn = gl_proc<void (*)(GLenum, GLenum, const GLfloat*)>("glMaterialfv");
+            std::vector<uint8_t> staged;
+            if (fn && stage_guest(arg(2), 4 * sizeof(GLfloat), staged)) {
+                fn(static_cast<GLenum>(arg(0)), static_cast<GLenum>(arg(1)),
+                   reinterpret_cast<const GLfloat*>(staged.data()));
+            }
+            return 0u;
+        };
+        import_handlers_["glLightfv"] = [this] {
+            auto fn = gl_proc<void (*)(GLenum, GLenum, const GLfloat*)>("glLightfv");
+            std::vector<uint8_t> staged;
+            if (fn && stage_guest(arg(2), 4 * sizeof(GLfloat), staged)) {
+                fn(static_cast<GLenum>(arg(0)), static_cast<GLenum>(arg(1)),
+                   reinterpret_cast<const GLfloat*>(staged.data()));
+            }
+            return 0u;
+        };
+
+#undef ZB_GL_V
+#undef ZB_GL_R
+
         // ---- client vertex arrays in a draw ------------------------------
         // glVertexAttribPointer never reached the driver for client arrays; the
         // staging happens inside glDrawArrays / glDrawElements above.
+    }
+
+    static int fixed_kind(GLenum state) {
+        switch (state) {
+            case 0x8074: return kVertexArray;    // GL_VERTEX_ARRAY
+            case 0x8075: return kNormalArray;    // GL_NORMAL_ARRAY
+            case 0x8076: return kColorArray;     // GL_COLOR_ARRAY
+            case 0x8078: return kTexCoordArray;  // GL_TEXTURE_COORD_ARRAY
+            default: return -1;
+        }
+    }
+
+    // Re-points every enabled fixed-function array at a host copy of the guest
+    // range the upcoming draw will read.
+    void stage_fixed_arrays(size_t vertex_count,
+                            std::vector<std::vector<uint8_t>>& storage) {
+        auto vertex = gl_proc<void (*)(GLint, GLenum, GLsizei, const void*)>(
+                "glVertexPointer");
+        auto color = gl_proc<void (*)(GLint, GLenum, GLsizei, const void*)>(
+                "glColorPointer");
+        auto texcoord = gl_proc<void (*)(GLint, GLenum, GLsizei, const void*)>(
+                "glTexCoordPointer");
+        auto normal = gl_proc<void (*)(GLenum, GLsizei, const void*)>("glNormalPointer");
+        auto issue = [&](int kind, void* /*tag*/) {
+            FixedArray& a = fixed_arrays_[kind];
+            if (!a.enabled || !a.set || a.element == 0) return;
+            const size_t stride = a.stride ? static_cast<size_t>(a.stride) : a.element;
+            const size_t bytes = stride * vertex_count + a.element;
+            storage.emplace_back();
+            if (!stage_guest(a.ptr, bytes, storage.back())) {
+                storage.pop_back();
+                return;
+            }
+            const void* host = storage.back().data();
+            switch (kind) {
+                case kVertexArray:
+                    if (vertex) vertex(a.size, a.type, static_cast<GLsizei>(stride), host);
+                    break;
+                case kColorArray:
+                    if (color) color(a.size, a.type, static_cast<GLsizei>(stride), host);
+                    break;
+                case kTexCoordArray:
+                    if (texcoord) texcoord(a.size, a.type, static_cast<GLsizei>(stride), host);
+                    break;
+                case kNormalArray:
+                    if (normal) normal(a.type, static_cast<GLsizei>(stride), host);
+                    break;
+                default:
+                    break;
+            }
+        };
+        for (int kind = 0; kind < kFixedArrayCount; ++kind) issue(kind, nullptr);
+    }
+
+    // =====================================================================
+    // libandroid / libOpenSLES
+    //
+    // NativeActivity-era payloads do not only draw: they poll an ALooper, read
+    // assets through AAssetManager, consume AInputQueue events and push PCM at
+    // an OpenSL ES buffer queue. All four are bridged to the real host
+    // libraries; opaque host pointers cross as 32-bit handles and every
+    // guest-memory buffer is copied, never truncated.
+    // =====================================================================
+    void install_platform_handlers() {
+        android_lib_ = ::dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
+        opensles_lib_ = ::dlopen("libOpenSLES.so", RTLD_NOW | RTLD_LOCAL);
+        LOGI("host platform: libandroid=%p libOpenSLES=%p", android_lib_, opensles_lib_);
+
+        install_looper_handlers();
+        install_asset_handlers();
+        install_config_handlers();
+        install_input_handlers();
+        install_opensles_handlers();
+        current_assets();
+    }
+
+    void install_looper_handlers() {
+        import_handlers_["ALooper_prepare"] = [this] {
+            auto fn = platform_proc<void* (*)(int)>("ALooper_prepare");
+            return fn ? to_guest_ref(fn(static_cast<int>(arg(0)))) : 0u;
+        };
+        import_handlers_["ALooper_acquire"] = [this] {
+            auto fn = platform_proc<void (*)(void*)>("ALooper_acquire");
+            if (fn) fn(from_guest_ref(arg(0)));
+            return 0u;
+        };
+        import_handlers_["ALooper_release"] = [this] {
+            auto fn = platform_proc<void (*)(void*)>("ALooper_release");
+            if (fn) fn(from_guest_ref(arg(0)));
+            return 0u;
+        };
+        import_handlers_["ALooper_wake"] = [this] {
+            auto fn = platform_proc<void (*)(void*)>("ALooper_wake");
+            if (fn) fn(from_guest_ref(arg(0)));
+            return 0u;
+        };
+        // ALooper_pollOnce(looper, timeoutMillis, outFd, outEvents, outData):
+        // the ident is the return value, the three out-parameters are guest
+        // memory and are filled from local host variables.
+        import_handlers_["ALooper_pollOnce"] = [this] {
+            auto fn = platform_proc<int (*)(void*, int, int*, int*, void**)>(
+                    "ALooper_pollOnce");
+            if (!fn) return static_cast<uint32_t>(-1);
+            int fd = -1, events = 0;
+            void* data = nullptr;
+            const int ident = fn(from_guest_ref(arg(0)), static_cast<int>(arg(1)),
+                                 &fd, &events, &data);
+            if (arg(2)) emu_.write_u32(arg(2), static_cast<uint32_t>(fd));
+            if (arg(3)) emu_.write_u32(arg(3), static_cast<uint32_t>(events));
+            if (arg(4)) emu_.write_u32(arg(4), to_guest_ref(data));
+            return static_cast<uint32_t>(ident);
+        };
+        import_handlers_["ALooper_pollAll"] = [this] {
+            auto fn = platform_proc<int (*)(int, int*, int*, void**)>
+                    ("ALooper_pollAll");
+            if (!fn) return static_cast<uint32_t>(-1);
+            int fd = -1, events = 0;
+            void* data = nullptr;
+            const int ident = fn(static_cast<int>(arg(0)), &fd, &events, &data);
+            if (arg(1)) emu_.write_u32(arg(1), static_cast<uint32_t>(fd));
+            if (arg(2)) emu_.write_u32(arg(2), static_cast<uint32_t>(events));
+            if (arg(3)) emu_.write_u32(arg(3), to_guest_ref(data));
+            return static_cast<uint32_t>(ident);
+        };
+        // The callback is a guest function pointer; the host looper cannot call
+        // into the emulator, so the fd is registered without one and the guest
+        // observes readiness through pollOnce's outEvents instead.
+        import_handlers_["ALooper_addFd"] = [this] {
+            auto fn = platform_proc<int (*)(void*, int, int, int, void*, void*)>(
+                    "ALooper_addFd");
+            if (!fn) return static_cast<uint32_t>(-1);
+            if (arg(4)) {
+                LOGW("ALooper_addFd: guest callback %08x cannot be invoked from the "
+                     "host looper; polling only", arg(4));
+            }
+            return static_cast<uint32_t>(fn(from_guest_ref(arg(0)),
+                                           static_cast<int>(arg(1)),
+                                           static_cast<int>(arg(2)),
+                                           static_cast<int>(arg(3)), nullptr, nullptr));
+        };
+        import_handlers_["ALooper_removeFd"] = [this] {
+            auto fn = platform_proc<int (*)(void*, int)>("ALooper_removeFd");
+            return fn ? static_cast<uint32_t>(fn(from_guest_ref(arg(0)),
+                                                 static_cast<int>(arg(1))))
+                      : static_cast<uint32_t>(-1);
+        };
+    }
+
+    void install_asset_handlers() {
+        import_handlers_["AAssetManager_fromJava"] = [this] {
+            auto fn = platform_proc<void* (*)(JNIEnv*, jobject)>("AAssetManager_fromJava");
+            if (!fn) return 0u;
+            jobject jmgr = static_cast<jobject>(from_guest_ref(arg(1)));
+            if (!jmgr) jmgr = assets_object_;
+            void* mgr = fn(env_, jmgr);
+            if (!mgr) {
+                LOGW("AAssetManager_fromJava: no AssetManager on the guest context");
+                return 0u;
+            }
+            return to_guest_ref(mgr);
+        };
+        import_handlers_["AAssetManager_open"] = [this] {
+            auto fn = platform_proc<void* (*)(void*, const char*, int)>( "AAssetManager_open");
+            if (!fn) return 0u;
+            const std::string name = guest_string(arg(1));
+            void* asset = fn(from_guest_ref(arg(0)), name.c_str(), static_cast<int>(arg(2)));
+            if (!asset) LOGW("AAssetManager_open(%s) -> null", name.c_str());
+            return asset ? to_guest_ref(asset) : 0u;
+        };
+        import_handlers_["AAssetManager_openDir"] = [this] {
+            auto fn = platform_proc<void* (*)(void*, const char*)>("AAssetManager_openDir");
+            return fn ? to_guest_ref(fn(from_guest_ref(arg(0)), guest_string(arg(1)).c_str()))
+                      : 0u;
+        };
+        import_handlers_["AAssetDir_getNextFileName"] = [this] {
+            auto fn = platform_proc<const char* (*)(void*)>("AAssetDir_getNextFileName");
+            if (!fn) return 0u;
+            const char* name = fn(from_guest_ref(arg(0)));
+            return name ? guest_str(name) : 0u;
+        };
+        import_handlers_["AAssetDir_close"] = [this] {
+            auto fn = platform_proc<void (*)(void*)>("AAssetDir_close");
+            if (fn) fn(from_guest_ref(arg(0)));
+            return 0u;
+        };
+        import_handlers_["AAsset_read"] = [this] {
+            auto fn = platform_proc<int (*)(void*, void*, size_t)>("AAsset_read");
+            if (!fn) return 0u;
+            const uint32_t dst = arg(1);
+            const size_t len = static_cast<size_t>(arg(2));
+            if (!dst || len == 0) return 0u;
+            std::vector<uint8_t> buf(len);
+            const int got = fn(from_guest_ref(arg(0)), buf.data(), len);
+            if (got > 0) emu_.write(dst, buf.data(), static_cast<size_t>(got));
+            return static_cast<uint32_t>(got);
+        };
+        import_handlers_["AAsset_seek"] = [this] {
+            auto fn = platform_proc<int (*)(void*, int, int)>("AAsset_seek");
+            return fn ? static_cast<uint32_t>(fn(from_guest_ref(arg(0)),
+                                                 static_cast<int>(arg(1)),
+                                                 static_cast<int>(arg(2))))
+                      : 0u;
+        };
+        import_handlers_["AAsset_getLength"] = [this] {
+            auto fn = platform_proc<int (*)(void*)>("AAsset_getLength");
+            return fn ? static_cast<uint32_t>(fn(from_guest_ref(arg(0)))) : 0u;
+        };
+        import_handlers_["AAsset_getRemainingLength"] = [this] {
+            auto fn = platform_proc<int (*)(void*)>("AAsset_getRemainingLength");
+            return fn ? static_cast<uint32_t>(fn(from_guest_ref(arg(0)))) : 0u;
+        };
+        import_handlers_["AAsset_close"] = [this] {
+            auto fn = platform_proc<void (*)(void*)>("AAsset_close");
+            if (fn) fn(from_guest_ref(arg(0)));
+            return 0u;
+        };
+        import_handlers_["AAsset_isAllocated"] = [this] {
+            auto fn = platform_proc<int (*)(void*)>("AAsset_isAllocated");
+            return fn ? static_cast<uint32_t>(fn(from_guest_ref(arg(0)))) : 0u;
+        };
+        // getBuffer hands out a host address; the guest gets a copy in its own
+        // address space instead, owned by the asset handle.
+        import_handlers_["AAsset_getBuffer"] = [this] {
+            auto fn = platform_proc<const void* (*)(void*)>("AAsset_getBuffer");
+            auto len = platform_proc<int (*)(void*)>("AAsset_getLength");
+            if (!fn || !len) return 0u;
+            const uint32_t handle = arg(0);
+            auto cached = asset_buffers_.find(handle);
+            if (cached != asset_buffers_.end()) return cached->second;
+            const void* host = fn(from_guest_ref(handle));
+            const int bytes = len(from_guest_ref(handle));
+            if (!host || bytes <= 0) return 0u;
+            const uint32_t copy = emu_.alloc(static_cast<size_t>(bytes), 64);
+            if (!copy) return 0u;
+            emu_.write(copy, host, static_cast<size_t>(bytes));
+            asset_buffers_[handle] = copy;
+            return copy;
+        };
+    }
+
+    void install_config_handlers() {
+        auto ref_new = [this](const char* name) {
+            import_handlers_[name] = [this, name] {
+                auto fn = platform_proc<void* (*)()>(name);
+                return fn ? to_guest_ref(fn()) : 0u;
+            };
+        };
+        ref_new("AConfiguration_new");
+
+        import_handlers_["AConfiguration_delete"] = [this] {
+            auto fn = platform_proc<void (*)(void*)>("AConfiguration_delete");
+            if (fn) fn(from_guest_ref(arg(0)));
+            return 0u;
+        };
+        import_handlers_["AConfiguration_fromAssetManager"] = [this] {
+            auto fn = platform_proc<void (*)(void*, void*)>(
+                    "AConfiguration_fromAssetManager");
+            if (fn) fn(from_guest_ref(arg(0)), from_guest_ref(arg(1)));
+            return 0u;
+        };
+        import_handlers_["AConfiguration_getAssetManager"] = [this] {
+            auto fn = platform_proc<void (*)(void*, void**)>(
+                    "AConfiguration_getAssetManager");
+            if (!fn) return 0u;
+            void* mgr = nullptr;
+            fn(from_guest_ref(arg(0)), &mgr);
+            return to_guest_ref(mgr);
+        };
+        import_handlers_["AConfiguration_copy"] = [this] {
+            auto fn = platform_proc<void (*)(void*, void*)>("AConfiguration_copy");
+            if (fn) fn(from_guest_ref(arg(0)), from_guest_ref(arg(1)));
+            return 0u;
+        };
+        // The remaining accessors all share (config, args..., out) shapes, so
+        // they are forwarded one by one with explicit widths.
+        auto get_int = [this](const char* name) {
+            import_handlers_[name] = [this, name] {
+                auto fn = platform_proc<int32_t (*)(void*)>(name);
+                return fn ? static_cast<uint32_t>(fn(from_guest_ref(arg(0)))) : 0u;
+            };
+        };
+        get_int("AConfiguration_getDensity");
+        get_int("AConfiguration_getKeyboard");
+        get_int("AConfiguration_getNavigation");
+        get_int("AConfiguration_getOrientation");
+        get_int("AConfiguration_getScreenSize");
+        get_int("AConfiguration_getScreenLong");
+        get_int("AConfiguration_getSdkVersion");
+        get_int("AConfiguration_getUiModeType");
+        get_int("AConfiguration_getUiModeNight");
+        get_int("AConfiguration_getTouchscreen");
+
+        auto set_int = [this](const char* name) {
+            import_handlers_[name] = [this, name] {
+                auto fn = platform_proc<int32_t (*)(void*, int32_t)>(name);
+                return fn ? static_cast<uint32_t>(fn(from_guest_ref(arg(0)),
+                                                    static_cast<int32_t>(arg(1))))
+                          : 0u;
+            };
+        };
+        set_int("AConfiguration_setDensity");
+        set_int("AConfiguration_setKeyboard");
+        set_int("AConfiguration_setNavigation");
+        set_int("AConfiguration_setOrientation");
+        set_int("AConfiguration_setScreenSize");
+        set_int("AConfiguration_setScreenLong");
+        set_int("AConfiguration_setSdkVersion");
+        set_int("AConfiguration_setUiModeType");
+        set_int("AConfiguration_setUiModeNight");
+        set_int("AConfiguration_setTouchscreen");
+
+        auto get_locale = [this](const char* name) {
+            import_handlers_[name] = [this, name] {
+                auto fn = platform_proc<void (*)(void*, char*)>(name);
+                if (!fn || !arg(1)) return 0u;
+                char buf[16] = {0};
+                fn(from_guest_ref(arg(0)), buf);
+                emu_.write(arg(1), buf, 2);
+                return 0u;
+            };
+        };
+        get_locale("AConfiguration_getLanguage");
+        get_locale("AConfiguration_getCountry");
+
+        import_handlers_["AConfiguration_diff"] = [this] {
+            auto fn = platform_proc<int32_t (*)(void*, void*)>("AConfiguration_diff");
+            return fn ? static_cast<uint32_t>(fn(from_guest_ref(arg(0)),
+                                                 from_guest_ref(arg(1))))
+                      : 0u;
+        };
+        import_handlers_["AConfiguration_equal"] = [this] {
+            auto fn = platform_proc<int (*)(void*, void*)>("AConfiguration_equal");
+            return fn ? static_cast<uint32_t>(fn(from_guest_ref(arg(0)),
+                                                 from_guest_ref(arg(1))))
+                      : 0u;
+        };
+        import_handlers_["AConfiguration_isBetterThan"] = [this] {
+            auto fn = platform_proc<int32_t (*)(void*, void*, void*)>(
+                    "AConfiguration_isBetterThan");
+            return fn ? static_cast<uint32_t>(fn(from_guest_ref(arg(0)),
+                                                 from_guest_ref(arg(1)),
+                                                 from_guest_ref(arg(2))))
+                      : 0u;
+        };
+    }
+
+    void install_input_handlers() {
+        import_handlers_["AInputQueue_attachLooper"] = [this] {
+            auto fn = platform_proc<void (*)(void*, void*, int, void*, void*)>(
+                    "AInputQueue_attachLooper");
+            if (fn) {
+                fn(from_guest_ref(arg(0)), from_guest_ref(arg(1)),
+                   static_cast<int>(arg(2)), nullptr, nullptr);
+            }
+            return 0u;
+        };
+        import_handlers_["AInputQueue_detachLooper"] = [this] {
+            auto fn = platform_proc<void (*)(void*)>("AInputQueue_detachLooper");
+            if (fn) fn(from_guest_ref(arg(0)));
+            return 0u;
+        };
+        import_handlers_["AInputQueue_hasEvents"] = [this] {
+            auto fn = platform_proc<int32_t (*)(void*)>("AInputQueue_hasEvents");
+            return fn ? static_cast<uint32_t>(fn(from_guest_ref(arg(0)))) : 0u;
+        };
+        import_handlers_["AInputQueue_getEvent"] = [this] {
+            auto fn = platform_proc<int32_t (*)(void*, void**)>("AInputQueue_getEvent");
+            if (!fn) return static_cast<uint32_t>(-1);
+            void* event = nullptr;
+            const int32_t r = fn(from_guest_ref(arg(0)), &event);
+            if (r >= 0 && arg(1)) emu_.write_u32(arg(1), to_guest_ref(event));
+            return static_cast<uint32_t>(r);
+        };
+        import_handlers_["AInputQueue_preDispatchEvent"] = [this] {
+            auto fn = platform_proc<int32_t (*)(void*, void*)>(
+                    "AInputQueue_preDispatchEvent");
+            return fn ? static_cast<uint32_t>(fn(from_guest_ref(arg(0)),
+                                                 from_guest_ref(arg(1))))
+                      : 0u;
+        };
+        import_handlers_["AInputQueue_finishEvent"] = [this] {
+            auto fn = platform_proc<void (*)(void*, void*, int) >("AInputQueue_finishEvent");
+            if (fn) fn(from_guest_ref(arg(0)), from_guest_ref(arg(1)),
+                       static_cast<int>(arg(2)));
+            return 0u;
+        };
+
+        auto event_int = [this](const char* name) {
+            import_handlers_[name] = [this, name] {
+                auto fn = platform_proc<int32_t (*)(void*)>(name);
+                return fn ? static_cast<uint32_t>(fn(from_guest_ref(arg(0)))) : 0u;
+            };
+        };
+        event_int("AInputEvent_getType");
+        event_int("AInputEvent_getDeviceId");
+        event_int("AInputEvent_getSource");
+        event_int("AKeyEvent_getAction");
+        event_int("AKeyEvent_getKeyCode");
+        event_int("AKeyEvent_getMetaState");
+        event_int("AKeyEvent_getRepeatCount");
+        event_int("AKeyEvent_getScanCode");
+        event_int("AKeyEvent_getFlags");
+        event_int("AMotionEvent_getPointerCount");
+        event_int("AMotionEvent_getMetaState");
+
+        auto event_long = [this](const char* name) {
+            import_handlers_[name] = [this, name] {
+                auto fn = platform_proc<int64_t (*)(void*)>(name);
+                if (!fn) return 0u;
+                const int64_t v = fn(from_guest_ref(arg(0)));
+                return static_cast<uint32_t>(static_cast<uint64_t>(v));
+            };
+        };
+        event_long("AKeyEvent_getEventTime");
+        event_long("AMotionEvent_getEventTime");
+        event_long("AMotionEvent_getDownTime");
+
+        import_handlers_["AMotionEvent_getAction"] = [this] {
+            auto fn = platform_proc<int32_t (*)(void*)>("AMotionEvent_getAction");
+            return fn ? static_cast<uint32_t>(fn(from_guest_ref(arg(0)))) : 0u;
+        };
+        import_handlers_["AMotionEvent_getX"] = [this] {
+            auto fn = platform_proc<float (*)(void*, size_t)>("AMotionEvent_getX");
+            if (!fn) return 0u;
+            const float v = fn(from_guest_ref(arg(0)), static_cast<size_t>(arg(1)));
+            uint32_t bits = 0;
+            std::memcpy(&bits, &v, sizeof bits);
+            return bits;
+        };
+        import_handlers_["AMotionEvent_getY"] = [this] {
+            auto fn = platform_proc<float (*)(void*, size_t)>("AMotionEvent_getY");
+            if (!fn) return 0u;
+            const float v = fn(from_guest_ref(arg(0)), static_cast<size_t>(arg(1)));
+            uint32_t bits = 0;
+            std::memcpy(&bits, &v, sizeof bits);
+            return bits;
+        };
+        import_handlers_["AMotionEvent_getPointerId"] = [this] {
+            auto fn = platform_proc<int32_t (*)(void*, size_t)>("AMotionEvent_getPointerId");
+            return fn ? static_cast<uint32_t>(fn(from_guest_ref(arg(0)),
+                                                 static_cast<size_t>(arg(1))))
+                      : 0u;
+        };
+    }
+
+    // ---- OpenSL ES ------------------------------------------------------
+    //
+    // A guest object is a two-word guest struct: { vtable, token }. The vtable
+    // is an array of trap-page stubs, so guest code can call it with the normal
+    // ARM32 interface convention while the implementation lives here. The host
+    // objects behind each token are the real ones from libOpenSLES.so, which is
+    // what makes audio actually audible.
+    struct SlHostObject {
+        SLObjectItf obj = nullptr;
+        SLEngineItf engine = nullptr;
+        SLPlayItf play = nullptr;
+        SLAndroidSimpleBufferQueueItf queue = nullptr;
+        uint32_t guest = 0;        // guest address of the two-word struct
+        uint32_t engine_iface = 0;
+        uint32_t play_iface = 0;
+        uint32_t queue_iface = 0;
+    };
+
+    uint32_t sl_new_object(std::vector<std::function<uint32_t()>>& cbs) {
+        std::vector<uint32_t> table;
+        table.reserve(cbs.size());
+        for (auto& cb : cbs) table.push_back(make_callback_stub(std::move(cb), "sl_itf"));
+        const uint32_t vt = emu_.alloc(table.size() * 4, 4);
+        if (!vt) return 0;
+        emu_.write(vt, table.data(), table.size() * 4);
+        const uint32_t obj = emu_.alloc(8, 4);
+        if (!obj) return 0;
+        emu_.write_u32(obj, vt);
+        emu_.write_u32(obj + 4, 0xFFFFFFFFu);
+        return obj;
+    }
+
+    void install_opensles_handlers() {
+        if (!opensles_lib_) {
+            LOGW("OpenSL ES: host libOpenSLES.so unavailable; slCreateEngine stubbed");
+            import_handlers_["slCreateEngine"] = [] { return static_cast<uint32_t>(0x0C); };
+            return;
+        }
+
+        // Interface identifiers are data imports: a guest word whose value is
+        // the address of a guest-side SLInterfaceID_ struct (id in word 0).
+        auto publish_id = [this](const char* symbol, uint32_t id) {
+            const uint32_t sid = emu_.alloc(16, 4);
+            const uint32_t slot = emu_.alloc(4, 4);
+            if (!sid || !slot) return;
+            emu_.write_u32(sid, id);
+            emu_.write_u32(slot, sid);
+            data_slots_[symbol] = slot;
+        };
+        publish_id("SL_IID_ENGINE", 1);
+        publish_id("SL_IID_PLAY", 2);
+        publish_id("SL_IID_ANDROIDSIMPLEBUFFERQUEUE", 3);
+        publish_id("SL_IID_OUTPUTMIX", 4);
+        publish_id("SL_IID_VOLUME", 5);
+        publish_id("SL_IID_BUFFERQUEUE", 6);
+        publish_id("SL_IID_ANDROIDCONFIGURATION", 7);
+
+        using CreateEngineFn = SLresult (*)(SLObjectItf*, SLuint32, const SLEngineOption*,
+                                            SLuint32, const SLInterfaceID*,
+                                            const SLboolean*);
+
+        import_handlers_["slCreateEngine"] = [this] {
+            auto fn = platform_proc<CreateEngineFn>("slCreateEngine");
+            if (!fn) return static_cast<uint32_t>(SL_RESULT_FEATURE_UNSUPPORTED);
+            SLObjectItf host = nullptr;
+            const SLresult r = fn(&host, 0, nullptr, 0, nullptr, nullptr);
+            if (r != SL_RESULT_SUCCESS || !host) {
+                LOGW("slCreateEngine -> %u", static_cast<unsigned>(r));
+                return static_cast<uint32_t>(r);
+            }
+            const size_t token = sl_objects_.size();
+            sl_objects_.emplace_back();
+            sl_objects_[token].obj = host;
+
+            std::vector<std::function<uint32_t()>> vt;
+            // Realize
+            vt.push_back([this, token] {
+                SlHostObject& o = sl_objects_[token];
+                const SLresult rr = (*o.obj)->Realize(o.obj, SL_BOOLEAN_FALSE);
+                if (rr == SL_RESULT_SUCCESS) {
+                    (*o.obj)->GetInterface(o.obj, SL_IID_ENGINE, &o.engine);
+                    o.guest = arg(0);
+                    LOGI("slCreateEngine: engine realized (host %p)", o.engine);
+                }
+                return static_cast<uint32_t>(rr);
+            });
+            // Resume
+            vt.push_back([this, token] {
+                SlHostObject& o = sl_objects_[token];
+                return static_cast<uint32_t>((*o.obj)->Resume(o.obj, SL_BOOLEAN_FALSE));
+            });
+            // GetState
+            vt.push_back([this, token] {
+                SlHostObject& o = sl_objects_[token];
+                SLuint32 state = SL_OBJECT_STATE_UNREALIZED;
+                const SLresult rr = (*o.obj)->GetState(o.obj, &state);
+                if (arg(1)) emu_.write_u32(arg(1), state);
+                return static_cast<uint32_t>(rr);
+            });
+            // GetInterface(SLObjectItf self, SLInterfaceID iid, SLboolean required,
+            //              void* out)
+            vt.push_back([this, token] {
+                SlHostObject& o = sl_objects_[token];
+                const uint32_t id = sl_id(arg(1));
+                uint32_t guest = 0;
+                if (id == 1) guest = engine_interface(token);
+                else if (id == 2) guest = play_interface(token);
+                else if (id == 3 || id == 6) guest = queue_interface(token);
+                if (guest && arg(3)) emu_.write_u32(arg(3), guest);
+                if (!guest) {
+                    LOGW("SL GetInterface(id=%u) unsupported", id);
+                    return static_cast<uint32_t>(SL_RESULT_FEATURE_UNSUPPORTED);
+                }
+                return static_cast<uint32_t>(SL_RESULT_SUCCESS);
+            });
+            // Destroy
+            vt.push_back([this, token] {
+                SlHostObject& o = sl_objects_[token];
+                if (o.obj) (*o.obj)->Destroy(o.obj);
+                o.obj = nullptr;
+                return static_cast<uint32_t>(SL_RESULT_SUCCESS);
+            });
+
+            const uint32_t obj = sl_new_object(vt);
+            if (arg(0)) emu_.write_u32(arg(0), obj);
+            LOGI("slCreateEngine -> guest object %08x", obj);
+            return static_cast<uint32_t>(SL_RESULT_SUCCESS);
+        };
+    }
+
+    uint32_t sl_id(uint32_t iid) { return iid ? read_guest_u32(iid) : 0u; }
+
+    uint32_t engine_interface(size_t token) {
+        SlHostObject& o = sl_objects_[token];
+        if (o.engine_iface) return o.engine_iface;
+        std::vector<std::function<uint32_t()>> vt;
+        // Slot order matches SLEngineItf_: 0 CreateLEDDevice, 1 CreateVibraDevice,
+        // 2 CreateAudioPlayer, 3 CreateAudioRecorder, 4 CreateMidiPlayer,
+        // 5 CreateListener, 6 Create3DGroup, 7 CreateOutputMix, ...
+        for (int i = 0; i < 12; ++i) {
+            vt.push_back([this, token, i] {
+                if (i == 7) return create_output_mix(token);
+                if (i == 2) return create_audio_player(token);
+                return static_cast<uint32_t>(SL_RESULT_FEATURE_UNSUPPORTED);
+            });
+        }
+        o.engine_iface = sl_new_object(vt);
+        return o.engine_iface;
+    }
+
+    uint32_t create_output_mix(size_t token) {
+        SlHostObject& o = sl_objects_[token];
+        if (!o.engine) return static_cast<uint32_t>(SL_RESULT_PRECONDITIONS_VIOLATED);
+        const size_t mixToken = sl_objects_.size();
+        sl_objects_.emplace_back();
+        SLObjectItf mix = nullptr;
+        const SLresult r = (*o.engine)->CreateOutputMix(o.engine, &mix, 0, nullptr, nullptr);
+        if (r != SL_RESULT_SUCCESS || !mix) {
+            LOGW("CreateOutputMix -> %u", static_cast<unsigned>(r));
+            return static_cast<uint32_t>(r);
+        }
+        sl_objects_[mixToken].obj = mix;
+        (*mix)->Realize(mix, SL_BOOLEAN_FALSE);
+        // The guest gets an object-like handle whose only supported interface is
+        // OUTPUTMIX (no methods are ever called on it in practice).
+        std::vector<std::function<uint32_t()>> vt;
+        vl_fill_noop(vt);
+        const uint32_t guest = sl_new_object(vt);
+        if (arg(1)) emu_.write_u32(arg(1), guest);
+        LOGI("CreateOutputMix -> guest %08x", guest);
+        return static_cast<uint32_t>(SL_RESULT_SUCCESS);
+    }
+
+    void vl_fill_noop(std::vector<std::function<uint32_t()>>& vt) {
+        for (int i = 0; i < 5; ++i) {
+            vt.push_back([] { return static_cast<uint32_t>(SL_RESULT_SUCCESS); });
+        }
+    }
+
+    uint32_t create_audio_player(size_t token) {
+        SlHostObject& o = sl_objects_[token];
+        if (!o.engine) return static_cast<uint32_t>(SL_RESULT_PRECONDITIONS_VIOLATED);
+
+        // 32-bit guest layouts of the source/sink descriptors.
+        const uint32_t src = arg(2), sink = arg(3);
+        const uint32_t locator = src ? read_guest_u32(src) : 0u;
+        const uint32_t format = src ? read_guest_u32(src + 4) : 0u;
+        const uint32_t sinkLocator = sink ? read_guest_u32(sink) : 0u;
+        if (!locator || !format || !sinkLocator) {
+            LOGW("CreateAudioPlayer: guest source/sink descriptors unreadable");
+            return static_cast<uint32_t>(SL_RESULT_PARAMETER_INVALID);
+        }
+
+        SLDataLocator_AndroidSimpleBufferQueue hostLoc = {};
+        hostLoc.locatorType = read_guest_u32(locator);
+        hostLoc.numBuffers = read_guest_u32(locator + 4);
+
+        SLDataFormat_PCM hostFmt = {};
+        hostFmt.formatType = read_guest_u32(format);
+        hostFmt.numChannels = read_guest_u32(format + 4);
+        hostFmt.samplesPerSec = read_guest_u32(format + 8);
+        hostFmt.bitsPerSample = read_guest_u32(format + 12);
+        hostFmt.containerSize = read_guest_u32(format + 16);
+        hostFmt.channelMask = read_guest_u32(format + 20);
+        hostFmt.endianness = read_guest_u32(format + 24);
+
+        SLDataLocator_OutputMix hostSinkLoc = {};
+        hostSinkLoc.locatorType = read_guest_u32(sinkLocator);
+        hostSinkLoc.outputMix = static_cast<SLObjectItf>(
+                from_guest_ref(read_guest_u32(sinkLocator + 4)));
+
+        SLDataSource hostSrc = {};
+        hostSrc.pLocator = &hostLoc;
+        hostSrc.pFormat = &hostFmt;
+        SLDataSink hostSink = {};
+        hostSink.pLocator = &hostSinkLoc;
+        hostSink.pFormat = nullptr;
+
+        const SLInterfaceID ids[2] = {SL_IID_PLAY, SL_IID_ANDROIDSIMPLEBUFFERQUEUE};
+        const SLboolean req[2] = {SL_BOOLEAN_TRUE, SL_BOOLEAN_TRUE};
+        SLObjectItf player = nullptr;
+        const SLresult r = (*o.engine)->CreateAudioPlayer(o.engine, &player, &hostSrc,
+                                                          &hostSink, 2, ids, req);
+        if (r != SL_RESULT_SUCCESS || !player) {
+            LOGW("CreateAudioPlayer -> %u", static_cast<unsigned>(r));
+            return static_cast<uint32_t>(r);
+        }
+
+        const size_t playerToken = sl_objects_.size();
+        sl_objects_.emplace_back();
+        SlHostObject& p = sl_objects_[playerToken];
+        p.obj = player;
+        (*player)->Realize(player, SL_BOOLEAN_FALSE);
+        (*player)->GetInterface(player, SL_IID_PLAY, &p.play);
+        (*player)->GetInterface(player, SL_IID_ANDROIDSIMPLEBUFFERQUEUE, &p.queue);
+
+        std::vector<std::function<uint32_t()>> vt;
+        // SLObjectItf subset: Realize, Resume, GetState, GetInterface, Destroy.
+        vt.push_back([this, playerToken] {
+            SlHostObject& po = sl_objects_[playerToken];
+            return static_cast<uint32_t>((*po.obj)->Realize(po.obj, SL_BOOLEAN_FALSE));
+        });
+        vt.push_back([this, playerToken] {
+            SlHostObject& po = sl_objects_[playerToken];
+            return static_cast<uint32_t>((*po.obj)->Resume(po.obj, SL_BOOLEAN_FALSE));
+        });
+        vt.push_back([this, playerToken] {
+            SlHostObject& po = sl_objects_[playerToken];
+            SLuint32 state = 0;
+            const SLresult rr = (*po.obj)->GetState(po.obj, &state);
+            if (arg(1)) emu_.write_u32(arg(1), state);
+            return static_cast<uint32_t>(rr);
+        });
+        vt.push_back([this, playerToken] {
+            const uint32_t id = sl_id(arg(1));
+            uint32_t guest = 0;
+            if (id == 2) guest = play_interface(playerToken);
+            else if (id == 3 || id == 6) guest = queue_interface(playerToken);
+            if (guest && arg(3)) emu_.write_u32(arg(3), guest);
+            return static_cast<uint32_t>(guest ? SL_RESULT_SUCCESS
+                                               : SL_RESULT_FEATURE_UNSUPPORTED);
+        });
+        vt.push_back([this, playerToken] {
+            SlHostObject& po = sl_objects_[playerToken];
+            if (po.obj) (*po.obj)->Destroy(po.obj);
+            po.obj = nullptr;
+            return static_cast<uint32_t>(SL_RESULT_SUCCESS);
+        });
+
+        p.guest = sl_new_object(vt);
+        LOGI("CreateAudioPlayer -> guest %08x play=%p queue=%p", p.guest, p.play, p.queue);
+        if (arg(1)) emu_.write_u32(arg(1), p.guest);
+        return static_cast<uint32_t>(SL_RESULT_SUCCESS);
+    }
+
+    uint32_t play_interface(size_t token) {
+        SlHostObject& o = sl_objects_[token];
+        if (o.play_iface) return o.play_iface;
+        std::vector<std::function<uint32_t()>> vt;
+        // 0 SetPlayState, 1 GetPlayState, 2 GetDuration, 3 GetPosition,
+        // 4 RegisterCallback, 5 SetCallbackEventsMask, 6 GetCallbackEventsMask
+        vt.push_back([this, token] {
+            SlHostObject& po = sl_objects_[token];
+            if (!po.play) return static_cast<uint32_t>(SL_RESULT_PRECONDITIONS_VIOLATED);
+            const SLresult r = (*po.play)->SetPlayState(po.play,
+                                                        static_cast<SLuint32>(arg(1)));
+            LOGI("SLPlay SetPlayState(%u) -> %u", arg(1), static_cast<unsigned>(r));
+            return static_cast<uint32_t>(r);
+        });
+        vt.push_back([this, token] {
+            SlHostObject& po = sl_objects_[token];
+            if (!po.play) return static_cast<uint32_t>(SL_RESULT_PRECONDITIONS_VIOLATED);
+            SLuint32 state = 0;
+            const SLresult r = (*po.play)->GetPlayState(po.play, &state);
+            if (arg(1)) emu_.write_u32(arg(1), state);
+            return static_cast<uint32_t>(r);
+        });
+        vt.push_back([this, token] {
+            SlHostObject& po = sl_objects_[token];
+            if (!po.play) return static_cast<uint32_t>(SL_RESULT_PRECONDITIONS_VIOLATED);
+            SLuint32 ms = 0;
+            const SLresult r = (*po.play)->GetDuration(po.play, &ms);
+            if (arg(1)) emu_.write_u32(arg(1), ms);
+            return static_cast<uint32_t>(r);
+        });
+        vt.push_back([this, token] {
+            SlHostObject& po = sl_objects_[token];
+            if (!po.play) return static_cast<uint32_t>(SL_RESULT_PRECONDITIONS_VIOLATED);
+            SLuint32 ms = 0;
+            const SLresult r = (*po.play)->GetPosition(po.play, &ms);
+            if (arg(1)) emu_.write_u32(arg(1), ms);
+            return static_cast<uint32_t>(r);
+        });
+        // RegisterCallback: the host would call a guest function pointer from an
+        // OpenSL thread, which the emulator cannot re-enter. Accepted and
+        // ignored; the guest learns of consumption via GetState.
+        vt.push_back([] { return static_cast<uint32_t>(SL_RESULT_SUCCESS); });
+        vt.push_back([] { return static_cast<uint32_t>(SL_RESULT_SUCCESS); });
+        vt.push_back([] { return static_cast<uint32_t>(SL_RESULT_SUCCESS); });
+        o.play_iface = sl_new_object(vt);
+        return o.play_iface;
+    }
+
+    uint32_t queue_interface(size_t token) {
+        SlHostObject& o = sl_objects_[token];
+        if (o.queue_iface) return o.queue_iface;
+        std::vector<std::function<uint32_t()>> vt;
+        // 0 Enqueue, 1 Clear, 2 GetState, 3 RegisterCallback
+        vt.push_back([this, token] {
+            SlHostObject& po = sl_objects_[token];
+            if (!po.queue) return static_cast<uint32_t>(SL_RESULT_PRECONDITIONS_VIOLATED);
+            const uint32_t at = arg(1);
+            const size_t bytes = static_cast<size_t>(arg(2));
+            if (!at || bytes == 0 || bytes > (8u * 1024u * 1024u)) {
+                return static_cast<uint32_t>(SL_RESULT_PARAMETER_INVALID);
+            }
+            // The host queue reads the buffer asynchronously, so it must stay
+            // alive after this call returns.
+            sl_pcm_.emplace_back(bytes);
+            if (!emu_.read(at, sl_pcm_.back().data(), bytes)) {
+                sl_pcm_.pop_back();
+                return static_cast<uint32_t>(SL_RESULT_PARAMETER_INVALID);
+            }
+            const SLresult r = (*po.queue)->Enqueue(po.queue, sl_pcm_.back().data(),
+                                                    static_cast<SLuint32>(bytes));
+            if (sl_pcm_.size() > 64) sl_pcm_.erase(sl_pcm_.begin(), sl_pcm_.begin() + 32);
+            return static_cast<uint32_t>(r);
+        });
+        vt.push_back([this, token] {
+            SlHostObject& po = sl_objects_[token];
+            if (!po.queue) return static_cast<uint32_t>(SL_RESULT_PRECONDITIONS_VIOLATED);
+            return static_cast<uint32_t>((*po.queue)->Clear(po.queue));
+        });
+        vt.push_back([this, token] {
+            SlHostObject& po = sl_objects_[token];
+            if (!po.queue) return static_cast<uint32_t>(SL_RESULT_PRECONDITIONS_VIOLATED);
+            SLAndroidSimpleBufferQueueState state = {};
+            const SLresult r = (*po.queue)->GetState(po.queue, &state);
+            if (arg(1)) {
+                emu_.write_u32(arg(1), state.count);
+                emu_.write_u32(arg(1) + 4, state.index);
+            }
+            return static_cast<uint32_t>(r);
+        });
+        vt.push_back([] { return static_cast<uint32_t>(SL_RESULT_SUCCESS); });
+        o.queue_iface = sl_new_object(vt);
+        return o.queue_iface;
+    }
+
+    template <typename T>
+    T platform_proc(const char* symbol) {
+        const std::string key(symbol);
+        auto it = platform_syms_.find(key);
+        if (it != platform_syms_.end()) return reinterpret_cast<T>(it->second);
+        void* p = android_lib_ ? ::dlsym(android_lib_, symbol) : nullptr;
+        if (!p && opensles_lib_) p = ::dlsym(opensles_lib_, symbol);
+        platform_syms_[key] = p;
+        if (!p) LOGW("platform symbol unavailable: %s", symbol);
+        return reinterpret_cast<T>(p);
+    }
+
+    uint32_t read_guest_u32(uint32_t at) {
+        uint32_t v = 0;
+        if (!emu_.read(at, &v, sizeof v)) return 0;
+        return v;
+    }
+
+    // The process AssetManager, used when guest code calls
+    // AAssetManager_fromJava with a null/torn-down manager. Guest APK assets are
+    // already merged into it by GuestContext, so a native open() finds them.
+    jobject current_assets() {
+        if (assets_object_ || !env_) return assets_object_;
+        jclass thread = env_->FindClass("android/app/ActivityThread");
+        if (!thread) return nullptr;
+        jmethodID current = env_->GetStaticMethodID(
+                thread, "currentApplication", "()Landroid/app/Application;");
+        jobject app = current ? env_->CallStaticObjectMethod(thread, current) : nullptr;
+        env_->DeleteLocalRef(thread);
+        if (!app) return nullptr;
+        jclass appCls = env_->GetObjectClass(app);
+        jmethodID getAssets = env_->GetMethodID(appCls, "getAssets",
+                                               "()Landroid/content/res/AssetManager;");
+        jobject assets = getAssets ? env_->CallObjectMethod(app, getAssets) : nullptr;
+        env_->DeleteLocalRef(appCls);
+        if (env_->ExceptionCheck()) env_->ExceptionClear();
+        if (assets) assets_object_ = env_->NewGlobalRef(assets);
+        if (assets_object_) LOGI("asset bridge: process AssetManager %p", assets_object_);
+        return assets_object_;
     }
 
     void install_import_handlers() {
@@ -3582,6 +4556,8 @@ private:
             brk_used_ = static_cast<uint32_t>(next);
             return previous;
         };
+        import_handlers_["__errno"] = [this] { return errno_cell_; };
+        import_handlers_["__errno_location"] = [this] { return errno_cell_; };
         import_handlers_["calloc"]  = [this] { return imp_calloc(); };
         import_handlers_["realloc"] = [this] { return imp_realloc(); };
         import_handlers_["free"]    = [this] { return imp_free(); };
@@ -3941,6 +4917,109 @@ private:
         import_handlers_["write"]   = [this] { return imp_write(); };
         import_handlers_["lseek"]   = [this] { return imp_lseek(); };
         import_handlers_["lseek64"] = [this] { return imp_lseek(); };
+
+        // C++ runtime allocation. An unresolved operator new returns 0 and the
+        // first virtual call through the resulting object jumps to PC=0, which
+        // is exactly what a legacy engine does on its very first frame.
+        import_handlers_["_Znwj"]  = [this] { return imp_malloc(); };
+        import_handlers_["_Znaj"]  = [this] { return imp_malloc(); };
+        import_handlers_["_ZnwjRKSt9nothrow_t"] = [this] { return imp_malloc(); };
+        import_handlers_["_ZnajRKSt9nothrow_t"] = [this] { return imp_malloc(); };
+        import_handlers_["_ZdlPv"] = [this] { return imp_free(); };
+        import_handlers_["_ZdaPv"] = [this] { return imp_free(); };
+
+        // strtok walks guest memory and NUL-terminates in place; handing the
+        // guest a constant 0 makes every config parse fail and the engine then
+        // jumps through a null table entry.
+        import_handlers_["strtok"] = [this] {
+            uint32_t at = arg(0);
+            if (!at) at = strtok_last_;
+            if (!at) return 0u;
+            const std::string delims = guest_string(arg(1));
+            auto is_delim = [&delims](char c) {
+                return c != '\0' && delims.find(c) != std::string::npos;
+            };
+            // Skip leading delimiters.
+            char c = 0;
+            while (emu_.read(at, &c, 1) && c != '\0' && is_delim(c)) ++at;
+            if (!emu_.read(at, &c, 1) || c == '\0') {
+                strtok_last_ = 0;
+                return 0u;
+            }
+            const uint32_t token = at;
+            while (emu_.read(at, &c, 1) && c != '\0') {
+                if (is_delim(c)) {
+                    const char zero = '\0';
+                    emu_.write(at, &zero, 1);
+                    strtok_last_ = at + 1;
+                    return token;
+                }
+                ++at;
+            }
+            strtok_last_ = 0;
+            return token;
+        };
+        import_handlers_["strtok_r"] = [this] {
+            const uint32_t save = arg(2);
+            uint32_t at = arg(0);
+            if (!at && save) emu_.read(save, &at, sizeof at);
+            if (!at) return 0u;
+            const std::string delims = guest_string(arg(1));
+            auto is_delim = [&delims](char c) {
+                return c != '\0' && delims.find(c) != std::string::npos;
+            };
+            char c = 0;
+            while (emu_.read(at, &c, 1) && c != '\0' && is_delim(c)) ++at;
+            if (!emu_.read(at, &c, 1) || c == '\0') {
+                if (save) { const uint32_t z = 0; emu_.write(save, &z, sizeof z); }
+                return 0u;
+            }
+            const uint32_t token = at;
+            while (emu_.read(at, &c, 1) && c != '\0') {
+                if (is_delim(c)) {
+                    const char zero = '\0';
+                    emu_.write(at, &zero, 1);
+                    if (save) { const uint32_t next = at + 1; emu_.write(save, &next, sizeof next); }
+                    return token;
+                }
+                ++at;
+            }
+            if (save) { const uint32_t z = 0; emu_.write(save, &z, sizeof z); }
+            return token;
+        };
+
+        import_handlers_["strerror"] = [this] {
+            const char* s = ::strerror(static_cast<int>(arg(0)));
+            return s ? guest_str(s) : 0u;
+        };
+        import_handlers_["getcwd"] = [this] {
+            const uint32_t buf = arg(0);
+            const size_t size = static_cast<size_t>(arg(1));
+            if (!buf || size < 2) return 0u;
+            const char* cwd = "/";
+            emu_.write(buf, cwd, 2);
+            return buf;
+        };
+        import_handlers_["fcntl"] = [this] {
+            const int fd = host_fd(arg(0));
+            if (fd < 0) return static_cast<uint32_t>(-1);
+            return static_cast<uint32_t>(::fcntl(fd, static_cast<int>(arg(1)),
+                                                 static_cast<int>(arg(2))));
+        };
+        import_handlers_["isatty"] = [this] {
+            const int fd = host_fd(arg(0));
+            return fd < 0 ? 0u : static_cast<uint32_t>(::isatty(fd));
+        };
+        import_handlers_["putchar"] = [this] { return static_cast<uint32_t>(arg(0)); };
+        import_handlers_["puts"] = [this] {
+            LOGI("guest: %s", guest_string(arg(0)).c_str());
+            return 0u;
+        };
+        import_handlers_["fputc"] = [this] { return static_cast<uint32_t>(arg(0)); };
+        import_handlers_["perror"] = [this] {
+            LOGW("guest perror: %s", guest_string(arg(0)).c_str());
+            return 0u;
+        };
         import_handlers_["fstat"]   = [this] { return imp_stat_common(true); };
         import_handlers_["stat"]    = [this] { return imp_stat_common(false); };
         import_handlers_["stat64"]  = [this] { return imp_stat_common(false); };
@@ -5025,11 +6104,13 @@ private:
     Emulator&    emu_;
     StaticLinker linker_;
     JNIEnv*      env_ = nullptr;
+    JavaVM*      vm_ = nullptr;
 
     uint32_t env_shadow_ = 0, env_funcs_ = 0;
     uint32_t vm_shadow_ = 0,  vm_funcs_ = 0;
 
     std::vector<StubSlot> slots_;
+    std::vector<std::function<uint32_t()>> callbacks_;
     std::unordered_map<std::string, uint32_t> import_slots_;
     std::unordered_map<uint32_t, void*> refs_;
     std::unordered_map<void*, uint32_t> ref_reverse_;
@@ -5042,6 +6123,7 @@ private:
     std::unordered_set<int> logged_;
     uc_hook hook_ = 0;
 
+    uint32_t strtok_last_ = 0;      // state of the emulated strtok()
     uint32_t stack_guard_ = 0;      // guest word behind __stack_chk_guard
     uint32_t errno_cell_ = 0;       // guest word behind __errno
     uint32_t return_gadget_ = 0;    // guest `mov r0,#0 ; ret` trampoline
@@ -5059,10 +6141,22 @@ private:
 
     // guest filesystem / runtime-loading context
     std::string game_root_, package_, payload_dir_, obb_dir_, data_dir_;
+    std::string runtime_root_;   // unpacked assets/runtime (sysroot_arm32, sysroot_x86)
     std::unordered_set<std::string> translate_log_;
     std::unordered_map<std::string, uint32_t> dl_handles_;
     std::unordered_map<uint32_t, LoadedLibrary*> dl_libs_;
     uint32_t next_runtime_slot_ = 0;
+
+    // host platform libraries
+    void* android_lib_ = nullptr;
+    void* opensles_lib_ = nullptr;
+    std::unordered_map<std::string, void*> platform_syms_;
+    jobject assets_object_ = nullptr;
+    std::unordered_map<uint32_t, uint32_t> asset_buffers_;
+
+    // OpenSL ES host objects, indexed by the token stored in the guest struct.
+    std::vector<SlHostObject> sl_objects_;
+    std::vector<std::vector<uint8_t>> sl_pcm_;
 
     // host graphics
     void* egl_lib_ = nullptr;
@@ -5187,9 +6281,12 @@ std::vector<std::string> discover_payloads(const std::string& dir) {
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
     (void)reserved;
     g_vm = vm;
-    LOGI("==============================================================");
-    LOGI(" Zai-Bridge translation core (Unicorn backend)");
+    LOGI("==============================================================");    LOGI("Zai-Bridge translation core (Unicorn backend)");
+#if defined(__aarch64__)
     LOGI(" guest: ARM32 / Thumb-2     host: arm64-v8a");
+#else
+    LOGI(" guest: ARM32 / Thumb-2     host: x86_64");
+#endif
     LOGI("==============================================================");
 
     // No payload is mapped at load time: the library is resident before any
@@ -5235,7 +6332,14 @@ Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeStartSession(
 
     // Guest classes (Java_* exports, RegisterNatives targets) must resolve
     // through the DexClassLoader the host positioned on the ingested APK.
-    if (guest_loader) g_bridge->set_guest_loader(guest_loader);
+    //
+    // The loader is used from every thread the guest runs on, so it has to be a
+    // global reference: a local reference belongs to the JNI transition frame
+    // that created it and CheckJNI rejects it on any other thread ("invalid
+    // JNI transition frame reference").
+    if (guest_loader) {
+        g_bridge->set_guest_loader(static_cast<jobject>(env->NewGlobalRef(guest_loader)));
+    }
     // The engine's native side calls back into Java through the Activity it was
     // handed, so it needs a real object, not null, as the JNI `this`.
     if (guest_activity) {
@@ -5289,16 +6393,17 @@ Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeStartSession(
 
     g_bridge->report_imports();
     g_session_active = true;
-    LOGI("Zai-Bridge session ready");
+    LOGI("Zai-Bridge session ready (engine-agnostic: the guest drives its own frame loop)");
 
-    // The session thread is the only thread with a valid JNIEnv for the guest's
-    // callbacks, and it is already a dedicated worker on the Java side, so the
-    // engine is driven here until the host surface goes away.
-    if (g_host_window.load()) {
-        g_bridge->drive_render_loop();
-    } else {
-        LOGW("no host window; render drive not started");
-    }
+    // Nothing is driven from here on purpose.
+    //
+    // Every payload this bridge supports (a GLSurfaceView.Renderer, a
+    // NativeActivity, SDL2's thread, an EGL paint loop) reaches its native code
+    // through RegisterNatives / Java_* exports, which are already bound to
+    // host trampolines. ART calls them on the guest's own thread, the guest's
+    // eglSwapBuffers is forwarded to the real driver bound to the Activity's
+    // window, and frames present themselves. A per-engine pump in this thread
+    // used to force that from the outside and only worked for one game.
     return 0;
 }
 
@@ -5332,9 +6437,45 @@ extern "C" JNIEXPORT jstring JNICALL
 Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeVersion(JNIEnv* env, jclass /*clazz*/) {
     unsigned int major = 0, minor = 0;
     uc_version(&major, &minor);
-    char buf[128];
-    snprintf(buf, sizeof buf, "Unicorn %u.%u - ARM32 guest on arm64-v8a host", major, minor);
+    char buf[160];
+    snprintf(buf, sizeof buf, "Unicorn %u.%u - ARM32 guest on %s host", major, minor,
+#if defined(__aarch64__)
+             "arm64-v8a"
+#elif defined(__x86_64__)
+             "x86_64"
+#else
+             "32-bit"
+#endif
+    );
     return env->NewStringUTF(buf);
+}
+
+// Root of the unpacked runtime bundle. The guest's DT_NEEDED resolver searches
+// it after the payload directory, which is what makes a self-contained,
+// offline legacy runtime possible.
+extern "C" JNIEXPORT void JNICALL
+Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeSetRuntimeSysroot(
+        JNIEnv* env, jclass /*clazz*/, jstring path) {
+    const std::string root = jstring_to_std(env, path);
+    if (g_bridge) g_bridge->set_runtime_root(root);
+    LOGI("runtime sysroot: %s", root.empty() ? "<none>" : root.c_str());
+}
+
+// The guest Activity only exists after newActivity(); the core is opened before
+// it, because a legacy static initialiser calls System.loadLibrary as soon as
+// the class is touched.
+extern "C" JNIEXPORT void JNICALL
+Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeSetGuestActivity(
+        JNIEnv* env, jclass /*clazz*/, jobject activity) {
+    if (!g_bridge || !activity) return;
+    g_bridge->set_guest_activity(static_cast<jobject>(env->NewGlobalRef(activity)));
+    LOGI("guest Activity registered with the core");
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeIsSessionActive(
+        JNIEnv* /*env*/, jclass /*clazz*/) {
+    return g_session_active ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void* reserved) {

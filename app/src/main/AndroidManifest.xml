@@ -20,12 +20,29 @@
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="29" />
 
+    <!-- =====================================================================
+         Permissions the *guests* rely on.
+         =====================================================================
+         A virtualized Activity runs under this package, so a permission its own
+         manifest declared is not granted to us. These are the normal-level
+         grants legacy games assume; each one is enforced by the framework at
+         the call site, so requesting them here is what keeps a guest's
+         onCreate/onResume from throwing SecurityException.
+    -->
+    <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
     <!-- Importing a multi-gigabyte OBB must survive the user leaving the app. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
+        android:name=".core.BridgeApplication"
         android:allowBackup="false"
         android:hardwareAccelerated="true"
         android:icon="@mipmap/ic_launcher"
@@ -47,9 +64,33 @@
         </activity>
 
         <!-- =================================================================
-             The execution surface. NoActionBar/Fullscreen comes from the
-             theme, and the activity additionally drives the SystemUI flags so
-             the emulated game is never letterboxed into a window.
+             The virtualized execution surface.
+
+             ProxyGameActivity is a real, manifest-declared Activity: launching
+             it makes ActivityThread run performLaunchActivity, which is where
+             the Window, DecorView, FragmentController and InputChannel are
+             created. BridgeInstrumentation substitutes the imported game's own
+             Activity in newActivity(), so the guest inherits all of that
+             plumbing instead of being hand-attached through reflection.
+
+             The configChanges below are the full set a game needs: rotation,
+             keyboard, density and UI mode changes are delivered to the guest
+             instead of recreating (and restarting) it.
+        -->
+        <activity
+            android:name=".proxy.ProxyGameActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation|uiMode|density|fontScale|locale|layoutDirection|touchscreen"
+            android:exported="false"
+            android:hardwareAccelerated="true"
+            android:launchMode="singleTask"
+            android:resizeableActivity="false"
+            android:theme="@style/Theme.ZaiBridge.GameHost" />
+
+        <!-- =================================================================
+             The direct execution surface used when the instrumentation hook is
+             unavailable. NoActionBar/Fullscreen comes from the theme, and the
+             activity additionally drives the SystemUI flags so the emulated
+             game is never letterboxed into a window.
         -->
         <activity
             android:name=".GameHostActivity"
