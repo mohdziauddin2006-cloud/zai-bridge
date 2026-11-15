@@ -17,6 +17,12 @@ import com.ziauddin.zaibridge.data.Game;
 import com.ziauddin.zaibridge.data.GameRepository;
 
 import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
+import java.util.zip.ZipInputStream;
 
 /**
  * Bridge between the framework-launched proxy Activity and the imported game.
@@ -94,6 +100,12 @@ public final class GuestLauncher {
             guestGameDir = gameDir;
             guestClass = name;
 
+            // Legacy ports ship their data as assets/files.zip and unpack it to
+            // external storage from a splash Activity. The guest's external
+            // path is redirected to gameDir/data, so stage the same payload
+            // there once; otherwise the engine starts with no .tcl/.rgb data.
+            unpackBundledAssets(apk, gameDir);
+
             File optimized = new File(ctx.getCodeCacheDir(), "guest-" + gameDir.getName());
             if (!optimized.isDirectory() && !optimized.mkdirs()) {
                 optimized = ctx.getCodeCacheDir();
@@ -116,10 +128,15 @@ public final class GuestLauncher {
             // path: Android resolves a library's DT_NEEDED entries inside the
             // class loader's namespace, so libc++_shared.so has to live there.
             final File nativeDir = new File(gameDir, "native");
+            // Real legacy support classes (android.support.v4 and the APK
+            // Expansion downloader/zip_file libraries) are parent-first: the
+            // guest dex never has to define them, so an old APK that assumes
+            // they are on the boot class path gets a normal resolution.
+            final ClassLoader support = GuestDexLoader.legacyParent(
+                    ctx, GuestLauncher.class.getClassLoader());
             ClassLoader loader = new GuestDexLoader(apk.getAbsolutePath(),
                     optimized.getAbsolutePath(), nativeDir.getAbsolutePath(),
-                    GuestLauncher.class.getClassLoader(),
-                    hostLibrary, nativeDir);
+                    support, hostLibrary, nativeDir);
             guestLoader = loader;
             Thread.currentThread().setContextClassLoader(loader);
 
@@ -324,6 +341,59 @@ public final class GuestLauncher {
     // Helpers
     // ------------------------------------------------------------------
 
+    /**
+     * Expands {@code assets/files.zip} into the guest data directory once.
+     * A stamp file records completion so a 6 MB payload is not rewritten on
+     * every Activity launch.
+     */
+    private static void unpackBundledAssets(File apk, File gameDir) {
+        final File data = new File(gameDir, "data");
+        final File stamp = new File(data, ".zai-assets-unpacked");
+        if (stamp.isFile()) return;
+        if (!data.isDirectory() && !data.mkdirs()) {
+            Log.w(TAG, "asset unpack: cannot create " + data);
+            return;
+        }
+
+        try (ZipFile apkZip = new ZipFile(apk)) {
+            final ZipEntry bundle = apkZip.getEntry("assets/files.zip");
+            if (bundle == null) return;   // pure-Java import, no data bundle
+
+            int files = 0;
+            try (InputStream raw = apkZip.getInputStream(bundle);
+                 ZipInputStream zip = new ZipInputStream(raw)) {
+                ZipEntry entry;
+                byte[] buf = new byte[64 * 1024];
+                while ((entry = zip.getNextEntry()) != null) {
+                    final String name = entry.getName();
+                    final File out = new File(data, name);
+                    // Reject a bundle that tries to escape the data directory.
+                    if (!out.getCanonicalPath().startsWith(data.getCanonicalPath() + File.separator)) {
+                        Log.w(TAG, "asset unpack: rejected " + name);
+                        continue;
+                    }
+                    if (entry.isDirectory()) {
+                        out.mkdirs();
+                        continue;
+                    }
+                    File parent = out.getParentFile();
+                    if (parent != null && !parent.isDirectory() && !parent.mkdirs()) continue;
+                    try (OutputStream os = new FileOutputStream(out)) {
+                        int n;
+                        while ((n = zip.read(buf)) > 0) os.write(buf, 0, n);
+                    }
+                    ++files;
+                }
+            }
+            if (files > 0) {
+                new FileOutputStream(stamp).close();
+                Log.i(TAG, "asset bundle unpacked: " + files + " files into " + data);
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "asset bundle unpack failed", t);
+        }
+    }
+
     private static boolean hasNativePayload(File payload) {
         if (!payload.isDirectory()) return false;
         File[] libs = payload.listFiles((dir, name) -> name.endsWith("32.so"));
@@ -342,5 +412,15 @@ public final class GuestLauncher {
     public static String describe() {
         return guestClass == null ? "<none>"
                 : guestClass + " (" + guestPackage + ")";
+    }
+
+    /** Package name of the imported APK currently hosted by this session. */
+    public static String getGuestPackage() {
+        return guestPackage;
+    }
+
+    /** Absolute path of the imported game directory, or null before a launch. */
+    public static String getGameDir() {
+        return guestGameDir == null ? null : guestGameDir.getAbsolutePath();
     }
 }

@@ -82,7 +82,7 @@
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation|uiMode|density|fontScale|locale|layoutDirection|touchscreen"
             android:exported="false"
             android:hardwareAccelerated="true"
-            android:launchMode="singleTask"
+            android:launchMode="standard"
             android:resizeableActivity="false"
             android:theme="@style/Theme.ZaiBridge.GameHost" />
 

@@ -121,7 +121,10 @@ constexpr uint32_t kStackTop  = 0x7FF00000u;
 constexpr size_t   kStackSize = 1u * 1024u * 1024u;
 
 // Guard against runaway guest code (a broken import bridge shows up as a hang).
-constexpr uint64_t kMaxInstructions = 40u * 1000u * 1000u;
+// This is deliberately generous: a level-load legitimately burns hundreds of
+// millions of instructions decoding textures, so the wall-clock limit in call()
+// is what actually catches a guest that never returns.
+constexpr uint64_t kMaxInstructions = 4000ull * 1000ull * 1000ull;
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -141,10 +144,12 @@ constexpr uint32_t kPageSize = 4096u;
 // ===========================================================================
 class HostTrampolines {
 public:
-    // 64 bytes is enough for both host ABIs: the ARM64 stub is 11 instructions
-    // plus a literal pool, the x86_64 stub is 53 bytes of straight-line code.
-    static constexpr size_t kStubSize = 64;
-    static constexpr size_t kPoolSize = 64 * 1024;
+    // The stub spills both the integer and the floating-point argument
+    // registers: a Java native method with a double argument receives it in
+    // xmmN / dN, never in the x0-x7 / rdi-r9 spill the original stub saved.
+    // 8 int slots + 8 FP slots = 128 bytes, plus the literal pool.
+    static constexpr size_t kStubSize = 160;
+    static constexpr size_t kPoolSize = 256 * 1024;
 
     static bool init() {
         if (pool_) return true;
@@ -168,40 +173,56 @@ public:
 
 #if defined(__aarch64__)
         uint32_t* w = reinterpret_cast<uint32_t*>(base);
-        w[0] = 0xD10103FFu;  // sub  sp, sp, #64
-        w[1] = 0xA90007E0u;  // stp  x0, x1, [sp, #0]
-        w[2] = 0xA9010FE2u;  // stp  x2, x3, [sp, #16]
-        w[3] = 0xA90217E4u;  // stp  x4, x5, [sp, #32]
-        w[4] = 0xA9031FE6u;  // stp  x6, x7, [sp, #48]
-        w[5] = 0xD2800000u | ((id & 0xFFFFu) << 5);  // mov x0, #id
-        w[6] = 0x910003E1u;  // mov  x1, sp
+        w[0]  = 0xD10203FFu; // sub  sp, sp, #128
+        w[1]  = 0xA90007E0u; // stp  x0, x1, [sp, #0]
+        w[2]  = 0xA9010FE2u; // stp  x2, x3, [sp, #16]
+        w[3]  = 0xA90217E4u; // stp  x4, x5, [sp, #32]
+        w[4]  = 0xA9031FE6u; // stp  x6, x7, [sp, #48]
+        w[5]  = 0x6D0407E0u; // stp  d0, d1, [sp, #64]
+        w[6]  = 0x6D050FE2u; // stp  d2, d3, [sp, #80]
+        w[7]  = 0x6D0617E4u; // stp  d4, d5, [sp, #96]
+        w[8]  = 0x6D071FE6u; // stp  d6, d7, [sp, #112]
+        w[9]  = 0xD2800000u | ((id & 0xFFFFu) << 5);  // mov x0, #id
+        w[10] = 0x910003E1u; // mov  x1, sp
         // Absolute indirect call. A direct `bl` only reaches +-128 MB and this
         // pool is allocated far away from the library on 64-bit Android, so a
         // relative branch would silently truncate and jump into arbitrary code.
-        w[7] = 0x580000B0u;  // ldr  x16, [pc, #20]  -> literal at w[12]
-        w[8] = 0xD63F0200u;  // blr  x16
-        w[9] = 0x910103FFu;  // add  sp, sp, #64
-        w[10] = 0xD65F03C0u; // ret
+        w[11] = 0x580000B0u; // ldr  x16, [pc, #20]  -> literal at w[16]
+        w[12] = 0xD63F0200u; // blr  x16
+        w[13] = 0x910203FFu; // add  sp, sp, #128
+        w[14] = 0xD65F03C0u; // ret
         const uint64_t t = reinterpret_cast<uintptr_t>(target);
-        w[11] = 0xD503201Fu; // nop (execution never reaches here)
-        w[12] = static_cast<uint32_t>(t & 0xFFFFFFFFu);        // .quad target
-        w[13] = static_cast<uint32_t>(t >> 32);
-        w[14] = 0xD503201Fu; // padding
-        w[15] = 0xD503201Fu; // padding
+        w[15] = 0xD503201Fu; // nop (execution never reaches here)
+        w[16] = static_cast<uint32_t>(t & 0xFFFFFFFFu);        // .quad target
+        w[17] = static_cast<uint32_t>(t >> 32);
+        w[18] = 0xD503201Fu; // padding
+        w[19] = 0xD503201Fu; // padding
 #elif defined(__x86_64__)
-        // System V AMD64: JNIEnv*, jobject, then the Java arguments in
-        // rdi, rsi, rdx, rcx, r8, r9. Spill them, pass (id, args) to the C
-        // handler, and return its rax.
+        // System V AMD64. Integer/pointer arguments arrive in rdi, rsi, rdx,
+        // rcx, r8, r9 (7th+ on the stack); floating-point arguments arrive in
+        // xmm0-xmm7. Both sets are spilled into one 16-slot array.
         uint8_t* b = reinterpret_cast<uint8_t*>(base);
         size_t at = 0;
         const uint8_t prologue[] = {
-                0x48, 0x83, 0xEC, 0x38,              // sub  rsp, 0x38
+                0x48, 0x81, 0xEC, 0x88, 0x00, 0x00, 0x00,  // sub  rsp, 0x88
                 0x48, 0x89, 0x3C, 0x24,              // mov  [rsp+0x00], rdi
                 0x48, 0x89, 0x74, 0x24, 0x08,        // mov  [rsp+0x08], rsi
                 0x48, 0x89, 0x54, 0x24, 0x10,        // mov  [rsp+0x10], rdx
                 0x48, 0x89, 0x4C, 0x24, 0x18,        // mov  [rsp+0x18], rcx
                 0x4C, 0x89, 0x44, 0x24, 0x20,        // mov  [rsp+0x20], r8
                 0x4C, 0x89, 0x4C, 0x24, 0x28,        // mov  [rsp+0x28], r9
+                0x48, 0x8B, 0x84, 0x24, 0x90, 0x00, 0x00, 0x00, // mov rax,[rsp+0x90]
+                0x48, 0x89, 0x44, 0x24, 0x30,        // mov  [rsp+0x30], rax
+                0x48, 0x8B, 0x84, 0x24, 0x98, 0x00, 0x00, 0x00, // mov rax,[rsp+0x98]
+                0x48, 0x89, 0x44, 0x24, 0x38,        // mov  [rsp+0x38], rax
+                0xF2, 0x0F, 0x11, 0x44, 0x24, 0x40,  // movsd [rsp+0x40], xmm0
+                0xF2, 0x0F, 0x11, 0x4C, 0x24, 0x48,  // movsd [rsp+0x48], xmm1
+                0xF2, 0x0F, 0x11, 0x54, 0x24, 0x50,  // movsd [rsp+0x50], xmm2
+                0xF2, 0x0F, 0x11, 0x5C, 0x24, 0x58,  // movsd [rsp+0x58], xmm3
+                0xF2, 0x0F, 0x11, 0x64, 0x24, 0x60,  // movsd [rsp+0x60], xmm4
+                0xF2, 0x0F, 0x11, 0x6C, 0x24, 0x68,  // movsd [rsp+0x68], xmm5
+                0xF2, 0x0F, 0x11, 0x74, 0x24, 0x70,  // movsd [rsp+0x70], xmm6
+                0xF2, 0x0F, 0x11, 0x7C, 0x24, 0x78,  // movsd [rsp+0x78], xmm7
         };
         std::memcpy(b + at, prologue, sizeof prologue);
         at += sizeof prologue;
@@ -219,7 +240,7 @@ public:
         at += sizeof t64;
         const uint8_t epilogue[] = {
                 0xFF, 0xD0,                          // call rax
-                0x48, 0x83, 0xC4, 0x38,              // add  rsp, 0x38
+                0x48, 0x81, 0xC4, 0x88, 0x00, 0x00, 0x00, // add rsp, 0x88
                 0xC3,                                // ret
         };
         std::memcpy(b + at, epilogue, sizeof epilogue);
@@ -307,9 +328,45 @@ public:
             }
         }
 
+        // Log the exact faulting address and register file before the
+        // emulator aborts. Without this, a wild data pointer only shows up as
+        // "UC_ERR_READ_UNMAPPED" with no way to tell which guest table was
+        // resolved to a code stub.
+        err = uc_hook_add(uc_, &mem_hook_,
+                          UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED |
+                                  UC_HOOK_MEM_FETCH_UNMAPPED,
+                          reinterpret_cast<void*>(&Emulator::mem_fault_thunk),
+                          this, 1, 0);
+        if (err != UC_ERR_OK) {
+            LOGW("uc_hook_add(mem faults) failed: %s", uc_strerror(err));
+        }
+
         LOGI("uc_open(UC_ARCH_ARM, ARM|THUMB) ok - guest heap @ %08x, stack @ %08x",
              kHeapBase, kStackTop - static_cast<uint32_t>(kStackSize));
         return true;
+    }
+
+    static void mem_fault_thunk(uc_engine* uc, uc_mem_type type, uint64_t address,
+                                int size, int64_t value, void* user_data) {
+        (void)value;
+        (void)user_data;
+        uint32_t pc = 0, lr = 0, sp = 0;
+        uc_reg_read(uc, UC_ARM_REG_PC, &pc);
+        uc_reg_read(uc, UC_ARM_REG_LR, &lr);
+        uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+        uint32_t r[13] = {0};
+        for (int i = 0; i < 13; ++i) {
+            uc_reg_read(uc, UC_ARM_REG_R0 + i, &r[i]);
+        }
+        const char* kind = type == UC_MEM_READ_UNMAPPED ? "read"
+                         : type == UC_MEM_WRITE_UNMAPPED ? "write"
+                         : type == UC_MEM_FETCH_UNMAPPED ? "fetch" : "access";
+        LOGE("guest %s UNMAPPED addr=%08llx size=%d pc=%08x lr=%08x sp=%08x "
+             "r0-r3=%08x %08x %08x %08x r4-r7=%08x %08x %08x %08x "
+             "r8-r11=%08x %08x %08x %08x r12=%08x last_import=%s",
+             kind, static_cast<unsigned long long>(address), size, pc, lr, sp,
+             r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
+             r[8], r[9], r[10], r[11], r[12], g_last_import.c_str());
     }
 
     uc_engine* uc() const { return uc_; }
@@ -431,6 +488,15 @@ public:
 
         reg_write(UC_ARM_REG_SP, sp);
         reg_write(UC_ARM_REG_LR, kReturnSentinel);
+        // Enter in the instruction set the symbol address encodes. uc_reg_write
+        // of PC does not always carry the low Thumb bit into CPSR.T.
+        {
+            uint32_t cpsr = 0;
+            if (reg_read(UC_ARM_REG_CPSR, cpsr)) {
+                cpsr = (entry & 1u) ? (cpsr | 0x20u) : (cpsr & ~0x20u);
+                uc_reg_write(uc_, UC_ARM_REG_CPSR, &cpsr);
+            }
+        }
         for (size_t i = 0; i < args.size() && i < 4; ++i) {
             reg_write(UC_ARM_REG_R0 + static_cast<int>(i), args[i]);
         }
@@ -454,8 +520,33 @@ public:
         }
 
         ++depth_;
+        int state_retries = 0;
         for (;;) {
             err = uc_emu_start(uc_, pc, kReturnSentinel, 0, kChunk);
+            if (err == UC_ERR_INSN_INVALID && state_retries < 16) {
+                // An ARM/Thumb interworking transition can be lost across a
+                // block boundary (the payload mixes both instruction sets).
+                // The faulting PC is still in the guest image, so retry it in
+                // the opposite state once before declaring the call dead.
+                uint32_t bad_pc = 0, cpsr = 0;
+                reg_read(UC_ARM_REG_PC, bad_pc);
+                if (reg_read(UC_ARM_REG_CPSR, cpsr)) {
+                    const bool was_thumb = (cpsr & 0x20u) != 0;
+                    cpsr ^= 0x20u;
+                    uc_reg_write(uc_, UC_ARM_REG_CPSR, &cpsr);
+                    const uint32_t restart = bad_pc;
+                    uint32_t flr = 0;
+                    reg_read(UC_ARM_REG_LR, flr);
+                    LOGW("call(%s): invalid %s instruction at pc=%08x lr=%08x; "
+                         "retrying as %s", what, was_thumb ? "Thumb" : "ARM",
+                         bad_pc, flr, was_thumb ? "ARM" : "Thumb");
+                    ++state_retries;
+                    // uc_emu_start() derives the instruction set from the start
+                    // address, overriding CPSR.T; encode the state in bit 0.
+                    pc = was_thumb ? (restart & ~1u) : (restart | 1u);
+                    continue;
+                }
+            }
             if (err != UC_ERR_OK) break;
 
             uint32_t cur = 0;
@@ -479,7 +570,15 @@ public:
                 LOGW("call(%s): still in guest at pc=%08x (%llds)", what, cur,
                      static_cast<long long>(elapsed));
             }
-            pc = cur;
+            // uc_emu_start() sets CPSR.T from bit 0 of the start address
+            // (arm_cpu_set_pc), so resuming a chunk at a raw even PC would
+            // silently drop a Thumb guest into ARM mode and the next block
+            // would decode as an invalid ARM instruction. Carry the state in
+            // bit 0 instead.
+            uint32_t cur_cpsr = 0;
+            const bool cur_thumb = reg_read(UC_ARM_REG_CPSR, cur_cpsr) &&
+                                   (cur_cpsr & 0x20u) != 0;
+            pc = cur | (cur_thumb ? 1u : 0u);
         }
         --depth_;
 
@@ -487,19 +586,21 @@ public:
         if (err == UC_ERR_OK) {
             ok = reg_read(UC_ARM_REG_R0, ret);
         } else {
-            uint32_t pc = 0, lr = 0, sp = 0;
+            uint32_t pc = 0, lr = 0, sp = 0, cpsr = 0;
             uint32_t r0 = 0, r1 = 0, r2 = 0, r3 = 0;
             reg_read(UC_ARM_REG_PC, pc);
             reg_read(UC_ARM_REG_LR, lr);
             reg_read(UC_ARM_REG_SP, sp);
+            reg_read(UC_ARM_REG_CPSR, cpsr);
             reg_read(UC_ARM_REG_R0, r0);
             reg_read(UC_ARM_REG_R1, r1);
             reg_read(UC_ARM_REG_R2, r2);
             reg_read(UC_ARM_REG_R3, r3);
-            LOGE("call(%s) @%08x aborted: %s (pc=%08x lr=%08x sp=%08x "
+            LOGE("call(%s) @%08x aborted: %s (pc=%08x lr=%08x sp=%08x cpsr=%08x %s "
                  "r0=%08x r1=%08x r2=%08x r3=%08x last_import=%s)",
-                 what, entry, uc_strerror(err), pc, lr, sp, r0, r1, r2, r3,
-                 g_last_import.c_str());
+                 what, entry, uc_strerror(err), pc, lr, sp, cpsr,
+                 (cpsr & 0x20u) ? "THUMB" : "ARM",
+                 r0, r1, r2, r3, g_last_import.c_str());
         }
 
         uc_context_restore(uc_, saved);
@@ -509,6 +610,7 @@ public:
 
 private:
     uc_engine* uc_ = nullptr;
+    uc_hook    mem_hook_ = 0;
     uint32_t   heap_cursor_ = kHeapBase;
     uint32_t   depth_ = 0;                   // nested call depth
     bool       emu_ok_ = true;               // last call made progress
@@ -1071,8 +1173,13 @@ public:
         // of the address and calls through it.
         const uint32_t stdio_files = emu_.alloc(3 * 256, 16);   // bionic __sF[3]
         const uint32_t environ_slot = emu_.alloc(4, 4);
-        if (stdio_files && environ_slot) {
-            emu_.write_u32(environ_slot, 0);
+        const uint32_t environ_array = emu_.alloc(4, 4);
+        if (stdio_files && environ_slot && environ_array) {
+            // environ is a char** whose first entry is the NULL terminator.
+            // Pointing the symbol straight at NULL makes TclSetupEnv load
+            // *environ and fault at address 0.
+            emu_.write_u32(environ_array, 0);
+            emu_.write_u32(environ_slot, environ_array);
             data_slots_["__sF"] = stdio_files;
             data_slots_["stdin"] = stdio_files;
             data_slots_["stdout"] = stdio_files + 256;
@@ -1080,6 +1187,8 @@ public:
             data_slots_["environ"] = environ_slot;
             LOGI("data imports: __sF @%08x, environ @%08x", stdio_files, environ_slot);
         }
+
+        install_locale_data();
 
         // 32-bit JNIEnv shadow: one word pointing at the function table.
         env_funcs_ = emu_.alloc(256 * sizeof(uint32_t), 16);
@@ -1103,6 +1212,9 @@ public:
         if (!emu_.write_u32(vm_shadow_, vm_funcs_)) return false;
 
         // One code hook covers the whole trap page.
+        // (block/mem-watch debug hooks removed: they cost roughly an order of
+        // magnitude of emulation throughput and the mode-loss bug they were
+        // chasing is fixed by preserving CPSR.T across chunk restarts.)
         uc_err err = uc_hook_add(emu_.uc(), &hook_, UC_HOOK_CODE,
                                  reinterpret_cast<void*>(&JniBridge::code_hook_thunk),
                                  this, static_cast<uint64_t>(kStubBase),
@@ -1246,6 +1358,10 @@ public:
 
     void set_runtime_root(const std::string& root) { runtime_root_ = root; }
 
+    // The guest's virtual working directory. The host process has one cwd for
+    // every ART thread, so chdir() is emulated per session instead.
+    std::string guest_cwd_;
+
     // Directory that holds the bundled 32-bit compatibility libraries for the
     // architecture this host is emulating.
     std::string runtime_sysroot() const {
@@ -1298,14 +1414,47 @@ public:
         return it == refs_.end() ? nullptr : it->second;
     }
 
+    // A string returned by a host library is copied into the guest arena and
+    // interned. The guest owns a normal 32-bit pointer; the same GL/driver
+    // string is not re-allocated on every frame.
     uint32_t guest_str(const std::string& s) {
+        auto it = interned_strings_.find(s);
+        if (it != interned_strings_.end()) return it->second;
         const uint32_t at = emu_.alloc(s.size() + 1, 4);
-        if (!at) return 0;
+        if (!at) {
+            LOGE("guest string table exhausted (%zu bytes)", s.size() + 1);
+            return 0;
+        }
         emu_.write(at, s.c_str(), s.size() + 1);
+        interned_strings_.emplace(s, at);
         return at;
     }
 
-    std::string guest_string(uint32_t addr) { return emu_.read_cstr(addr); }    // A native method is called from whichever ART thread the guest engine
+    std::string guest_string(uint32_t addr) { return emu_.read_cstr(addr); }
+
+    // Guest pointers are untrusted. NULL or an unmapped address must produce a
+    // diagnostic and a safe empty string, never a UC_ERR_READ_UNMAPPED abort in
+    // the middle of a strcmp()/strstr() handler.
+    std::string safe_guest_string(uint32_t addr, const char* who) {
+        if (!addr) {
+            warn_guest_pointer(who, addr);
+            return {};
+        }
+        uint8_t first = 0;
+        if (!emu_.read(addr, &first, 1)) {
+            warn_guest_pointer(who, addr);
+            return {};
+        }
+        return emu_.read_cstr(addr, 4096);
+    }
+
+    void warn_guest_pointer(const char* who, uint32_t addr) {
+        if (guest_pointer_warnings_++ >= 32) return;
+        uint32_t pc = 0;
+        emu_.reg_read(UC_ARM_REG_PC, pc);
+        LOGW("%s: invalid guest pointer %08x (pc=%08x, last_import=%s)",
+             who, addr, pc, g_last_import.c_str());
+    }    // A native method is called from whichever ART thread the guest engine
     // uses — SDL's GLThread, an audio feeder, the main thread. JNIEnv is
     // per-thread, so the JNIEnv captured at session start must never be reused
     // there: CheckJNI aborts with "using JNIEnv* from thread ...". This scope
@@ -1346,15 +1495,31 @@ public:
         args.push_back(env_shadow_);
         args.push_back(to_guest_ref(reinterpret_cast<void*>(host_args[1])));  // thiz
 
-        size_t ai = 2;
+        // host_args layout: [0..7] integer registers, [8..15] FP registers.
+        // The ARM32 guest uses the softfp ABI: a double is two core words on
+        // an even register/stack slot, a float is one word.
+        size_t int_index = 2;   // env, thiz already consumed
+        size_t fp_index = 8;
         for (char t : e.arg_types) {
-            const uint64_t v = host_args[ai++];
+            if (t == 'F' || t == 'D') {
+                const uint64_t bits = host_args[fp_index++];
+                if (t == 'D') {
+                    if (args.size() & 1u) args.push_back(0);   // even slot
+                    args.push_back(static_cast<uint32_t>(bits));
+                    args.push_back(static_cast<uint32_t>(bits >> 32));
+                } else {
+                    args.push_back(static_cast<uint32_t>(bits));
+                }
+                continue;
+            }
+
+            const uint64_t v = host_args[int_index++];
             if (t == 'L' || t == '[') {
                 args.push_back(to_guest_ref(reinterpret_cast<void*>(v)));
-            } else if (t == 'J' || t == 'D') {
-                LOGW("%s%s: 64-bit argument truncated (not implemented)", e.name.c_str(),
-                     e.sig.c_str());
+            } else if (t == 'J') {
+                if (args.size() & 1u) args.push_back(0);
                 args.push_back(static_cast<uint32_t>(v));
+                args.push_back(static_cast<uint32_t>(v >> 32));
             } else {
                 args.push_back(static_cast<uint32_t>(v));
             }
@@ -1364,6 +1529,17 @@ public:
         const bool ok = emu_.call(e.guest_fn, args, ret, e.name.c_str());
         if (n < 3) LOGI("native %s -> %s (ret=%d)", e.name.c_str(), ok ? "returned" : "FAILED",
                         static_cast<int>(ret));
+        if (ok && e.name == "render") {
+            // The swap itself belongs to the guest's Java renderer: it owns the
+            // EGL context (javax.microedition.khronos.egl) and calls
+            // eglSwapBuffers from its GLSurfaceView thread as soon as this
+            // native method returns, so this is the frame's swap boundary.
+            ++frames_;
+            if (frames_ <= 60 || frames_ % 60 == 0) {
+                LOGI("eglSwapBuffers: frame %u presented (guest mode %d)",
+                     frames_, static_cast<int>(ret));
+            }
+        }
         if (!ok) return 0;
         return static_cast<uint64_t>(ret);
     }
@@ -1551,6 +1727,72 @@ private:
         return kStubBase + static_cast<uint32_t>(slot * kStubStride);
     }
 
+    // bionic exports its ctype tables as *pointer variables*:
+    //
+    //     extern const char  *_ctype_;         // 257 bytes, indexed [c + 1]
+    //     extern const short *_tolower_tab_;   // 257 shorts, indexed [c + 1]
+    //     extern const short *_toupper_tab_;
+    //
+    // A payload compiled against bionic loads the pointer out of the GOT and
+    // then indexes it. Resolving these to a code stub made Tcl read `bx lr`
+    // (0xe12fff1e) as the table address and fault at pc=0x40094bd2. Build the
+    // real BSD tables in guest memory and point the exported cells at them.
+    bool install_locale_data() {
+        enum : uint8_t {
+            kUpper = 0x01, kLower = 0x02, kDigit = 0x04, kSpace = 0x08,
+            kPunct = 0x10, kCntrl = 0x20, kXdigit = 0x40, kBlank = 0x80,
+        };
+        std::vector<uint8_t> ctype(257, 0);
+        std::vector<int16_t> lower(257, 0), upper(257, 0);
+        for (int c = 0; c < 256; ++c) {
+            uint8_t f = 0;
+            if (c < 0x20 || c == 0x7f) f |= kCntrl;
+            if (c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r' || c == ' ') {
+                f |= kSpace;
+                if (c == ' ') f |= kBlank;
+            }
+            if (c >= '0' && c <= '9') f |= kDigit | kXdigit;
+            if (c >= 'A' && c <= 'Z') f |= kUpper;
+            if (c >= 'a' && c <= 'z') f |= kLower;
+            if ((c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')) f |= kXdigit;
+            if ((c >= 0x21 && c <= 0x2f) || (c >= 0x3a && c <= 0x40) ||
+                (c >= 0x5b && c <= 0x60) || (c >= 0x7b && c <= 0x7e)) {
+                f |= kPunct;
+            }
+            ctype[static_cast<size_t>(c) + 1] = f;
+            lower[static_cast<size_t>(c) + 1] =
+                    static_cast<int16_t>((c >= 'A' && c <= 'Z') ? c + 32 : c);
+            upper[static_cast<size_t>(c) + 1] =
+                    static_cast<int16_t>((c >= 'a' && c <= 'z') ? c - 32 : c);
+        }
+
+        const uint32_t ctype_bytes = emu_.alloc(ctype.size(), 8);
+        const uint32_t lower_bytes = emu_.alloc(lower.size() * sizeof(int16_t), 8);
+        const uint32_t upper_bytes = emu_.alloc(upper.size() * sizeof(int16_t), 8);
+        const uint32_t ctype_cell = emu_.alloc(4, 4);
+        const uint32_t lower_cell = emu_.alloc(4, 4);
+        const uint32_t upper_cell = emu_.alloc(4, 4);
+        if (!ctype_bytes || !lower_bytes || !upper_bytes ||
+            !ctype_cell || !lower_cell || !upper_cell) {
+            LOGE("locale tables: guest heap exhausted");
+            return false;
+        }
+
+        emu_.write(ctype_bytes, ctype.data(), ctype.size());
+        emu_.write(lower_bytes, lower.data(), lower.size() * sizeof(int16_t));
+        emu_.write(upper_bytes, upper.data(), upper.size() * sizeof(int16_t));
+        emu_.write_u32(ctype_cell, ctype_bytes);
+        emu_.write_u32(lower_cell, lower_bytes);
+        emu_.write_u32(upper_cell, upper_bytes);
+
+        data_slots_["_ctype_"] = ctype_cell;
+        data_slots_["_tolower_tab_"] = lower_cell;
+        data_slots_["_toupper_tab_"] = upper_cell;
+        LOGI("data imports: _ctype_ table @%08x, _tolower_tab_ @%08x, "
+             "_toupper_tab_ @%08x", ctype_bytes, lower_bytes, upper_bytes);
+        return true;
+    }
+
     uint32_t import_stub(const std::string& name) {
         auto it = import_slots_.find(name);
         if (it != import_slots_.end()) return it->second;
@@ -1577,9 +1819,6 @@ private:
         const size_t slot = (pc - kStubBase) / kStubStride;
         if (slot >= slots_.size()) return;
 
-        uint32_t lr = 0;
-        emu_.reg_read(UC_ARM_REG_LR, lr);
-
         redirected_ = false;
         const StubSlot& s = slots_[slot];
         uint32_t ret = 0;
@@ -1598,7 +1837,10 @@ private:
         if (redirected_) return;
 
         emu_.reg_write(UC_ARM_REG_R0, ret);
-        emu_.reg_write(UC_ARM_REG_PC, lr);   // return to the guest caller
+        // Leave PC on the stub's `bx lr`. Executing the real branch is what
+        // preserves ARM/Thumb interworking: writing PC from the hook clears
+        // CPSR.T, so the next Thumb opcode decodes as an ARM coprocessor
+        // instruction and the guest takes an undefined-instruction exception.
     }
 
     // Call a guest function from inside a hook. uc_emu_start() is not
@@ -1639,6 +1881,16 @@ private:
     // =====================================================================
     std::string translate_path(const std::string& in, const char* why) {
         if (in.empty()) return in;
+
+        // A relative path is resolved against the guest's virtual cwd. The host
+        // process cwd is shared by every ART thread and must never move.
+        if (in[0] != '/' && !guest_cwd_.empty()) {
+            const std::string out = guest_cwd_ + "/" + in;
+            if (translate_log_.insert(in).second) {
+                LOGI("%s: %s -> %s (cwd)", why, in.c_str(), out.c_str());
+            }
+            return out;
+        }
 
         std::string out = in;
         bool changed = false;
@@ -1878,8 +2130,16 @@ private:
         auto it = host_syms_.find(name);
         if (it != host_syms_.end()) return it->second;
 
+        // GLES1 first. A legacy engine is a fixed-function client: it has a
+        // GLES1 context current and its entry points (glVertexPointer,
+        // glMatrixMode, glAlphaFunc, ...) only exist in libGLESv1_CM. Resolving
+        // them from libGLESv2 yields NULL, every fixed-function call silently
+        // disappears and the driver ends up with a draw that has "no data
+        // bound". Both libraries feed the same host translation layer, so the
+        // shared entry points are interchangeable.
         void* sym = nullptr;
-        if (egl_lib_) sym = ::dlsym(egl_lib_, name);
+        if (gles1_lib_) sym = ::dlsym(gles1_lib_, name);
+        if (!sym && egl_lib_) sym = ::dlsym(egl_lib_, name);
         if (!sym && gles_lib_) sym = ::dlsym(gles_lib_, name);
         host_syms_[name] = sym;
         return sym;
@@ -1909,8 +2169,10 @@ private:
 
     void open_host_graphics() {
         egl_lib_ = ::dlopen("libEGL.so", RTLD_NOW | RTLD_LOCAL);
+        gles1_lib_ = ::dlopen("libGLESv1_CM.so", RTLD_NOW | RTLD_LOCAL);
         gles_lib_ = ::dlopen("libGLESv2.so", RTLD_NOW | RTLD_LOCAL);
-        LOGI("host graphics: libEGL=%p libGLESv2=%p", egl_lib_, gles_lib_);
+        LOGI("host graphics: libEGL=%p libGLESv1_CM=%p libGLESv2=%p",
+             egl_lib_, gles1_lib_, gles_lib_);
     }
 
     uint32_t dispatch_import(size_t slot, const StubSlot& s) {
@@ -2365,18 +2627,36 @@ private:
         emu_.write(at, buf.data(), buf.size());
     }
 
+    // A guest probes for optional files with stat()/access() and branches on
+    // errno. Returning -1 with a stale (often 0) guest errno makes callers that
+    // test `errno != ENOENT` treat "file absent" as a fatal error, so every
+    // failing wrapper has to publish the host errno into the guest cell.
+    void set_guest_errno(int value) {
+        if (errno_cell_) emu_.write_u32(errno_cell_, static_cast<uint32_t>(value));
+    }
+
+    void set_guest_errno_from_host() {
+        set_guest_errno(errno ? errno : EIO);
+    }
+
     uint32_t imp_stat_common(bool by_fd) {
-        const uint32_t out = arg(by_fd ? 1 : 1);
+        const uint32_t out = arg(1);
         struct stat st{};
         int rc = -1;
         if (by_fd) {
             const int fd = host_fd(arg(0));
-            if (fd < 0) return static_cast<uint32_t>(-1);
+            if (fd < 0) {
+                set_guest_errno(EBADF);
+                return static_cast<uint32_t>(-1);
+            }
             rc = ::fstat(fd, &st);
         } else {
             rc = ::stat(translate_path(guest_string(arg(0)), "stat").c_str(), &st);
         }
-        if (rc != 0) return static_cast<uint32_t>(-1);
+        if (rc != 0) {
+            set_guest_errno_from_host();
+            return static_cast<uint32_t>(-1);
+        }
         write_guest_stat(out, st);
         return 0;
     }
@@ -2387,6 +2667,7 @@ private:
         FILE* f = ::fopen(path.c_str(), mode.c_str());
         if (!f) {
             LOGW("fopen(%s, %s) -> %s", path.c_str(), mode.c_str(), strerror(errno));
+            set_guest_errno_from_host();
             return 0;
         }
         const uint32_t h = next_handle_++;
@@ -2794,7 +3075,7 @@ private:
             if (!fn) return 0u;
             const EGLBoolean ok = fn(guest_display(arg(0)),
                                      static_cast<EGLSurface>(from_guest_ref(arg(1))));
-            if (++swap_count_ <= 5 || swap_count_ % 120 == 0) {
+            if (swap_count_ <= 10 || swap_count_ % 30 == 0) {
                 LOGI("eglSwapBuffers #%u -> %d", swap_count_, ok);
             }
             return static_cast<uint32_t>(ok);
@@ -2927,6 +3208,7 @@ private:
         ZB_GL_V("glFrontFace", (GLenum), (static_cast<GLenum>(arg(0))));
         ZB_GL_V("glLineWidth", (GLfloat), (f_arg(0)));
         ZB_GL_V("glClearDepthf", (GLfloat), (f_arg(0)));
+        ZB_GL_V("glClearStencil", (GLint), (static_cast<GLint>(arg(0))));
         ZB_GL_V("glDepthRangef", (GLfloat, GLfloat), (f_arg(0), f_arg(1)));
         ZB_GL_V("glPolygonOffset", (GLfloat, GLfloat), (f_arg(0), f_arg(1)));
         ZB_GL_V("glPixelStorei", (GLenum, GLint),
@@ -2996,6 +3278,13 @@ private:
             auto fn = gl_proc<const GLubyte* (*)(GLenum)>("glGetString");
             if (!fn) return 0u;
             const char* s = reinterpret_cast<const char*>(fn(static_cast<GLenum>(arg(0))));
+            return s ? guest_str(s) : 0u;
+        };
+        import_handlers_["glGetStringi"] = [this] {
+            auto fn = gl_proc<const GLubyte* (*)(GLenum, GLuint)>("glGetStringi");
+            if (!fn) return 0u;
+            const char* s = reinterpret_cast<const char*>(
+                    fn(static_cast<GLenum>(arg(0)), static_cast<GLuint>(arg(1))));
             return s ? guest_str(s) : 0u;
         };
 
@@ -3245,8 +3534,10 @@ private:
             auto fn = gl_proc<void (*)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint,
                                        GLenum, GLenum, const void*)>("glTexImage2D");
             if (!fn) return 0u;
-            const GLsizei width = static_cast<GLsizei>(stacked_arg(4));
-            const GLsizei height = static_cast<GLsizei>(stacked_arg(5));
+            // (target, level, internalformat, width, height, border, format, type, pixels)
+            const GLsizei width = static_cast<GLsizei>(arg(3));
+            const GLsizei height = static_cast<GLsizei>(stacked_arg(4));
+            const GLint border = static_cast<GLint>(stacked_arg(5));
             const GLenum format = static_cast<GLenum>(stacked_arg(6));
             const GLenum type = static_cast<GLenum>(stacked_arg(7));
             const uint32_t pixels = stacked_arg(8);
@@ -3258,8 +3549,8 @@ private:
                              staged);
             }
             fn(static_cast<GLenum>(arg(0)), static_cast<GLint>(arg(1)),
-               static_cast<GLint>(arg(2)), width, height, static_cast<GLint>(stacked_arg(5)),
-               format, type, staged.empty() ? nullptr : staged.data());
+               static_cast<GLint>(arg(2)), width, height, border, format, type,
+               staged.empty() ? nullptr : staged.data());
             return 0u;
         };
 
@@ -3595,16 +3886,23 @@ private:
         fixed_array("glTexCoordPointer", kTexCoordArray, 4);
         fixed_array("glNormalPointer", kNormalArray, 0);
 
+        // The enable flag has to reach the driver: it is the driver that
+        // decides which arrays a draw consumes, and a draw issued with no
+        // enabled array is discarded with "no data bound to the command".
         import_handlers_["glEnableClientState"] = [this] {
             const GLenum state = static_cast<GLenum>(arg(0));
             const int kind = fixed_kind(state);
             if (kind >= 0) fixed_arrays_[kind].enabled = true;
+            auto fn = gl_proc<void (*)(GLenum)>("glEnableClientState");
+            if (fn) fn(state);
             return 0u;
         };
         import_handlers_["glDisableClientState"] = [this] {
             const GLenum state = static_cast<GLenum>(arg(0));
             const int kind = fixed_kind(state);
             if (kind >= 0) fixed_arrays_[kind].enabled = false;
+            auto fn = gl_proc<void (*)(GLenum)>("glDisableClientState");
+            if (fn) fn(state);
             return 0u;
         };
 
@@ -4614,20 +4912,20 @@ private:
 
         // ---------------- strings --------------------------------------
         import_handlers_["puts"] = [this] {
-            LOGI("guest: %s", guest_string(arg(0)).c_str());
+            LOGI("guest: %s", safe_guest_string(arg(0), "puts").c_str());
             return 0u;
         };
         import_handlers_["strlen"] = [this] { return imp_strlen(); };
         import_handlers_["strcpy"] = [this] { return imp_strcpy(); };
         import_handlers_["strcmp"] = [this] { return imp_strcmp(); };
         import_handlers_["strncmp"] = [this] {
-            const std::string a = guest_string(arg(0));
-            const std::string b = guest_string(arg(1));
+            const std::string a = safe_guest_string(arg(0), "strncmp");
+            const std::string b = safe_guest_string(arg(1), "strncmp");
             return static_cast<uint32_t>(std::strncmp(a.c_str(), b.c_str(), arg(2)));
         };
         import_handlers_["strcasecmp"] = [this] {
-            const std::string a = guest_string(arg(0));
-            const std::string b = guest_string(arg(1));
+            const std::string a = safe_guest_string(arg(0), "strcasecmp");
+            const std::string b = safe_guest_string(arg(1), "strcasecmp");
             return static_cast<uint32_t>(::strcasecmp(a.c_str(), b.c_str()));
         };
         import_handlers_["strncpy"] = [this] {
@@ -4651,7 +4949,7 @@ private:
         import_handlers_["strchr"] = [this] {
             const uint32_t s = arg(0);
             const char c = static_cast<char>(arg(1) & 0xFFu);
-            const std::string str = guest_string(s);
+            const std::string str = safe_guest_string(s, "strchr");
             const size_t at = str.find(c);
             if (at != std::string::npos) return s + static_cast<uint32_t>(at);
             return c == 0 ? s + static_cast<uint32_t>(str.size()) : 0u;
@@ -4659,15 +4957,15 @@ private:
         import_handlers_["strrchr"] = [this] {
             const uint32_t s = arg(0);
             const char c = static_cast<char>(arg(1) & 0xFFu);
-            const std::string str = guest_string(s);
+            const std::string str = safe_guest_string(s, "strrchr");
             const size_t at = str.rfind(c);
             if (at != std::string::npos) return s + static_cast<uint32_t>(at);
             return c == 0 ? s + static_cast<uint32_t>(str.size()) : 0u;
         };
         import_handlers_["strstr"] = [this] {
             const uint32_t h = arg(0);
-            const std::string hay = guest_string(h);
-            const std::string needle = guest_string(arg(1));
+            const std::string hay = safe_guest_string(h, "strstr");
+            const std::string needle = safe_guest_string(arg(1), "strstr");
             const size_t at = hay.find(needle);
             return at == std::string::npos ? 0u : h + static_cast<uint32_t>(at);
         };
@@ -4880,6 +5178,17 @@ private:
         // ---------------- time / scheduling -----------------------------
         import_handlers_["gettimeofday"] = [this] { return imp_gettimeofday(); };
         import_handlers_["clock_gettime"] = [this] { return imp_clock_gettime(); };
+        // POSIX 48-bit LCG. The engine seeds the course randomiser with
+        // srand48 and reads lrand48, so "return 0" would pin every game to the
+        // same level order.
+        import_handlers_["srand48"] = [this] {
+            drand48_state_ = ((static_cast<uint64_t>(arg(0)) & 0xFFFFFFFFull) << 16) | 0x330Eull;
+            return 0u;
+        };
+        import_handlers_["lrand48"] = [this] {
+            drand48_state_ = (drand48_state_ * 0x5DEECE66Dull + 0xBull) & 0xFFFFFFFFFFFFull;
+            return static_cast<uint32_t>(drand48_state_ >> 17);
+        };
         import_handlers_["time"] = [this] {
             const uint32_t out = arg(0);
             const uint32_t now = static_cast<uint32_t>(::time(nullptr));
@@ -4992,13 +5301,141 @@ private:
             const char* s = ::strerror(static_cast<int>(arg(0)));
             return s ? guest_str(s) : 0u;
         };
+
+        // printf-family formatting has to be rewritten against guest varargs:
+        // a host vsnprintf() would follow 32-bit guest pointers as if they were
+        // host addresses. sprintf/snprintf are what Tcl uses for number and
+        // list formatting during startup.
+        import_handlers_["sprintf"] = [this] {
+            const uint32_t dst = arg(0);
+            if (!dst) return 0u;
+            const std::string fmt = safe_guest_string(arg(1), "sprintf");
+            uint32_t sp = 0;
+            emu_.reg_read(UC_ARM_REG_SP, sp);
+            size_t index = 0;
+            auto next = [&]() -> uint32_t {
+                uint32_t v = 0;
+                if (index == 0) v = arg(2);
+                else if (index == 1) v = arg(3);
+                else v = emu_.read_u32(sp + static_cast<uint32_t>((index - 2) * 4));
+                ++index;
+                return v;
+            };
+            const std::string out = format_guest(fmt, next);
+            emu_.write(dst, out.c_str(), out.size() + 1);
+            return static_cast<uint32_t>(out.size());
+        };
+        import_handlers_["snprintf"] = [this] {
+            const uint32_t dst = arg(0);
+            const uint32_t cap = arg(1);
+            if (!dst || cap == 0) return 0u;
+            const std::string fmt = safe_guest_string(arg(2), "snprintf");
+            uint32_t sp = 0;
+            emu_.reg_read(UC_ARM_REG_SP, sp);
+            size_t index = 0;
+            auto next = [&]() -> uint32_t {
+                uint32_t v = 0;
+                if (index == 0) v = arg(3);
+                else v = emu_.read_u32(sp + static_cast<uint32_t>((index - 1) * 4));
+                ++index;
+                return v;
+            };
+            std::string out = format_guest(fmt, next);
+            const uint32_t written = static_cast<uint32_t>(
+                    std::min<size_t>(out.size(), static_cast<size_t>(cap) - 1));
+            emu_.write(dst, out.c_str(), written);
+            const uint8_t zero = 0;
+            emu_.write(dst + written, &zero, 1);
+            return static_cast<uint32_t>(out.size());
+        };
         import_handlers_["getcwd"] = [this] {
             const uint32_t buf = arg(0);
             const size_t size = static_cast<size_t>(arg(1));
             if (!buf || size < 2) return 0u;
-            const char* cwd = "/";
-            emu_.write(buf, cwd, 2);
+            const std::string cwd = guest_cwd_.empty() ? "/" : guest_cwd_;
+            const size_t n = std::min(cwd.size() + 1, size);
+            emu_.write(buf, cwd.c_str(), n);
+            if (n < size) {
+                const uint8_t zero = 0;
+                emu_.write(buf + static_cast<uint32_t>(n), &zero, 1);
+            }
             return buf;
+        };
+        import_handlers_["chdir"] = [this] {
+            const std::string raw = safe_guest_string(arg(0), "chdir");
+            const std::string path = translate_path(raw, "chdir");
+            struct stat st = {};
+            if (::stat(path.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+                LOGW("chdir(%s) -> %s failed", raw.c_str(), path.c_str());
+                return static_cast<uint32_t>(-1);
+            }
+            guest_cwd_ = path;
+            LOGI("chdir(%s) -> %s", raw.c_str(), guest_cwd_.c_str());
+            return 0u;
+        };
+
+        // printf family. The format string and every %s argument come from
+        // guest memory, so each one is rewritten before the host logger sees
+        // it. This is also the only way to surface a Tcl/engine error message
+        // that would otherwise be lost on the guest's stderr.
+        auto guest_varargs = [this](size_t first_reg, uint32_t& sp) {
+            emu_.reg_read(UC_ARM_REG_SP, sp);
+            return [this, first_reg, &sp, index = size_t{0}]() mutable -> uint32_t {
+                uint32_t v = 0;
+                if (first_reg + index < 4) {
+                    v = arg(static_cast<int>(first_reg + index));
+                } else {
+                    v = emu_.read_u32(sp + static_cast<uint32_t>(
+                            (first_reg + index - 4) * 4));
+                }
+                ++index;
+                return v;
+            };
+        };
+        import_handlers_["printf"] = [this, guest_varargs] {
+            uint32_t sp = 0;
+            const std::string fmt = safe_guest_string(arg(0), "printf");
+            const std::string out = format_guest(fmt, guest_varargs(1, sp));
+            LOGI("guest printf: %s", out.c_str());
+            return static_cast<uint32_t>(out.size());
+        };
+        import_handlers_["fprintf"] = [this, guest_varargs] {
+            uint32_t sp = 0;
+            const std::string fmt = safe_guest_string(arg(1), "fprintf");
+            const std::string out = format_guest(fmt, guest_varargs(2, sp));
+            LOGW("guest fprintf: %s", out.c_str());
+            return static_cast<uint32_t>(out.size());
+        };
+        auto guest_va_list = [this](uint32_t va) {
+            return [this, va, index = size_t{0}]() mutable -> uint32_t {
+                const uint32_t v = emu_.read_u32(va + static_cast<uint32_t>(index * 4));
+                ++index;
+                return v;
+            };
+        };
+        import_handlers_["vprintf"] = [this, guest_va_list] {
+            const std::string fmt = safe_guest_string(arg(0), "vprintf");
+            const std::string out = format_guest(fmt, guest_va_list(arg(1)));
+            LOGI("guest vprintf: %s", out.c_str());
+            return static_cast<uint32_t>(out.size());
+        };
+        import_handlers_["vfprintf"] = [this, guest_va_list] {
+            const std::string fmt = safe_guest_string(arg(1), "vfprintf");
+            const std::string out = format_guest(fmt, guest_va_list(arg(2)));
+            LOGW("guest vfprintf: %s", out.c_str());
+            return static_cast<uint32_t>(out.size());
+        };
+        import_handlers_["asprintf"] = [this, guest_varargs] {
+            const uint32_t outpp = arg(0);
+            if (!outpp) return static_cast<uint32_t>(-1);
+            uint32_t sp = 0;
+            const std::string fmt = safe_guest_string(arg(1), "asprintf");
+            const std::string out = format_guest(fmt, guest_varargs(2, sp));
+            const uint32_t at = guest_alloc(out.size() + 1);
+            if (!at) return static_cast<uint32_t>(-1);
+            emu_.write(at, out.c_str(), out.size() + 1);
+            emu_.write_u32(outpp, at);
+            return static_cast<uint32_t>(out.size());
         };
         import_handlers_["fcntl"] = [this] {
             const int fd = host_fd(arg(0));
@@ -5029,13 +5466,16 @@ private:
         import_handlers_["__statfs"] = [this] { return imp_statfs(); };
         import_handlers_["access"]  = [this] {
             const std::string p = translate_path(guest_string(arg(0)), "access");
-            return ::access(p.c_str(), static_cast<int>(arg(1))) == 0 ? 0u
-                                                                      : static_cast<uint32_t>(-1);
+            if (::access(p.c_str(), static_cast<int>(arg(1))) == 0) return 0u;
+            set_guest_errno_from_host();
+            return static_cast<uint32_t>(-1);
         };
         import_handlers_["faccessat"] = [this] {
             const std::string p = translate_path(guest_string(arg(1)), "faccessat");
-            return ::faccessat(static_cast<int>(arg(0)), p.c_str(), static_cast<int>(arg(2)), 0) == 0
-                       ? 0u : static_cast<uint32_t>(-1);
+            if (::faccessat(static_cast<int>(arg(0)), p.c_str(),
+                            static_cast<int>(arg(2)), 0) == 0) return 0u;
+            set_guest_errno_from_host();
+            return static_cast<uint32_t>(-1);
         };
         import_handlers_["unlink"] = [this] {
             return ::unlink(translate_path(guest_string(arg(0)), "unlink").c_str()) == 0
@@ -5145,8 +5585,15 @@ private:
         import_handlers_["__assert"] = [this] { return imp_assert2(); };
         import_handlers_["sysconf"] = [this] { return imp_sysconf(); };
         import_handlers_["getenv"] = [this] {
-            LOGI("getenv(%s) -> (unset)", guest_string(arg(0)).c_str());
+            LOGI("getenv(%s) -> (unset)", safe_guest_string(arg(0), "getenv").c_str());
             return 0u;
+        };
+        import_handlers_["setlocale"] = [this] {
+            if (!arg(1)) return guest_str("C");
+            const std::string requested = safe_guest_string(arg(1), "setlocale");
+            LOGI("setlocale(%d, \"%s\") -> C", static_cast<int>(arg(0)),
+                 requested.c_str());
+            return guest_str(requested.empty() ? "C" : requested);
         };
         import_handlers_["setenv"] = [] { return 0u; };
         import_handlers_["getpid"] = [] { return static_cast<uint32_t>(::getpid()); };
@@ -5162,14 +5609,14 @@ private:
         import_handlers_["__aeabi_atexit"] = [] { return 0u; };
         import_handlers_["fwide"] = [] { return 0u; };
         import_handlers_["strncasecmp"] = [this] {
-            const std::string a = guest_string(arg(0));
-            const std::string b = guest_string(arg(1));
+            const std::string a = safe_guest_string(arg(0), "strncasecmp");
+            const std::string b = safe_guest_string(arg(1), "strncasecmp");
             return static_cast<uint32_t>(::strncasecmp(a.c_str(), b.c_str(), arg(2)));
         };
         import_handlers_["strpbrk"] = [this] {
             const uint32_t s = arg(0);
-            const std::string hay = guest_string(s);
-            const std::string set = guest_string(arg(1));
+            const std::string hay = safe_guest_string(s, "strpbrk");
+            const std::string set = safe_guest_string(arg(1), "strpbrk");
             const size_t at = hay.find_first_of(set);
             return at == std::string::npos ? 0u : s + static_cast<uint32_t>(at);
         };
@@ -5521,7 +5968,15 @@ private:
         return 0;
     }
 
-    uint32_t imp_strlen() { return static_cast<uint32_t>(guest_strlen(arg(0))); }
+    uint32_t imp_strlen() {
+        const uint32_t a = arg(0);
+        uint8_t probe = 0;
+        if (!a || !emu_.read(a, &probe, 1)) {
+            warn_guest_pointer("strlen", a);
+            return 0u;
+        }
+        return static_cast<uint32_t>(guest_strlen(a));
+    }
 
     uint32_t imp_strcpy() {
         const uint32_t dst = arg(0), src = arg(1);
@@ -5533,8 +5988,8 @@ private:
     }
 
     uint32_t imp_strcmp() {
-        const std::string a = guest_string(arg(0));
-        const std::string b = guest_string(arg(1));
+        const std::string a = safe_guest_string(arg(0), "strcmp");
+        const std::string b = safe_guest_string(arg(1), "strcmp");
         return static_cast<uint32_t>(std::strcmp(a.c_str(), b.c_str()));
     }
 
@@ -6112,6 +6567,8 @@ private:
     std::vector<StubSlot> slots_;
     std::vector<std::function<uint32_t()>> callbacks_;
     std::unordered_map<std::string, uint32_t> import_slots_;
+    std::unordered_map<std::string, uint32_t> interned_strings_;
+    int guest_pointer_warnings_ = 0;
     std::unordered_map<uint32_t, void*> refs_;
     std::unordered_map<void*, uint32_t> ref_reverse_;
     uint32_t next_ref_ = 0x00010000;
@@ -6125,7 +6582,9 @@ private:
 
     uint32_t strtok_last_ = 0;      // state of the emulated strtok()
     uint32_t stack_guard_ = 0;      // guest word behind __stack_chk_guard
-    uint32_t errno_cell_ = 0;       // guest word behind __errno
+    uint32_t   errno_cell_ = 0;     // guest word behind __errno
+    uint64_t   drand48_state_ = 0x1234ABCD330Eull;   // POSIX 48-bit LCG state
+    uint32_t   frames_ = 0;         // guest frames presented (eglSwapBuffers)
     uint32_t return_gadget_ = 0;    // guest `mov r0,#0 ; ret` trampoline
     bool     redirected_ = false;   // a handler already set PC itself
 
@@ -6160,9 +6619,11 @@ private:
 
     // host graphics
     void* egl_lib_ = nullptr;
+    void* gles1_lib_ = nullptr;             // GLES1 fixed-function entry points
     void* gles_lib_ = nullptr;
     ANativeWindow* host_window_ = nullptr;
-    std::unordered_map<std::string, void*> host_syms_;
+    std::unordered_map<std::string, void*>    host_syms_;
+
     uint32_t swap_count_ = 0;
     uint32_t egl_window_surfaces_ = 0;
     std::map<std::string, uint32_t> entry_points_;

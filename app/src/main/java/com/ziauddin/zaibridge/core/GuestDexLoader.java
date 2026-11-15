@@ -1,5 +1,6 @@
 package com.ziauddin.zaibridge.core;
 
+import android.content.Context;
 import android.util.Log;
 
 import java.io.File;
@@ -90,6 +91,54 @@ public final class GuestDexLoader extends DexClassLoader {
         } catch (Throwable t) {
             Log.e(TAG, "bridge alias dependency copy failed: " + fileName, t);
         }
+    }
+
+    /**
+     * Loads the bundled legacy runtime JARs as a parent-first class loader.
+     *
+     * <p>The assets are dex archives (a jar containing {@code classes.dex}), not
+     * plain {@code .class} bundles, because {@link DexClassLoader} only opens
+     * dex. They are copied once into the code cache and marked read-only: ART
+     * refuses a writable dex on Android 14+.
+     *
+     * @return the legacy loader, or {@code hostParent} when no assets ship
+     */
+    public static ClassLoader legacyParent(Context ctx, ClassLoader hostParent) {
+        final File dir = new File(ctx.getCodeCacheDir(), "legacy");
+        if (!dir.isDirectory() && !dir.mkdirs()) return hostParent;
+
+        final StringBuilder classPath = new StringBuilder();
+        try {
+            final String[] names = ctx.getAssets().list("runtime/legacy");
+            if (names != null) {
+                for (String name : names) {
+                    if (!name.endsWith(".jar")) continue;
+                    File target = new File(dir, name);
+                    if (!target.isFile() || target.length() == 0) {
+                        try (InputStream in = ctx.getAssets().open("runtime/legacy/" + name);
+                             OutputStream out = new FileOutputStream(target)) {
+                            byte[] buf = new byte[64 * 1024];
+                            int n;
+                            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                        }
+                    }
+                    if (!target.setReadOnly()) {
+                        Log.w(TAG, "legacy jar could not be made read-only: " + name);
+                    }
+                    if (classPath.length() > 0) classPath.append(File.pathSeparatorChar);
+                    classPath.append(target.getAbsolutePath());
+                    Log.i(TAG, "legacy runtime available: " + name
+                            + " (" + target.length() + " bytes)");
+                }
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "legacy runtime extraction failed", t);
+            return hostParent;
+        }
+
+        if (classPath.length() == 0) return hostParent;
+        return new DexClassLoader(classPath.toString(), dir.getAbsolutePath(),
+                null, hostParent);
     }
 
     /** Absolute path of libwrapper.so inside the installed APK's lib dir. */

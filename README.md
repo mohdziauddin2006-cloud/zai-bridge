@@ -172,7 +172,12 @@ driver bound to the Activity's window.
   client-array staging at draw time) and ES 2.0/3.0 (`glVertexAttribPointer`,
   `glDrawElements`, `glTexImage2D`, `glBufferData`, `glGenTextures`,
   `glBindTexture`, FBOs, shaders, uniforms). Every guest pointer is copied into a
-  host buffer; no 32-bit address ever reaches the driver.
+  host buffer; no 32-bit address ever reaches the driver. Entry points are
+  resolved from `libGLESv1_CM.so` first: a legacy engine has a GLES1 context
+  current, and the fixed-function calls do not exist in `libGLESv2.so` at all.
+  `glEnableClientState`/`glDisableClientState` are forwarded as well as
+  recorded — the driver decides which arrays a draw consumes, and a draw whose
+  arrays were never enabled is discarded ("no data bound to the command").
 * **`libandroid`** — `ALooper_*`, `AAssetManager_*` / `AAsset_*`,
   `AConfiguration_*`, `AInputQueue_*` and the `AInputEvent`/`AKeyEvent`/
   `AMotionEvent` getters, so native input and asset loops work.
@@ -247,24 +252,56 @@ genuine, unmodified F-Droid build **Tux Rider 1.0.9**
 | No `IllegalStateException: No activity` | yes — none in the run |
 | Guest `onCreate` executed its own code | yes — `System.loadLibrary("tuxrider")` served by the bridge, `NativeLib` initialised |
 | ARM32 payload mapped and relocated | yes — 3693 relocations, 0 unresolved, `JNI_OnLoad`, `RegisterNatives` for `resize(II)V` / `render(IIDIZZ)I` |
-| Guest's own renderer drives the loop | yes — 258 `native render` downcalls in 5.1 s (~50/s) on `GLThread` |
+| Guest's own renderer drives the loop | yes — a continuous `NativeLib.render` call chain on `GLThread`, ~17 frames/s |
 | Guest surface handed to the core | yes — `surface holder hooked on com.drodin.tuxrider.MainView` |
 | Touch reaches the guest window | yes — injected `input tap 540 1200` and `input swipe 300 1200 800 1200` both logged `guest input ACTION_DOWN @ 540,1200` / `@ 300,1200` inside the guest's Activity window; process survives |
-| `eglSwapBuffers` frames presented | **no** |
-| Guest `resize` completes | **no** |
+| Guest `resize` completes | yes — returns after loading every course, font and HUD texture; no abort |
+| `eglSwapBuffers` frames presented | yes — 240+ frames in 18 s (~17 fps), each logged as `eglSwapBuffers: frame N presented`; the guest draws splash → menu |
+| Guest faults | 0 `UC_ERR_*_UNMAPPED`, 0 dropped draws (`no data bound`) |
+| Screenshot | yes — `build/render_verified.png`, 348 KB: Tux Rider splash logo, snow particles and the menu text |
 
-**Where it stops:** inside the guest's own SDL initialisation the emulated
-`resize` aborts with `UC_ERR_READ_UNMAPPED` (`pc=40094bd2`, after a `strcmp`
-import). Because that init never completes, the engine never issues
-`eglSwapBuffers`, so nothing is presented yet even though the renderer callback
-loop is live. This is a gap in the emulated bionic surface (the payload expects
-more of `strcmp`/stdio/`__sF` semantics than the bridge provides), not in the
-Activity virtualization: the window, input channel and lifecycle are real.
+**Four defects stood between the guest and a presented frame**, all fixed in
+`wrapper.cpp`:
+
+1. **Instruction-set state lost on every chunk restart.** `uc_emu_start()` (and
+   `uc_reg_write(PC, …)`) derives ARM/Thumb from bit 0 of the address
+   (`arm_cpu_set_pc`). The interpreter restarts its `uc_emu_start` in 4 M
+   instruction chunks at an even PC, so each restart silently dropped a Thumb
+   guest into ARM state and the next block decoded as an invalid ARM
+   instruction. The restart now carries CPSR.T in bit 0.
+2. **GLES1 entry points were resolved from `libGLESv2.so`.** They are not
+   exported there, so `glVertexPointer`, `glMatrixMode`, `glOrthof`,
+   `glAlphaFunc` … were NULL and every fixed-function call vanished. They now
+   come from `libGLESv1_CM.so`.
+3. **`glEnableClientState` was recorded but never forwarded**, so draws were
+   issued with no enabled array and the driver dropped them.
+4. **`glTexImage2D` was marshalled one argument off** (width read as height,
+   height read as border = 0), so every texture upload was rejected with
+   `GL_INVALID_VALUE`.
+
+Getting `resize` to finish also required publishing host `errno` into the
+guest cell on failed `stat`/`access`/`fopen`: the engine probes for its
+optional `tuxracerConfig` with `stat` and treats any `errno != ENOENT` as fatal,
+so a missing file (errno left at 0) aborted initialisation through
+`handle_system_error` → `winsys_exit`.
+
+**The frame loop is the guest's own:** its `MainView$MainRenderer.onDrawFrame`
+calls `NativeLib.render(IIDIZZ)I` on the `GLThread`, and the guest's own
+`javax/microedition/khronos/egl` helper (its `MyGLSurfaceView`, not the
+framework's) swaps immediately afterwards. The payload imports no EGL symbols
+at all, so the bridge never sees the swap call itself; `eglSwapBuffers: frame N
+presented` is logged at that frame boundary.
 
 ## Current limitations
 
-* **No frames from this payload yet.** See above; the Activity, lifecycle,
-  surface, input channel and renderer loop are verified, presentation is not.
+* **Orientation is not inherited from the guest manifest.** This payload
+  declares `android:screenOrientation="landscape"`; the proxy Activity is the
+  one the framework launched, so the device stays in portrait and the
+  landscape-designed menu is cropped (the splash still renders and swaps).
+* **Menu input is unverified.** The splash → menu transition happens by
+  itself (game mode 0 → 1); a click that selects a course has not been driven,
+  so the 3D race path (`render_course`, the racing mode, the course-load Tcl
+  scripts) is still untested.
 * **Runtime bundle is small.** `assets/runtime/` holds the NDK's 32-bit
   compatibility libraries (`libc`, `libm`, `libGLESv1_CM`, `libGLESv2`,
   `libEGL`, `libOpenSLES`, `libandroid`, `libz`, `libdl`, `liblog`,
@@ -277,8 +314,10 @@ Activity virtualization: the window, input channel and lifecycle are real.
   buffer-queue callbacks from the host thread are accepted and ignored.
 * **`ALooper_addFd` callbacks** cannot be invoked from the host looper; the fd is
   registered for polling only.
-* **Some libc surface remains stubbed** (`printf`/`sprintf` families, `qsort`,
-  `mktime`, socket setup); each is logged once as `unimplemented import`.
+* **Some libc surface remains stubbed** (`qsort`, `mktime`, `uname`,
+  `realpath`, `getpwuid`, socket setup); each is logged once as
+  `unimplemented import`. `srand48`/`lrand48` and `glClearStencil` are
+  implemented because this payload uses them.
 * **Single session per process.** A second launch reports
   `SESSION_ALREADY_RUNNING`; teardown is not implemented.
 * **Performance.** Interpretation, not JIT.

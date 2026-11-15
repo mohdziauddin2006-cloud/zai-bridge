@@ -2,9 +2,11 @@ package com.ziauddin.zaibridge.core;
 
 import android.app.Activity;
 import android.app.Instrumentation;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.os.Bundle;
+import android.os.IBinder;
 import android.util.Log;
 
 import com.ziauddin.zaibridge.proxy.ProxyGameActivity;
@@ -75,7 +77,8 @@ public final class BridgeInstrumentation extends Instrumentation {
             if (existing instanceof BridgeInstrumentation) return true;
 
             BridgeInstrumentation hook = new BridgeInstrumentation(
-                    existing instanceof Instrumentation ? (Instrumentation) existing : null);
+                    existing instanceof Instrumentation
+                            ? (Instrumentation) existing : new Instrumentation());
             field.set(thread, hook);
             Log.i(TAG, "ActivityThread.mInstrumentation -> BridgeInstrumentation "
                     + "(delegate=" + (hook.delegate != null) + ")");
@@ -138,6 +141,66 @@ public final class BridgeInstrumentation extends Instrumentation {
             GuestLauncher.hookSurface(activity);
             GuestLauncher.probeInput(activity);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Multi-Activity guest apps
+    // ------------------------------------------------------------------
+
+    /**
+     * Rewrites a guest's {@code startActivity} into another launch of the
+     * proxy, carrying the new target class in {@code GUEST_ACTIVITY_CLASS}.
+     *
+     * <p>{@code Instrumentation.execStartActivity} is a hidden framework
+     * method (it does not exist in the public SDK stubs), so this override is
+     * declared without {@code @Override} and delegates through reflection.
+     * Dynamic dispatch still reaches it, because the runtime superclass method
+     * has exactly this signature.
+     */
+    public Instrumentation.ActivityResult execStartActivity(
+            Context who, IBinder contextThread, IBinder token, Activity target,
+            Intent intent, int requestCode, Bundle options) {
+        final Intent rewritten = rewriteGuestIntent(target, intent);
+        final Intent effective = rewritten != null ? rewritten : intent;
+        Instrumentation base = delegate;
+        if (base == null || base == this) base = new Instrumentation();
+        try {
+            Method method = Instrumentation.class.getDeclaredMethod("execStartActivity",
+                    Context.class, IBinder.class, IBinder.class, Activity.class,
+                    Intent.class, int.class, Bundle.class);
+            method.setAccessible(true);
+            return (Instrumentation.ActivityResult) method.invoke(base, who, contextThread,
+                    token, target, effective, requestCode, options);
+        } catch (Throwable t) {
+            Log.e(TAG, "execStartActivity: base delegate unavailable", t);
+            return null;
+        }
+    }
+
+    /**
+     * @return a copy of {@code intent} that launches ProxyGameActivity for the
+     *         requested class, or null when the intent should be left alone.
+     */
+    private static Intent rewriteGuestIntent(Activity target, Intent intent) {
+        if (intent == null || !isGuest(target)) return null;
+        ComponentName component = intent.getComponent();
+        if (component == null) return null;
+
+        final String pkg = GuestLauncher.getGuestPackage();
+        final String dir = GuestLauncher.getGameDir();
+        final Context host = BridgeApplication.get();
+        if (pkg == null || dir == null || host == null) return null;
+        if (!pkg.equals(component.getPackageName())) return null;
+        if (ProxyGameActivity.class.getName().equals(component.getClassName())) return null;
+
+        Intent out = new Intent(intent);   // preserves every extra and flag
+        out.setComponent(new ComponentName(host.getPackageName(),
+                ProxyGameActivity.class.getName()));
+        out.putExtra(GuestLauncher.EXTRA_GAME_DIR, dir);
+        out.putExtra(GuestLauncher.EXTRA_GUEST_ACTIVITY, component.getClassName());
+        Log.i(TAG, "execStartActivity: " + component.flattenToShortString()
+                + " -> ProxyGameActivity (guest class preserved in extras)");
+        return out;
     }
 
     // ------------------------------------------------------------------
