@@ -131,9 +131,15 @@ public final class BridgeInstrumentation extends Instrumentation {
         final boolean guest = isGuest(activity);
         if (ctx != null && guest) {
             GuestLauncher.attachGuestContext(activity, ctx);
+            // Before performCreate: the guest's onCreate may inflate the very
+            // SurfaceView whose dimensions a late rotation would invalidate.
+            GuestLauncher.applyGuestOrientation(activity);
         }
         super.callActivityOnCreate(activity, icicle);
         if (ctx != null && guest) {
+            // A guest that probed the display size in onCreate saw the pre-rotation
+            // orientation and may have asked for it. The imported manifest wins.
+            GuestLauncher.confirmGuestOrientation(activity);
             // The guest inflated its view tree during onCreate; the surface can
             // be handed to the core from the next layout pass onwards. Input is
             // dispatched by the framework into the same window, so the probe

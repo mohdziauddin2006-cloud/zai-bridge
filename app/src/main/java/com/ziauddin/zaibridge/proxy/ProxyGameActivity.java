@@ -8,6 +8,7 @@ import android.view.Window;
 import android.view.WindowManager;
 import android.widget.TextView;
 
+import com.ziauddin.zaibridge.core.GameOrientation;
 import com.ziauddin.zaibridge.core.GuestLauncher;
 
 import java.io.File;
@@ -40,6 +41,11 @@ public class ProxyGameActivity extends Activity {
                 : getIntent().getStringExtra(GuestLauncher.EXTRA_GAME_DIR);
         String label = getIntent() == null ? null
                 : getIntent().getStringExtra(GuestLauncher.EXTRA_GAME_LABEL);
+
+        // The guest's declared orientation has to be in effect before this
+        // window's surface is created, or a landscape game is letterboxed into
+        // a portrait surface for its whole lifetime.
+        GameOrientation.apply(this, dir == null ? null : new File(dir));
 
         Log.e(TAG, "proxy Activity is visible: guest was not attached (dir=" + dir + ")");
 

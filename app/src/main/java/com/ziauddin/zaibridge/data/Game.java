@@ -24,6 +24,8 @@ public final class Game {
     public final String packageName;
     public final String label;
     public final String launcherActivity;
+    /** The launch Activity's {@code android:screenOrientation}, as declared. */
+    public final String orientation;
     public final String iconFile;
     public final String obbFile;
     public final String abi;
@@ -31,11 +33,14 @@ public final class Game {
     public final long sizeBytes;
 
     public Game(String directoryName, String packageName, String label, String launcherActivity,
-                String iconFile, String obbFile, String abi, long importedAt, long sizeBytes) {
+                String orientation, String iconFile, String obbFile, String abi,
+                long importedAt, long sizeBytes) {
         this.directoryName = directoryName;
         this.packageName = packageName;
         this.label = label;
         this.launcherActivity = launcherActivity;
+        this.orientation = orientation == null || orientation.isEmpty()
+                ? "unspecified" : orientation;
         this.iconFile = iconFile;
         this.obbFile = obbFile;
         this.abi = abi;
@@ -53,6 +58,7 @@ public final class Game {
         o.put("package", packageName);
         o.put("label", label);
         o.put("launcher", launcherActivity);
+        o.put("orientation", orientation);
         o.put("icon", iconFile);
         o.put("obb", obbFile);
         o.put("abi", abi);
@@ -75,6 +81,9 @@ public final class Game {
                     o.optString("package"),
                     o.optString("label", o.optString("package")),
                     o.optString("launcher"),
+                    // Imports made before orientation was recorded have no key;
+                    // the guest keeps the device's orientation, as they did then.
+                    o.optString("orientation", "unspecified"),
                     o.optString("icon"),
                     o.optString("obb"),
                     o.optString("abi", "armeabi-v7a"),

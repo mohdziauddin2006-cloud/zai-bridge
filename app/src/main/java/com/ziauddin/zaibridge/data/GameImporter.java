@@ -17,6 +17,7 @@ import android.provider.OpenableColumns;
 import android.util.Log;
 
 import com.ziauddin.zaibridge.R;
+import com.ziauddin.zaibridge.core.GameOrientation;
 
 import java.io.BufferedOutputStream;
 import java.io.File;
@@ -89,6 +90,19 @@ public final class GameImporter {
             String label = safeLabel(pm, app, info.packageName);
             String launcher = pickLauncherActivity(info);
 
+            // The platform has just parsed the imported APK's AndroidManifest.xml
+            // for us: GET_ACTIVITIES populates every <activity> with its
+            // android:screenOrientation. Recording the launch Activity's value
+            // is what lets the host window match the guest at launch.
+            ActivityInfo launchActivity = findActivity(info, launcher);
+            String orientation = GameOrientation.nameOf(launchActivity == null
+                    ? ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                    : launchActivity.screenOrientation);
+            Log.i(TAG, "guest manifest: launcher=" + launcher
+                    + " screenOrientation=" + (launchActivity == null
+                            ? "<not parsed>" : String.valueOf(launchActivity.screenOrientation))
+                    + " -> " + orientation);
+
             step(progress, "Extracting icon");
             File icon = new File(staging, "icon.png");
             writeIcon(pm, app, label, icon);
@@ -120,6 +134,7 @@ public final class GameImporter {
                     info.packageName,
                     label,
                     launcher,
+                    orientation,
                     "icon.png",
                     obbName,
                     "armeabi-v7a",
@@ -209,6 +224,16 @@ public final class GameImporter {
             // Unparseable resource table; the package name still identifies it.
         }
         return fallback;
+    }
+
+    /** The parsed manifest entry for {@code name}, or null when unavailable. */
+    private static ActivityInfo findActivity(PackageInfo info, String name) {
+        ActivityInfo[] activities = info.activities;
+        if (activities == null || name == null) return null;
+        for (ActivityInfo activity : activities) {
+            if (activity.name != null && activity.name.equals(name)) return activity;
+        }
+        return null;
     }
 
     /**

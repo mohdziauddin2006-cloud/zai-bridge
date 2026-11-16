@@ -24,7 +24,7 @@ Engine translation core that executes the original ARM32 libraries inside the
         │      │                              FragmentController, InputChannel — all native        │
         │      ▼                                        ▼                                        │
         │  guest Activity (real lifecycle, real input, own GLSurfaceView renderer)                │
-        │      │  eglSwapBuffers / RegisterNatives                                                │
+        │      │  eglSwapBuffers (payload + Java EGL hook) / RegisterNatives                       │
         │      ▼                                                                                  │
         │  libwrapper.so ─────► libunicorn.a (static)                                             │
         │      maps ELF32 payloads, relocates, runs DT_INIT, binds Java_* / RegisterNatives,      │
@@ -50,6 +50,7 @@ zai-bridge/
 │       │   ├── CMakeLists.txt           # translating vs passthrough backend per ABI
 │       │   ├── wrapper.cpp              # the translation core (ELF loader + JNI/EGL/GLES/OpenSL bridge)
 │       │   ├── wrapper_passthrough.cpp  # 32-bit host backend (no translation)
+│       │   ├── egl_swap_hook.cpp        # RegisterNatives hook at the Java EGL boundary
 │       │   └── prebuilt/<abi>/          # libunicorn.a + Unicorn headers (arm64-v8a, x86_64)
 │       ├── java/com/ziauddin/zaibridge/
 │       │   ├── MainActivity.java        # all-files access, APK/OBB pickers, grid
@@ -57,7 +58,9 @@ zai-bridge/
 │       │   ├── core/
 │       │   │   ├── BridgeApplication.java    # attachBaseContext: hidden-API exemption + hook install
 │       │   │   ├── BridgeInstrumentation.java# mInstrumentation replacement (Activity virtualization)
-│       │   │   ├── GuestLauncher.java       # session open, guest instantiation, surface + input wiring
+│       │   │   ├── GameOrientation.java      # guest screenOrientation -> host window
+│       │   │   ├── EglSwapHook.java          # Java EGL10/EGL14 frame boundary
+│       │   │   ├── GuestLauncher.java        # session open, guest instantiation, surface + input wiring
 │       │   │   ├── GuestContext.java         # merged assets, redirected files/cache/obb
 │       │   │   ├── GuestDexLoader.java       # guest dex + System.loadLibrary served by the bridge
 │       │   │   ├── HiddenApi.java            # VMRuntime.setHiddenApiExemptions (double reflection)
@@ -88,7 +91,7 @@ launcher never sees a half-imported game:
 files/games/<package>/
   game.apk             original archive (DexClassLoader source, read-only)
   icon.png             icon rendered from the guest manifest
-  meta.json            label, package, launcher, ABI, OBB name, timestamp, size
+  meta.json            label, package, launcher, orientation, ABI, OBB name, timestamp, size
   payload/
     libfoo32.so        every lib/armeabi-v7a/*.so, renamed with a 32 tag
   native/              per-name bridge aliases for System.loadLibrary
@@ -96,6 +99,8 @@ files/games/<package>/
 ```
 
 * `.so` extraction accepts `lib/armeabi-v7a/` and the ancient `lib/arm/`.
+* `meta.json` also records the launch Activity's `screenOrientation`, so the host
+  window can match the guest at launch (see *Guest screen orientation* below).
 * The `libfoo.so → libfoo32.so` rename is the **only** contract between the
   ingestion engine and the native core; no game or symbol name is hardcoded.
 
@@ -115,7 +120,7 @@ The container now lets Android do the attaching:
    and replaces `ActivityThread.mInstrumentation` with
    `BridgeInstrumentation`.
 2. **`ProxyGameActivity`** is a real `<activity>` in the manifest with
-   `hardwareAccelerated="true"`, `launchMode="singleTask"` and the full
+   `hardwareAccelerated="true"`, `launchMode="standard"` and the full
    `configChanges` set, so rotation/density/UI-mode changes are delivered to the
    guest instead of recreating it.
 3. **`BridgeInstrumentation.newActivity`** recognises a bridge launch and
@@ -142,6 +147,34 @@ Two supporting details make this work in practice:
   trampoline entry. A renderer runs on `GLThread`, not on the thread that opened
   the session, and reusing the session's `JNIEnv` aborts under CheckJNI.
 
+### Guest screen orientation
+
+Ingestion reads the launch Activity's `screenOrientation` out of the imported
+APK's manifest — `PackageManager.getPackageArchiveInfo(..., GET_ACTIVITIES)`
+parses `AndroidManifest.xml` for us and exposes the attribute as
+`ActivityInfo.screenOrientation` — and stores the manifest spelling in
+`meta.json`: `landscape`, `portrait`, `sensorLandscape`, `user`, `locked`, and
+so on. `unspecified` means "leave the device alone".
+
+The proxy is the Activity the system launched, but the *guest* owns its window,
+so the declared orientation has to be applied to the guest:
+
+1. `BridgeInstrumentation.callActivityOnCreate` calls `GameOrientation.apply`
+   **before** `Activity.performCreate`, i.e. before the guest's `onCreate`
+   inflates its `GLSurfaceView`. The display rotates first, so the surface is
+   created at the right size. `ProxyGameActivity.onCreate` does the same for the
+   fallback path and `GameHostActivity` for the direct host.
+2. A legacy game often decides its own orientation by comparing the display's
+   current width and height. While our rotation is still in flight it sees the
+   old size and asks for the old orientation, cancelling ours. So the bridge
+   re-asserts the manifest value immediately after the guest's `onCreate`
+   returns (still before the first layout pass creates a surface) and logs which
+   request it overrode. Tux Rider does exactly this: it asks for portrait when
+   it sees a portrait display.
+
+The guest may still change orientation later in its lifecycle; the bridge only
+re-asserts once, at launch.
+
 ---
 
 ## 3. The translation core
@@ -152,6 +185,26 @@ guests' `JNI_OnLoad` and returns. Nothing drives frames from the native side:
 the guest's own `GLSurfaceView.Renderer`, `NativeActivity` or SDL loop calls its
 natives from ART, and the guest's `eglSwapBuffers` is forwarded to the real
 driver bound to the Activity's window.
+
+### Frame accounting at the Java EGL boundary
+
+`wrapper.cpp` only sees a swap when the *payload* imports `eglSwapBuffers` — a
+pure NDK game. A Java `GLSurfaceView` swaps inside the framework instead, through
+`com.google.android.gles_jni.EGLImpl.eglSwapBuffers` (EGL10) or
+`android.opengl.EGL14.eglSwapBuffers` (EGL14). Both are declared `native`, so
+`egl_swap_hook.cpp` re-registers them with `RegisterNatives` and forwards to the
+real `libEGL.so`:
+
+* the native handles are read from the objects (`EGLDisplayImpl.mEGLDisplay`,
+  `EGLSurfaceImpl.mEGLSurface`, or `EGLObjectHandle.mHandle` for EGL14);
+* when a system image blocks those fields (hidden-API enforcement on Android 9+),
+  the hook swaps the **current draw surface** instead, which is the same surface
+  a `GLSurfaceView` has just made current;
+* counting, pacing and the `eglSwapBuffers: frame N presented` log now come from
+  one clock for Java and NDK renderers alike, on all four ABIs.
+
+The hook is installed from `Application.attachBaseContext`, before any Activity
+(and therefore any `GLSurfaceView`) exists.
 
 ### Guest address space
 
@@ -236,6 +289,53 @@ UNICORN_ABI=x86_64    ./vendor/build_unicorn_android.sh
 # stage prebuilt/<abi>/{lib/libunicorn.a,include/unicorn/} into app/src/main/cpp/
 ```
 
+### Signed universal APK
+
+The artifact handed to a phone is the same four-ABI APK, aligned and signed with
+a locally generated 4096-bit RSA key (the keystore stays in `build/`, which is
+not tracked):
+
+```bash
+keytool -genkeypair -keystore build/signing/zai-bridge.jks -alias zaibridge \
+  -storetype PKCS12 -keyalg RSA -keysize 4096 -validity 10000 \
+  -storepass zai-bridge -keypass zai-bridge \
+  -dname "CN=Zai-Bridge Universal, O=Zai-Bridge, C=US"
+
+BUILD_TOOLS=$ANDROID_HOME/build-tools/34.0.0
+"$BUILD_TOOLS/zipalign" -f -p 4 app/build/outputs/apk/debug/app-debug.apk \
+  build/signing/aligned.apk
+"$BUILD_TOOLS/apksigner" sign --ks build/signing/zai-bridge.jks \
+  --ks-key-alias zaibridge --ks-pass pass:zai-bridge \
+  --key-pass pass:zai-bridge --out Zai-Bridge-Universal.apk \
+  build/signing/aligned.apk
+"$BUILD_TOOLS/apksigner" verify --print-certs Zai-Bridge-Universal.apk
+```
+
+`zai-bridge/Zai-Bridge-Universal.apk` is therefore v2 + v3 signed, 4-byte
+aligned, and contains all four ABIs plus the bundled 32-bit runtime sysroot.
+
+## Install on a phone (Android 8 – 16+)
+
+1. Copy `Zai-Bridge-Universal.apk` to the phone and open it. Allow "install
+   unknown apps" for the file manager or browser when prompted; the APK carries
+   a self-signed certificate, so Play Protect may ask you to confirm. If a
+   differently signed Zai-Bridge build is already installed (for example the
+   debug APK), uninstall it first — Android refuses to replace an app with a
+   different signing key.
+2. Launch Zai-Bridge and tap **Grant access**. The launcher needs *All files
+   access* (`MANAGE_EXTERNAL_STORAGE`) to browse the phone for old APK/OBB pairs.
+3. Tap **Import game** and pick the APK. If the game ships an expansion file,
+   attach it at the next prompt; it is copied into private storage and hidden
+   from the grid.
+4. Tap the game card. The proxy Activity opens full-screen in the orientation
+   the imported manifest declares.
+5. Nothing has to be placed in `/sdcard/Android/obb`: the import keeps its OBB
+   under `files/games/<package>/obb/` and the guest sees it through its
+   redirected `obb` directory.
+
+Uninstalling Zai-Bridge removes the imports with it (`allowBackup=false`), so
+keep the original APK/OBB pair if you want to re-import later.
+
 ---
 
 ## Verification
@@ -246,7 +346,7 @@ genuine, unmodified F-Droid build **Tux Rider 1.0.9**
 
 | Check | Result |
 |---|---|
-| APK installs, 4 ABIs present | yes — `arm64-v8a`, `armeabi-v7a`, `x86_64`, `x86`, 12.3 MB |
+| APK installs, 4 ABIs present | yes — `arm64-v8a`, `armeabi-v7a`, `x86_64`, `x86`; 10.8 MB, v2 + v3 signed, 4-byte aligned |
 | `BridgeInstrumentation` installed | yes — `ActivityThread.mInstrumentation -> BridgeInstrumentation` |
 | Guest Activity natively attached | yes — `newActivity(ProxyGameActivity) -> com.drodin.tuxrider.MainActivity`, then `onResume` through `Instrumentation.callActivityOnResume` |
 | No `IllegalStateException: No activity` | yes — none in the run |
@@ -256,9 +356,12 @@ genuine, unmodified F-Droid build **Tux Rider 1.0.9**
 | Guest surface handed to the core | yes — `surface holder hooked on com.drodin.tuxrider.MainView` |
 | Touch reaches the guest window | yes — injected `input tap 540 1200` and `input swipe 300 1200 800 1200` both logged `guest input ACTION_DOWN @ 540,1200` / `@ 300,1200` inside the guest's Activity window; process survives |
 | Guest `resize` completes | yes — returns after loading every course, font and HUD texture; no abort |
-| `eglSwapBuffers` frames presented | yes — 240+ frames in 18 s (~17 fps), each logged as `eglSwapBuffers: frame N presented`; the guest draws splash → menu |
+| Guest orientation read from the manifest | yes — importer logged `launcher=com.drodin.tuxrider.MainActivity screenOrientation=0 -> landscape` and wrote `"orientation": "landscape"` to `meta.json` |
+| Orientation applied before the surface | yes — `guest orientation: manifest landscape -> setRequestedOrientation(0)` before the guest's `onCreate`; the guest's own `setRequestedOrientation(1)` was then overridden (`re-asserting manifest landscape over the guest's own request 1`); window and EGL surface came up 2204×948 |
+| `eglSwapBuffers` counted at the Java EGL10 boundary | yes — `EGL swap hooks: EGL10=yes EGL14=yes`; `eglSwapBuffers[java/EGL10]: frame 240 presented (…, 240 EGL10 / 0 EGL14)`; rendering continued with no guest fault |
 | Guest faults | 0 `UC_ERR_*_UNMAPPED`, 0 dropped draws (`no data bound`) |
-| Screenshot | yes — `build/render_verified.png`, 348 KB: Tux Rider splash logo, snow particles and the menu text |
+| Menu screenshot | yes — `build/screen_menu.png`: full landscape Tux Rider menu (logo, Training, Challenge, Preference, Credits, Help, Quit), no cropping |
+| 3D race screenshot | **not captured** in this session — see *Verification gap* |
 
 **Four defects stood between the guest and a presented frame**, all fixed in
 `wrapper.cpp`:
@@ -288,27 +391,43 @@ so a missing file (errno left at 0) aborted initialisation through
 **The frame loop is the guest's own:** its `MainView$MainRenderer.onDrawFrame`
 calls `NativeLib.render(IIDIZZ)I` on the `GLThread`, and the guest's own
 `javax/microedition/khronos/egl` helper (its `MyGLSurfaceView`, not the
-framework's) swaps immediately afterwards. The payload imports no EGL symbols
-at all, so the bridge never sees the swap call itself; `eglSwapBuffers: frame N
-presented` is logged at that frame boundary.
+framework's) swaps immediately afterwards. The payload imports no EGL symbols at
+all, so the payload-import counter in `wrapper.cpp` never fires for this game;
+the swap is counted at the Java boundary instead
+(`eglSwapBuffers[java/EGL10]: frame N presented`), which is the path the new
+hook adds.
+
+### Verification gap
+
+The 3D race screenshot (`build/screen_gameplay.png`) was **not** obtained. The
+guest's `MyGLSurfaceView.surfaceChanged` blocks its main thread until `GLThread`
+finishes the engine's `resize` (course, font and HUD loading inside Unicorn); on
+the software-GL emulator this exceeded the 5 s input-dispatch timeout, so the
+system raised an ANR on every launch. The menu nevertheless rendered and swapped
+240+ frames, but the run could not be driven past it: the test host is shared
+with another automation that repeatedly reinstalled and foregrounded an
+unrelated app, disabled this package, and closed ANR dialogs, removing the
+window in which the `Training` tap had to land.
+
+Everything above the gap — manifest orientation, pre-surface rotation, and the
+Java/native swap accounting — is verified on the device. The interactive race
+run needs hardware the harness owns exclusively, or a GPU-accelerated device.
 
 ## Current limitations
 
-* **Orientation is not inherited from the guest manifest.** This payload
-  declares `android:screenOrientation="landscape"`; the proxy Activity is the
-  one the framework launched, so the device stays in portrait and the
-  landscape-designed menu is cropped (the splash still renders and swaps).
-* **Menu input is unverified.** The splash → menu transition happens by
-  itself (game mode 0 → 1); a click that selects a course has not been driven,
-  so the 3D race path (`render_course`, the racing mode, the course-load Tcl
-  scripts) is still untested.
+* **The 3D race path is unverified.** The menu now renders in the orientation
+  its manifest declares, but selecting a course has not been driven on a device
+  the harness controls exclusively; see *Verification gap*.
+* **A guest's later orientation changes win.** The manifest orientation is
+  applied before `onCreate` and re-asserted once afterwards. A game that flips
+  the screen later in its lifecycle keeps its own choice.
 * **Runtime bundle is small.** `assets/runtime/` holds the NDK's 32-bit
   compatibility libraries (`libc`, `libm`, `libGLESv1_CM`, `libGLESv2`,
   `libEGL`, `libOpenSLES`, `libandroid`, `libz`, `libdl`, `liblog`,
   `libvulkan`, `libstdc++`, `libOpenMAXAL` for both `arm` and `x86`) plus
   `org.apache.http.legacy.jar`. Those NDK platform libraries are linker stubs,
   and `android.support.v4` / the Play APK-Expansion classes are not available
-  locally, so they are not bundled. The APK is 12.3 MB, not the 200 MB target:
+  locally, so they are not bundled. The APK is 10.8 MB, not the 200 MB target:
   padding it to a size would add nothing a guest can use.
 * **OpenSL ES is interface-complete but not exercised** by the verified payload;
   buffer-queue callbacks from the host thread are accepted and ignored.

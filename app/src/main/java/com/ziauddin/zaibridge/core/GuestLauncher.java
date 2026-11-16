@@ -163,6 +163,42 @@ public final class GuestLauncher {
     }
 
     /**
+     * Applies the orientation recorded for this import to the guest Activity.
+     *
+     * <p>Runs before {@code Activity.performCreate}, i.e. before the guest's own
+     * {@code onCreate} inflates its {@code GLSurfaceView}. That ordering is the
+     * point: a landscape game has to rotate the display before its first surface
+     * is created, otherwise the surface keeps the portrait dimensions it was
+     * born with. A guest that overrides this from its own {@code onCreate} is
+     * corrected immediately afterwards: the imported manifest is authoritative.
+     */
+    public static void applyGuestOrientation(Activity guest) {
+        GameOrientation.apply(guest, guestGameDir);
+    }
+
+    /**
+     * Re-applies the manifest orientation after the guest's {@code onCreate}.
+     *
+     * <p>A legacy game often decides its orientation by comparing the display's
+     * current width and height. With a rotation request already in flight the
+     * display is still portrait at that moment, so the guest asks for portrait
+     * and the last request wins. The declared orientation is authoritative, and
+     * this second call lands after the game's own — still before its
+     * {@code GLSurfaceView} gets a surface, which only happens on the first
+     * layout pass after {@code onResume}.
+     */
+    public static void confirmGuestOrientation(Activity guest) {
+        Game game = guestGameDir == null ? null : GameRepository.load(guestGameDir);
+        if (game == null) return;
+        int wanted = GameOrientation.constantOf(game.orientation);
+        if (wanted == android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED) return;
+        if (guest.getRequestedOrientation() == wanted) return;
+        Log.i(TAG, "guest orientation: re-asserting manifest " + game.orientation
+                + " over the guest's own request " + guest.getRequestedOrientation());
+        GameOrientation.apply(guest, game.orientation, game.label);
+    }
+
+    /**
      * Runs just before {@code Activity.performCreate}: rebases the guest on
      * {@link GuestContext} (merged assets, redirected
      * files/cache/obb), applies a legacy theme fallback and hands the

@@ -37,7 +37,11 @@ public class BridgeApplication extends Application {
         //    every proxy launch is redirected to the guest Activity.
         BridgeInstrumentation.install(base);
 
-        // 3. Unpack the bundled 32-bit runtime on a worker so first launch is
+        // 3. Put the frame counter on the Java EGL boundary as well, so a
+        //    GLSurfaceView game and a pure NDK game are accounted the same way.
+        EglSwapHook.install();
+
+        // 4. Unpack the bundled 32-bit runtime on a worker so first launch is
         //    not blocked by ~200 MB of asset I/O.
         new Thread(() -> {
             File runtime = RuntimeAssets.ensure(base);

@@ -45,6 +45,7 @@ if(ZAI_TRANSLATING_ABI)
     # payloads it maps are read per session, never compiled in.
     add_library(wrapper SHARED
         wrapper.cpp
+        egl_swap_hook.cpp
     )
 
     target_link_libraries(wrapper PRIVATE
@@ -60,8 +61,11 @@ if(ZAI_TRANSLATING_ABI)
     # dynamic symbol table: only JNI_OnLoad and the JNI thunks should be exported.
     target_link_options(wrapper PRIVATE "-Wl,--exclude-libs,ALL")
 else()
+    # The Java EGL boundary hook is backend-independent: a 32-bit phone counts
+    # frames exactly the way the 64-bit translation core does.
     add_library(wrapper SHARED
         wrapper_passthrough.cpp
+        egl_swap_hook.cpp
     )
     target_link_libraries(wrapper PRIVATE
         android

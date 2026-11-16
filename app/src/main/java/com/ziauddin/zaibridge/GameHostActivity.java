@@ -15,6 +15,7 @@ import android.view.WindowManager;
 import android.widget.ProgressBar;
 import android.widget.TextView;
 
+import com.ziauddin.zaibridge.core.GameOrientation;
 import com.ziauddin.zaibridge.core.GuestActivityHost;
 import com.ziauddin.zaibridge.core.UnicornBridge;
 import com.ziauddin.zaibridge.data.Game;
@@ -97,6 +98,8 @@ public class GameHostActivity extends Activity {
         }
         gameDir = new File(dir);
         game = GameRepository.load(gameDir);
+        // The direct host has no guest Activity to inherit the manifest from.
+        GameOrientation.apply(this, gameDir);
 
         String label = getIntent().getStringExtra(EXTRA_GAME_LABEL);
         if (label != null && !label.isEmpty()) {
