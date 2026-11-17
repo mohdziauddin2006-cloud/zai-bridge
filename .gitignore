@@ -4,6 +4,10 @@ build/
 app/build/
 local.properties
 
+# Unsigned intermediates and v4 signature sidecars
+*.unaligned.apk
+*.idsig
+
 # Android Studio / IntelliJ
 .idea/
 *.iml

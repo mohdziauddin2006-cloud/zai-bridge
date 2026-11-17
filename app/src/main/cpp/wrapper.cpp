@@ -74,6 +74,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <chrono>
+#include <mutex>
 #include <thread>
 #include <cstring>
 #include <ctime>
@@ -471,13 +472,38 @@ public:
         return uc_reg_read(uc_, reg, &v) == UC_ERR_OK;
     }
 
+    // A guest call that overran its time budget.
+    //
+    // The guest's frame is still on its own stack and the emulator registers are
+    // exactly where the last chunk stopped, so the call can be continued later
+    // instead of being lost. `saved` is the pre-call context snapshot that a
+    // normal return would have restored.
+    struct Pause {
+        bool        active = false;
+        uc_context* saved = nullptr;
+        uint32_t    entry = 0;
+        std::string what;
+    };
+
     // Enter the guest, stopping when PC reaches the return sentinel.
     //
     // AAPCS: the first four words travel in R0-R3 and everything after that is
     // pushed onto the stack at [SP], [SP+4], ... Native methods with more than
     // four parameters (and their JNIEnv*/jobject prefix) need the stack path.
+    //
+    // `budget_ms` bounds how long the calling ART thread stays inside the guest.
+    // A legacy renderer can park its UI thread on the first frame -- Tux Rider's
+    // GLSurfaceView waits inside surfaceChanged() for the GL thread to finish
+    // `resize` -- so an engine initialisation that takes seconds is reported by
+    // the system as an input-dispatch ANR. When the budget expires the call is
+    // suspended and resume_pending() finishes it from the next native entry,
+    // which is the GL thread, i.e. exactly where the work would have run anyway.
     bool call(uint32_t entry, const std::vector<uint32_t>& args, uint32_t& ret,
-              const char* what = "") {
+              const char* what = "", int budget_ms = 0, bool* paused_out = nullptr) {
+        if (pending_.active) {
+            LOGW("call(%s): a suspended call is still pending", what);
+            return false;
+        }
         uc_context* saved = nullptr;
         if (uc_context_alloc(uc_, &saved) != UC_ERR_OK) return false;
         uc_context_save(uc_, saved);
@@ -504,15 +530,6 @@ public:
             write_u32(sp + static_cast<uint32_t>((i - 4) * 4), args[i]);
         }
 
-        // Run in chunks so a guest that spins (typically a wait loop for a
-        // worker thread this single-threaded emulator never starts) is visible
-        // instead of hanging the host silently.
-        constexpr uint32_t kChunk = 4u * 1000u * 1000u;
-        const auto started = std::chrono::steady_clock::now();
-        uint64_t budget = kMaxInstructions;
-        uint32_t pc = entry;
-        uc_err err = UC_ERR_OK;
-
         if (call_trace_ < 60) {
             ++call_trace_;
             LOGI("emu call #%d: %s @%08x (%zu args, depth %u)", call_trace_, what, entry,
@@ -520,65 +537,20 @@ public:
         }
 
         ++depth_;
-        int state_retries = 0;
-        for (;;) {
-            err = uc_emu_start(uc_, pc, kReturnSentinel, 0, kChunk);
-            if (err == UC_ERR_INSN_INVALID && state_retries < 16) {
-                // An ARM/Thumb interworking transition can be lost across a
-                // block boundary (the payload mixes both instruction sets).
-                // The faulting PC is still in the guest image, so retry it in
-                // the opposite state once before declaring the call dead.
-                uint32_t bad_pc = 0, cpsr = 0;
-                reg_read(UC_ARM_REG_PC, bad_pc);
-                if (reg_read(UC_ARM_REG_CPSR, cpsr)) {
-                    const bool was_thumb = (cpsr & 0x20u) != 0;
-                    cpsr ^= 0x20u;
-                    uc_reg_write(uc_, UC_ARM_REG_CPSR, &cpsr);
-                    const uint32_t restart = bad_pc;
-                    uint32_t flr = 0;
-                    reg_read(UC_ARM_REG_LR, flr);
-                    LOGW("call(%s): invalid %s instruction at pc=%08x lr=%08x; "
-                         "retrying as %s", what, was_thumb ? "Thumb" : "ARM",
-                         bad_pc, flr, was_thumb ? "ARM" : "Thumb");
-                    ++state_retries;
-                    // uc_emu_start() derives the instruction set from the start
-                    // address, overriding CPSR.T; encode the state in bit 0.
-                    pc = was_thumb ? (restart & ~1u) : (restart | 1u);
-                    continue;
-                }
-            }
-            if (err != UC_ERR_OK) break;
-
-            uint32_t cur = 0;
-            reg_read(UC_ARM_REG_PC, cur);
-            if (cur == kReturnSentinel) break;   // normal return
-
-            budget -= std::min<uint64_t>(budget, kChunk);
-            const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::steady_clock::now() - started).count();
-
-            if (budget == 0 || elapsed > 90) {
-                uint32_t lr = 0;
-                reg_read(UC_ARM_REG_LR, lr);
-                LOGE("call(%s) @%08x never returned: spinning at pc=%08x lr=%08x "
-                     "after %llds", what, entry, cur, lr, static_cast<long long>(elapsed));
-                emu_ok_ = false;
-                break;
-            }
-            if (elapsed / 10 > last_report_) {
-                last_report_ = elapsed / 10;
-                LOGW("call(%s): still in guest at pc=%08x (%llds)", what, cur,
-                     static_cast<long long>(elapsed));
-            }
-            // uc_emu_start() sets CPSR.T from bit 0 of the start address
-            // (arm_cpu_set_pc), so resuming a chunk at a raw even PC would
-            // silently drop a Thumb guest into ARM mode and the next block
-            // would decode as an invalid ARM instruction. Carry the state in
-            // bit 0 instead.
-            uint32_t cur_cpsr = 0;
-            const bool cur_thumb = reg_read(UC_ARM_REG_CPSR, cur_cpsr) &&
-                                   (cur_cpsr & 0x20u) != 0;
-            pc = cur | (cur_thumb ? 1u : 0u);
+        uint32_t pc = entry;
+        uc_err err = UC_ERR_OK;
+        bool paused = false;
+        run_to_return(pc, what, budget_ms, paused, err);
+        if (paused) {
+            pending_.active = true;
+            pending_.saved = saved;
+            pending_.entry = entry;
+            pending_.what = what;
+            if (paused_out) *paused_out = true;
+            LOGI("call(%s) @%08x suspended at pc=%08x after %dms: "
+                 "ART thread released, continuing on the next native entry",
+                 what, entry, pc, budget_ms);
+            return false;   // depth_ and `saved` stay with the suspended call
         }
         --depth_;
 
@@ -608,7 +580,139 @@ public:
         return ok;
     }
 
+    /**
+     * Continues a suspended call from the PC it stopped at.
+     *
+     * @return true when the call really returned (`ret` holds R0), false when it
+     *         is still suspended (`paused`) or aborted.
+     */
+    bool resume_pending(uint32_t& ret, int budget_ms, bool& paused) {
+        if (!pending_.active) return true;
+        uc_context* saved = pending_.saved;
+        const std::string what = pending_.what;
+        const uint32_t entry = pending_.entry;
+        pending_ = Pause{};
+
+        // uc_emu_start() takes the instruction set from bit 0 of the start
+        // address, so the suspended PC has to be re-encoded from CPSR.T.
+        uint32_t raw_pc = 0, cpsr = 0;
+        reg_read(UC_ARM_REG_PC, raw_pc);
+        const bool thumb = reg_read(UC_ARM_REG_CPSR, cpsr) && (cpsr & 0x20u) != 0;
+        uint32_t pc = raw_pc | (thumb ? 1u : 0u);
+
+        uc_err err = UC_ERR_OK;
+        run_to_return(pc, what.c_str(), budget_ms, paused, err);
+        if (paused) {
+            pending_.active = true;
+            pending_.saved = saved;
+            pending_.entry = entry;
+            pending_.what = what;
+            return false;
+        }
+        --depth_;
+
+        bool ok = false;
+        if (err == UC_ERR_OK) {
+            ok = reg_read(UC_ARM_REG_R0, ret);
+        } else {
+            LOGE("resume(%s) @%08x aborted: %s (pc=%08x)", what.c_str(), entry,
+                 uc_strerror(err), pc);
+        }
+        uc_context_restore(uc_, saved);
+        uc_context_free(saved);
+        LOGI("call(%s): resumed and completed (ret=%d)", what.c_str(), static_cast<int>(ret));
+        return ok;
+    }
+
+    bool has_pending() const { return pending_.active; }
+
 private:
+    // Chunked execution from `pc` up to the return sentinel.
+    //
+    // Chunks keep a guest that spins (typically a wait loop for a worker thread
+    // this single-threaded emulator never starts) visible instead of hanging the
+    // host silently. `budget_ms` additionally caps how long the caller is held
+    // inside the guest: when it expires the loop stops at a chunk boundary with
+    // the guest frame intact and `paused` is set.
+    void run_to_return(uint32_t& pc, const char* what, int budget_ms, bool& paused,
+                       uc_err& err) {
+        constexpr uint32_t kChunk = 4u * 1000u * 1000u;
+        const auto started = std::chrono::steady_clock::now();
+        uint64_t budget = kMaxInstructions;
+        int state_retries = 0;
+        for (;;) {
+            err = uc_emu_start(uc_, pc, kReturnSentinel, 0, kChunk);
+            if (err == UC_ERR_INSN_INVALID && state_retries < 16) {
+                // An ARM/Thumb interworking transition can be lost across a
+                // block boundary (the payload mixes both instruction sets).
+                // The faulting PC is still in the guest image, so retry it in
+                // the opposite state once before declaring the call dead.
+                uint32_t bad_pc = 0, cpsr = 0;
+                reg_read(UC_ARM_REG_PC, bad_pc);
+                if (reg_read(UC_ARM_REG_CPSR, cpsr)) {
+                    const bool was_thumb = (cpsr & 0x20u) != 0;
+                    cpsr ^= 0x20u;
+                    uc_reg_write(uc_, UC_ARM_REG_CPSR, &cpsr);
+                    const uint32_t restart = bad_pc;
+                    uint32_t flr = 0;
+                    reg_read(UC_ARM_REG_LR, flr);
+                    LOGW("call(%s): invalid %s instruction at pc=%08x lr=%08x; "
+                         "retrying as %s", what, was_thumb ? "Thumb" : "ARM",
+                         bad_pc, flr, was_thumb ? "ARM" : "Thumb");
+                    ++state_retries;
+                    // uc_emu_start() derives the instruction set from the start
+                    // address, overriding CPSR.T; encode the state in bit 0.
+                    pc = was_thumb ? (restart & ~1u) : (restart | 1u);
+                    continue;
+                }
+            }
+            if (err != UC_ERR_OK) return;
+
+            uint32_t cur = 0;
+            reg_read(UC_ARM_REG_PC, cur);
+            if (cur == kReturnSentinel) return;   // normal return
+
+            budget -= std::min<uint64_t>(budget, kChunk);
+            const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - started).count();
+
+            if (budget == 0 || elapsed > 90) {
+                uint32_t lr = 0;
+                reg_read(UC_ARM_REG_LR, lr);
+                LOGE("call(%s) never returned: spinning at pc=%08x lr=%08x "
+                     "after %llds", what, cur, lr, static_cast<long long>(elapsed));
+                emu_ok_ = false;
+                return;
+            }
+            if (budget_ms > 0) {
+                const auto held = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - started).count();
+                if (held >= budget_ms) {
+                    paused = true;
+                    uint32_t live_cpsr = 0;
+                    const bool live_thumb = reg_read(UC_ARM_REG_CPSR, live_cpsr) &&
+                                            (live_cpsr & 0x20u) != 0;
+                    pc = cur | (live_thumb ? 1u : 0u);
+                    return;
+                }
+            }
+            if (elapsed / 10 > last_report_) {
+                last_report_ = elapsed / 10;
+                LOGW("call(%s): still in guest at pc=%08x (%llds)", what, cur,
+                     static_cast<long long>(elapsed));
+            }
+            // uc_emu_start() sets CPSR.T from bit 0 of the start address
+            // (arm_cpu_set_pc), so resuming a chunk at a raw even PC would
+            // silently drop a Thumb guest into ARM mode and the next block
+            // would decode as an invalid ARM instruction. Carry the state in
+            // bit 0 instead.
+            uint32_t cur_cpsr = 0;
+            const bool cur_thumb = reg_read(UC_ARM_REG_CPSR, cur_cpsr) &&
+                                   (cur_cpsr & 0x20u) != 0;
+            pc = cur | (cur_thumb ? 1u : 0u);
+        }
+    }
+
     uc_engine* uc_ = nullptr;
     uc_hook    mem_hook_ = 0;
     uint32_t   heap_cursor_ = kHeapBase;
@@ -617,6 +721,7 @@ private:
     int        call_trace_ = 0;              // bounded entry logging for uc calls
     long long  last_report_ = 0;             // seconds bucket for spin reports
     std::map<uint32_t, size_t> free_list_;   // guest address -> size
+    Pause      pending_;                     // call suspended by the time budget
 };
 
 // ===========================================================================
@@ -1478,6 +1583,10 @@ public:
     // ---- called from the generated ARM64 trampoline -----------------------
     uint64_t native_entry(uint32_t id, uint64_t* host_args) {
         EnvScope env_scope(env_, vm_);
+        // The guest CPU is a single register file: two ART threads entering it
+        // at once would interleave into one another. Recursive because a guest
+        // ->Java->guest round trip re-enters from the same thread.
+        std::lock_guard<std::recursive_mutex> emu_lock(emu_mu_);
 
         if (id >= natives_.size()) return 0;
         const NativeEntry& e = natives_[id];
@@ -1526,7 +1635,40 @@ public:
         }
 
         uint32_t ret = 0;
-        const bool ok = emu_.call(e.guest_fn, args, ret, e.name.c_str());
+        const int budget_ms = startup_budget_ms();
+
+        // A call the budget suspended last time is still sitting on the guest's
+        // stack. Finish it before dispatching anything else; if it needs more
+        // than this call's budget, let ART have this call back too. Dropping a
+        // frame here is harmless -- the engine is still initialising, and the
+        // frame the UI thread waits for has already been answered.
+        if (emu_.has_pending()) {
+            bool still_paused = false;
+            uint32_t ignored = 0;
+            emu_.resume_pending(ignored, budget_ms, still_paused);
+            if (still_paused) {
+                // Remember this call so its effect is not lost. Dropping a
+                // frame is harmless, dropping a `resize` is not: the engine
+                // would keep the viewport of the first surface size.
+                deferred_.active = true;
+                deferred_.fn = e.guest_fn;
+                deferred_.args = args;
+                deferred_.name = e.name;
+                LOGI("native %s%s deferred: guest engine still initialising",
+                     e.name.c_str(), e.sig.c_str());
+                return 0;
+            }
+            if (deferred_.active) {
+                uint32_t replayed = 0;
+                LOGI("native %s%s replayed after the suspended call completed",
+                     deferred_.name.c_str(), e.sig.c_str());
+                emu_.call(deferred_.fn, deferred_.args, replayed,
+                          deferred_.name.c_str(), 0);
+                deferred_ = Deferred{};
+            }
+        }
+
+        const bool ok = emu_.call(e.guest_fn, args, ret, e.name.c_str(), budget_ms);
         if (n < 3) LOGI("native %s -> %s (ret=%d)", e.name.c_str(), ok ? "returned" : "FAILED",
                         static_cast<int>(ret));
         if (ok && e.name == "render") {
@@ -1911,6 +2053,28 @@ private:
             if (!changed) changed = fold("/data/data/" + package_, data_dir_);
             if (!changed) changed = fold("/data/user/0/" + package_, data_dir_);
             if (!changed) changed = fold("/data/user_de/0/" + package_, data_dir_);
+
+            // The guest's own data directory, wherever the platform used to
+            // put it: /sdcard/<package>/courses/bunny_hill/course.tcl and
+            // friends are built at runtime from a storage path the game only
+            // learns at start-up. Everything after the package name has to
+            // survive the rewrite -- keeping the basename alone turned
+            // courses/bunny_hill/course.tcl into <data>/course.tcl, which does
+            // not exist, and the engine then aborts while parsing the course.
+            if (!changed && !in.empty() && in[0] == '/') {
+                static const char* kSharedRoots[] = {
+                    "/sdcard/", "/mnt/sdcard/", "/storage/emulated/0/",
+                    "/storage/self/primary/",
+                };
+                for (const char* shared : kSharedRoots) {
+                    const std::string base = std::string(shared) + package_;
+                    if (in.compare(0, base.size(), base) != 0) continue;
+                    if (in.size() > base.size() && in[base.size()] != '/') continue;
+                    out = data_dir_ + in.substr(base.size());
+                    changed = true;
+                    break;
+                }
+            }
 
             // Any other absolute path under shared storage that mentions the
             // package: keep only its basename inside our private data dir.
@@ -3974,6 +4138,7 @@ private:
             }
             return 0u;
         };
+
 
 #undef ZB_GL_V
 #undef ZB_GL_R
@@ -6574,6 +6739,38 @@ private:
     uint32_t next_ref_ = 0x00010000;
 
     std::vector<NativeEntry> natives_;
+    // Until the first frame is presented no single guest call may hold the
+    // calling ART thread for longer than this.
+    //
+    // A legacy renderer parks its UI thread on the first frame -- Tux Rider's
+    // GLSurfaceView sits in surfaceChanged() waiting for the GL thread to finish
+    // `resize` -- so an engine initialisation measured in seconds reads to the
+    // system as a frozen app and turns into an input-dispatch ANR. Slicing the
+    // call keeps the UI thread responsive while the GL thread, which is the
+    // thread that has to do the work, drains it frame by frame. Once a frame has
+    // been presented the budget is lifted and calls run to completion as before.
+    int startup_budget_ms() {
+        if (frames_ > 0) return 0;
+        const auto now = std::chrono::steady_clock::now();
+        if (startup_begin_.time_since_epoch().count() == 0) startup_begin_ = now;
+        // A guest that never renders must not be sliced forever.
+        if (now - startup_begin_ > std::chrono::seconds(60)) return 0;
+        return kStartupCallBudgetMs;
+    }
+
+    // A call that arrived while the guest was still inside a suspended one.
+    struct Deferred {
+        bool        active = false;
+        uint32_t    fn = 0;
+        std::vector<uint32_t> args;
+        std::string name;
+    };
+    Deferred deferred_;
+
+    static constexpr int kStartupCallBudgetMs = 250;
+    std::recursive_mutex emu_mu_;                     // serialises ART -> guest
+    std::chrono::steady_clock::time_point startup_begin_{};
+
     std::unordered_map<std::string, ImportHandler> import_handlers_;
     std::unordered_map<uint32_t, size_t> guest_allocs_;
     std::unordered_map<std::string, uint32_t> data_slots_;

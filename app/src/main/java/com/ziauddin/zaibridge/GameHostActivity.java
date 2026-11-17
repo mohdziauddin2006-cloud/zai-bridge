@@ -22,6 +22,8 @@ import com.ziauddin.zaibridge.data.Game;
 import com.ziauddin.zaibridge.data.GameRepository;
 
 import java.io.File;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import dalvik.system.DexClassLoader;
 
@@ -59,6 +61,24 @@ public class GameHostActivity extends Activity {
     private volatile boolean pureJavaMode;
 
     private final Object startLock = new Object();
+
+    /**
+     * Surface callbacks are handed to the core from this single background
+     * thread, never from the main looper.
+     *
+     * <p>{@code surfaceChanged} is delivered inside the framework's traversal,
+     * and a legacy guest answers it by waiting for its own {@code GLThread} to
+     * finish the engine's {@code resize}. Everything that call can touch lives
+     * inside the emulator, so doing it here would hold the input dispatcher for
+     * as long as the engine takes to load its course, font and HUD data. One
+     * ordered queue keeps created -> changed -> destroyed in the right order
+     * without any of it running on the UI thread.
+     */
+    private static final ExecutorService SURFACE_QUEUE = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "zai-bridge-surface");
+        t.setDaemon(true);
+        return t;
+    });
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -109,30 +129,46 @@ public class GameHostActivity extends Activity {
         surfaceView.getHolder().addCallback(new SurfaceHolder.Callback() {
             @Override
             public void surfaceCreated(SurfaceHolder holder) {
-                onSurface(holder.getSurface());
+                onSurface(holder.getSurface(), holder.getSurfaceFrame().width(),
+                        holder.getSurfaceFrame().height());
             }
 
             @Override
             public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
-                onSurface(holder.getSurface());
+                onSurface(holder.getSurface(), width, height);
             }
 
             @Override
             public void surfaceDestroyed(SurfaceHolder holder) {
                 status("surface destroyed", false);
                 surfaceReady = false;
-                UnicornBridge.setSurface(null);
+                SURFACE_QUEUE.execute(() -> UnicornBridge.setSurface(null));
             }
         });
 
         prepareGuest();
     }
 
-    private void onSurface(Surface surface) {
+    /**
+     * Publishes a surface (and its size) to the core without blocking the UI
+     * thread.
+     *
+     * <p>{@link UnicornBridge#setSurface} only stores the ANativeWindow, but the
+     * guest's surface change that follows it is a guest call: the engine's
+     * {@code resize} loads every course, font and HUD texture and can take
+     * seconds on software GL. Queuing it means the main looper is free within
+     * microseconds of the callback, so the input dispatcher can never time out
+     * waiting for the engine.
+     */
+    private void onSurface(final Surface surface, final int width, final int height) {
         if (surface == null || !surface.isValid()) return;
-        UnicornBridge.setSurface(surface);
         surfaceReady = true;
-        dispatchSessionIfReady();
+        SURFACE_QUEUE.execute(() -> {
+            Log.i(TAG, "surface handed to the core off the UI thread: "
+                    + width + "x" + height);
+            UnicornBridge.setSurface(surface);
+            dispatchSessionIfReady();
+        });
     }
 
     @Override
@@ -163,7 +199,8 @@ public class GameHostActivity extends Activity {
     @Override
     protected void onDestroy() {
         if (guestHost != null) guestHost.onDestroy();
-        UnicornBridge.setSurface(null);
+        surfaceReady = false;
+        SURFACE_QUEUE.execute(() -> UnicornBridge.setSurface(null));
         super.onDestroy();
     }
 

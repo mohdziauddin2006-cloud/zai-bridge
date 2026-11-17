@@ -7,6 +7,7 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
+import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
@@ -20,6 +21,8 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 import java.util.zip.ZipInputStream;
@@ -55,6 +58,23 @@ public final class GuestLauncher {
     private static volatile File guestGameDir;
     private static volatile String guestPackage;
     private static volatile String guestClass;
+
+    /**
+     * Surface callbacks reach the native core from this one background thread.
+     *
+     * <p>A {@code SurfaceHolder} callback is delivered on the main looper, and
+     * the guest's {@code MyGLSurfaceView.surfaceChanged} cannot return until its
+     * {@code GLThread} has finished the engine's {@code resize} — a guest call
+     * that loads every course, font and HUD texture inside Unicorn. Anything the
+     * bridge does in that window is charged to the input dispatcher, so the
+     * window is handed over on an ordered queue instead and the UI thread is
+     * released immediately.
+     */
+    private static final ExecutorService SURFACE_QUEUE = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "zai-bridge-surface");
+        t.setDaemon(true);
+        return t;
+    });
 
     private GuestLauncher() {
     }
@@ -340,25 +360,46 @@ public final class GuestLauncher {
                     @Override
                     public void surfaceCreated(SurfaceHolder holder) {
                         Log.i(TAG, "guest " + name + " surface created");
-                        UnicornBridge.setSurface(holder.getSurface());
+                        dispatchSurface(holder.getSurface(),
+                                holder.getSurfaceFrame().width(),
+                                holder.getSurfaceFrame().height());
                     }
 
                     @Override
                     public void surfaceChanged(SurfaceHolder holder, int format,
                                                int width, int height) {
                         Log.i(TAG, "guest surface " + width + "x" + height);
-                        UnicornBridge.setSurface(holder.getSurface());
+                        dispatchSurface(holder.getSurface(), width, height);
                     }
 
                     @Override
                     public void surfaceDestroyed(SurfaceHolder holder) {
-                        UnicornBridge.setSurface(null);
+                        SURFACE_QUEUE.execute(() -> UnicornBridge.setSurface(null));
                     }
                 });
                 Log.i(TAG, "surface holder hooked on " + name);
             }
         };
         handler.post(scan);
+    }
+
+    /**
+     * Hands a surface and its new size to the core off the UI thread.
+     *
+     * <p>The call itself only stores the {@code ANativeWindow}; what it unblocks
+     * is the guest's own surface change, which is where the engine's expensive
+     * {@code resize} runs. Keeping it on a dedicated thread means the main
+     * looper returns before the input-dispatch timeout can be reached, no
+     * matter how long the engine takes to initialise.
+     */
+    private static void dispatchSurface(final Surface surface, final int width,
+                                        final int height) {
+        if (surface == null || !surface.isValid()) return;
+        SURFACE_QUEUE.execute(() -> {
+            Log.i(TAG, "surface handed to the core off the UI thread: "
+                    + width + "x" + height);
+            UnicornBridge.setSurface(surface);
+        });
     }
 
     private static SurfaceView findSurfaceView(View root) {

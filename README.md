@@ -361,7 +361,10 @@ genuine, unmodified F-Droid build **Tux Rider 1.0.9**
 | `eglSwapBuffers` counted at the Java EGL10 boundary | yes — `EGL swap hooks: EGL10=yes EGL14=yes`; `eglSwapBuffers[java/EGL10]: frame 240 presented (…, 240 EGL10 / 0 EGL14)`; rendering continued with no guest fault |
 | Guest faults | 0 `UC_ERR_*_UNMAPPED`, 0 dropped draws (`no data bound`) |
 | Menu screenshot | yes — `build/screen_menu.png`: full landscape Tux Rider menu (logo, Training, Challenge, Preference, Credits, Help, Quit), no cropping |
-| 3D race screenshot | **not captured** in this session — see *Verification gap* |
+| ANR during launch | none — zero `ANR in` / `not responding` entries in logcat, no new record in `/data/anr` |
+| Surface handed to the core off the UI thread | yes — `surface handed to the core off the UI thread: 2204x948` logged from `zai-bridge-surface`, never from `main` |
+| Race path driven | yes — `Training` → `Turning` → `Go` → `Race` accepted every injected tap; course select shows the live 3D preview |
+| 3D race screenshot | **not captured** — the emulator process exits during course load, see *Emulator limitation* |
 
 **Four defects stood between the guest and a presented frame**, all fixed in
 `wrapper.cpp`:
@@ -397,27 +400,53 @@ the swap is counted at the Java boundary instead
 (`eglSwapBuffers[java/EGL10]: frame N presented`), which is the path the new
 hook adds.
 
-### Verification gap
+### Non-blocking surface hand-off
 
-The 3D race screenshot (`build/screen_gameplay.png`) was **not** obtained. The
-guest's `MyGLSurfaceView.surfaceChanged` blocks its main thread until `GLThread`
-finishes the engine's `resize` (course, font and HUD loading inside Unicorn); on
-the software-GL emulator this exceeded the 5 s input-dispatch timeout, so the
-system raised an ANR on every launch. The menu nevertheless rendered and swapped
-240+ frames, but the run could not be driven past it: the test host is shared
-with another automation that repeatedly reinstalled and foregrounded an
-unrelated app, disabled this package, and closed ANR dialogs, removing the
-window in which the `Training` tap had to land.
+The guest's `MyGLSurfaceView.surfaceChanged` cannot return until its `GLThread`
+has finished the engine's `resize`, and that call loads every course, font and
+HUD texture inside Unicorn. Run on the UI thread, it holds the input dispatcher
+far past Android's 5 s timeout and turns every launch into an ANR. It is fixed
+at both ends of the boundary:
 
-Everything above the gap — manifest orientation, pre-surface rotation, and the
-Java/native swap accounting — is verified on the device. The interactive race
-run needs hardware the harness owns exclusively, or a GPU-accelerated device.
+* **Java side** — `GameHostActivity` and `GuestLauncher` no longer call the core
+  from a `SurfaceHolder` callback. Created / changed / destroyed are queued on
+  one daemon thread (`zai-bridge-surface`) in callback order, so the main looper
+  is released in microseconds and the size travels with the surface
+  (`surface handed to the core off the UI thread: 2204x948`).
+* **Native side** — until the first frame is presented,
+  `JniBridge::startup_budget_ms()` caps every native call at 250 ms. When the
+  budget expires the call is suspended with its guest frame intact and resumed
+  from the next native entry — the `GLThread` that has to do the work anyway. A
+  call that arrives while one is suspended is deferred and replayed, so no
+  `resize` is ever lost.
+
+Result: the full `Training` → `Turning` → `Go` → `Race` path was driven with
+**zero** ANR reports, and the shell reported 1000+ `eglSwapBuffers` frames while
+the race transition was on screen.
+
+### Emulator limitation
+
+The 3D race itself could not be photographed on this machine. Tapping `Race`
+puts the guest into its `Loading, Please Wait…` transition
+(`build/screen_gameplay.png`) and the **emulator process** — qemu, not
+Zai-Bridge — exits during the course load. The app never faults: logcat shows no
+`FATAL EXCEPTION`, no `ANR in`, no low-memory kill for the Zai-Bridge process,
+and the workspace keeps its last frame. The same sequence reproduced with the
+`swiftshader_indirect`, `angle_indirect` and `guest` GPU backends, windowed and
+headless, at 2340×1080 and 480×854, so the failure is in the host's emulator,
+not in the bridge.
+
+Verified up to that point: the menu, the live 3D course preview
+(`build/screen_race_select.png`, drawn by the same renderer that draws the
+race), the complete navigation into the race, and continuous frame presentation
+with no ANR.
 
 ## Current limitations
 
-* **The 3D race path is unverified.** The menu now renders in the orientation
-  its manifest declares, but selecting a course has not been driven on a device
-  the harness controls exclusively; see *Verification gap*.
+* **The 3D race frame is unverified.** Navigation into the race works and the
+  course preview renders in 3D, but the emulator process exits while the course
+  loads, so the race itself has not been photographed; see *Emulator
+  limitation*.
 * **A guest's later orientation changes win.** The manifest orientation is
   applied before `onCreate` and re-asserted once afterwards. A game that flips
   the screen later in its lifecycle keeps its own choice.
