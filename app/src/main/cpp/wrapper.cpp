@@ -49,6 +49,8 @@
 #include <unicorn/unicorn.h>
 #include <android/log.h>
 #include <android/native_window.h>
+#include <android/native_activity.h>
+#include <android/configuration.h>
 #include <android/native_window_jni.h>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
@@ -7465,7 +7467,102 @@ Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeEndSession(
     LOGI("Zai-Bridge: session closed; a new import can start");
 }
 
+// NATIVE_ACTIVITY_BRIDGE_START
+struct ANativeActivityCallbacks32 {
+    uint32_t onStart, onResume, onSaveInstanceState, onPause, onStop, onDestroy;
+    uint32_t onWindowFocusChanged, onNativeWindowCreated, onNativeWindowResized;
+    uint32_t onNativeWindowRedrawNeeded, onNativeWindowDestroyed;
+    uint32_t onInputQueueCreated, onInputQueueDestroyed, onContentRectChanged;
+    uint32_t onConfigurationChanged, onLowMemory;
+};
+struct ANativeActivity32 {
+    uint32_t callbacks, vm, env, clazz, internalDataPath, externalDataPath;
+    int32_t sdkVersion; uint32_t instance, assetManager, obbPath;
+};
+static uint32_t g_guest_onStart=0,g_guest_onResume=0,g_guest_onPause=0,g_guest_onStop=0,g_guest_onDestroy=0;
+static uint32_t g_guest_onWindowFocusChanged=0,g_guest_onLowMemory=0,g_guest_onConfigurationChanged=0,g_guest_onSaveInstanceState=0;
+static uint32_t g_guest_onNativeWindowCreated=0,g_guest_onNativeWindowResized=0,g_guest_onNativeWindowRedrawNeeded=0,g_guest_onNativeWindowDestroyed=0;
+static uint32_t g_guest_onInputQueueCreated=0,g_guest_onInputQueueDestroyed=0,g_guest_onContentRectChanged=0;
+static uint32_t g_shadow_activity_addr=0;
+static void host_fwd_void(uint32_t cb){ if(!cb||!g_emulator) return; uint32_t r=0; g_emulator->call(cb,{g_shadow_activity_addr},r,"NA fwd"); }
+static void hc_onStart(ANativeActivity*a){(void)a;host_fwd_void(g_guest_onStart);}
+static void hc_onResume(ANativeActivity*a){(void)a;host_fwd_void(g_guest_onResume);}
+static void hc_onPause(ANativeActivity*a){(void)a;host_fwd_void(g_guest_onPause);}
+static void hc_onStop(ANativeActivity*a){(void)a;host_fwd_void(g_guest_onStop);}
+static void hc_onDestroy(ANativeActivity*a){(void)a;host_fwd_void(g_guest_onDestroy);}
+static void hc_onLowMemory(ANativeActivity*a){(void)a;host_fwd_void(g_guest_onLowMemory);}
+static void hc_onConfigurationChanged(ANativeActivity*a){(void)a;host_fwd_void(g_guest_onConfigurationChanged);}
+static void hc_onWindowFocusChanged(ANativeActivity*a,int f){(void)a;(void)f;host_fwd_void(g_guest_onWindowFocusChanged);}
+static void* hc_onSaveInstanceState(ANativeActivity*a,size_t*out){(void)a;if(out)*out=0;if(!g_guest_onSaveInstanceState||!g_emulator)return nullptr;uint32_t r=0;g_emulator->call(g_guest_onSaveInstanceState,{g_shadow_activity_addr},r,"NA save");return nullptr;}
+static void hc_onNativeWindowCreated(ANativeActivity*a,ANativeWindow*w){(void)a;(void)w;host_fwd_void(g_guest_onNativeWindowCreated);}
+static void hc_onNativeWindowResized(ANativeActivity*a,ANativeWindow*w){(void)a;(void)w;host_fwd_void(g_guest_onNativeWindowResized);}
+static void hc_onNativeWindowRedrawNeeded(ANativeActivity*a,ANativeWindow*w){(void)a;(void)w;host_fwd_void(g_guest_onNativeWindowRedrawNeeded);}
+static void hc_onNativeWindowDestroyed(ANativeActivity*a,ANativeWindow*w){(void)a;(void)w;host_fwd_void(g_guest_onNativeWindowDestroyed);}
+static void hc_onInputQueueCreated(ANativeActivity*a,AInputQueue*q){(void)a;(void)q;host_fwd_void(g_guest_onInputQueueCreated);}
+static void hc_onInputQueueDestroyed(ANativeActivity*a,AInputQueue*q){(void)a;(void)q;host_fwd_void(g_guest_onInputQueueDestroyed);}
+static void hc_onContentRectChanged(ANativeActivity*a,const ARect*r){(void)a;(void)r;host_fwd_void(g_guest_onContentRectChanged);}
+static ANativeActivityCallbacks g_host_callbacks={};
+static bool g_cb_init=false;
+static void init_host_callbacks(){ if(g_cb_init) return;
+g_host_callbacks.onStart=hc_onStart;g_host_callbacks.onResume=hc_onResume;g_host_callbacks.onPause=hc_onPause;g_host_callbacks.onStop=hc_onStop;g_host_callbacks.onDestroy=hc_onDestroy;
+g_host_callbacks.onWindowFocusChanged=hc_onWindowFocusChanged;g_host_callbacks.onNativeWindowCreated=hc_onNativeWindowCreated;g_host_callbacks.onNativeWindowResized=hc_onNativeWindowResized;g_host_callbacks.onNativeWindowRedrawNeeded=hc_onNativeWindowRedrawNeeded;g_host_callbacks.onNativeWindowDestroyed=hc_onNativeWindowDestroyed;
+g_host_callbacks.onInputQueueCreated=hc_onInputQueueCreated;g_host_callbacks.onInputQueueDestroyed=hc_onInputQueueDestroyed;g_host_callbacks.onContentRectChanged=hc_onContentRectChanged;g_host_callbacks.onConfigurationChanged=hc_onConfigurationChanged;g_host_callbacks.onLowMemory=hc_onLowMemory;g_host_callbacks.onSaveInstanceState=hc_onSaveInstanceState;g_cb_init=true;}
+extern "C" JNIEXPORT void ANativeActivity_finish(ANativeActivity*a){(void)a;}
+extern "C" JNIEXPORT void ANativeActivity_setWindowFormat(ANativeActivity*a,int32_t f){(void)a;(void)f;}
+extern "C" JNIEXPORT void ANativeActivity_setWindowFlags(ANativeActivity*a,uint32_t add,uint32_t rem){(void)a;(void)add;(void)rem;}
+extern "C" JNIEXPORT void ANativeActivity_showSoftInput(ANativeActivity*a,uint32_t f){(void)a;(void)f;}
+extern "C" JNIEXPORT void ANativeActivity_hideSoftInput(ANativeActivity*a,uint32_t f){(void)a;(void)f;}
+extern "C" JNIEXPORT void ANativeActivity_onCreate(ANativeActivity* activity, void* savedState, size_t savedStateSize) {
+    LOGI("ANativeActivity_onCreate invoked by framework (%p)", (void*)activity);
+    if (!activity) return;
+    init_host_callbacks();
+    activity->callbacks = &g_host_callbacks;
+    if (!g_bridge || !g_emulator) { LOGW("bridge not initialised"); return; }
+    uint32_t shadow = g_emulator->alloc(sizeof(ANativeActivity32), 8);
+    if (!shadow) { LOGE("shadow alloc failed"); return; }
+    g_shadow_activity_addr = shadow;
+    const char* internal = activity->internalDataPath ? activity->internalDataPath : "";
+    const char* external = activity->externalDataPath ? activity->externalDataPath : "";
+    const char* obb = activity->obbPath ? activity->obbPath : "";
+    uint32_t si = g_emulator->alloc(strlen(internal)+1,4);
+    uint32_t se = g_emulator->alloc(strlen(external)+1,4);
+    uint32_t so = g_emulator->alloc(strlen(obb)+1,4);
+    if(si) g_emulator->write(si,internal,strlen(internal)+1);
+    if(se) g_emulator->write(se,external,strlen(external)+1);
+    if(so) g_emulator->write(so,obb,strlen(obb)+1);
+    uint32_t ss = 0;
+    if (savedState && savedStateSize>0) { ss = g_emulator->alloc(savedStateSize,8); if(ss) g_emulator->write(ss,savedState,savedStateSize); }
+    uint32_t cb = g_emulator->alloc(sizeof(ANativeActivityCallbacks32),8);
+    std::vector<uint8_t> zero(sizeof(ANativeActivityCallbacks32),0);
+    if(cb) g_emulator->write(cb,zero.data(),zero.size());
+    ANativeActivity32 sa{};
+    sa.callbacks=cb; sa.vm=g_bridge->vm_shadow(); sa.env=g_bridge->env_shadow();
+    sa.clazz = g_bridge->to_guest_ref(activity->clazz);
+    sa.internalDataPath=si; sa.externalDataPath=se; sa.sdkVersion=activity->sdkVersion;
+    sa.instance=0; sa.assetManager=0; sa.obbPath=so;
+    g_emulator->write(shadow,&sa,sizeof(sa));
+    uint32_t guest_onCreate=0;
+    for (const auto* lib : g_bridge->libraries()) { uint32_t fn=JniBridge::export_of(lib,"ANativeActivity_onCreate"); if(fn){guest_onCreate=fn;break;} }
+    if (!guest_onCreate) { LOGW("no guest ANativeActivity_onCreate"); return; }
+    uint32_t ret=0;
+    g_emulator->call(guest_onCreate,{shadow,ss,(uint32_t)savedStateSize},ret,"guest ANativeActivity_onCreate");
+    ANativeActivityCallbacks32 c32{};
+    if(cb) g_emulator->read(cb,&c32,sizeof(c32));
+    g_guest_onStart=c32.onStart; g_guest_onResume=c32.onResume; g_guest_onSaveInstanceState=c32.onSaveInstanceState;
+    g_guest_onPause=c32.onPause; g_guest_onStop=c32.onStop; g_guest_onDestroy=c32.onDestroy;
+    g_guest_onWindowFocusChanged=c32.onWindowFocusChanged; g_guest_onNativeWindowCreated=c32.onNativeWindowCreated;
+    g_guest_onNativeWindowResized=c32.onNativeWindowResized; g_guest_onNativeWindowRedrawNeeded=c32.onNativeWindowRedrawNeeded;
+    g_guest_onNativeWindowDestroyed=c32.onNativeWindowDestroyed; g_guest_onInputQueueCreated=c32.onInputQueueCreated;
+    g_guest_onInputQueueDestroyed=c32.onInputQueueDestroyed; g_guest_onContentRectChanged=c32.onContentRectChanged;
+    g_guest_onConfigurationChanged=c32.onConfigurationChanged; g_guest_onLowMemory=c32.onLowMemory;
+    LOGI("ANativeActivity_onCreate bridge complete");
+}
+// NATIVE_ACTIVITY_BRIDGE_DONE
+// NATIVE_ACTIVITY_BRIDGE_END
+
 extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void* reserved) {
     (void)vm; (void)reserved;
     LOGI("JNI_OnUnload");
 }
+
+

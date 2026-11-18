@@ -240,6 +240,7 @@ zai-bridge/
 | Emulator / Device startup | Verified on Android 14 (API 34) emulator (`ZaiBridge_X86_64`) |
 | Startup crash test | 0 crashes; `last_crash.txt` absent; `MainActivity` running indefinitely |
 | 32-bit payload test | Ingestion & execution verified with `com.drodin.tuxrider` payload |
+| NativeActivity/Unity | `ANativeActivity_onCreate` struct bridge + multi-lib dlopen + guest threading |
 
 Known limits:
 
