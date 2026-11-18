@@ -269,10 +269,10 @@ public:
         // relative branch would silently truncate and jump into arbitrary code.
         w[11] = 0x580000B0u; // ldr  x16, [pc, #20]  -> literal at w[16]
         w[12] = 0xD63F0200u; // blr  x16
-        w[13] = 0x910203FFu; // add  sp, sp, #128
-        w[14] = 0xD65F03C0u; // ret
+        w[13] = 0x9E670000u; // fmov d0, x0 (copy return value to FP register d0)
+        w[14] = 0x910203FFu; // add  sp, sp, #128
+        w[15] = 0xD65F03C0u; // ret
         const uint64_t t = reinterpret_cast<uintptr_t>(target);
-        w[15] = 0xD503201Fu; // nop (execution never reaches here)
         w[16] = static_cast<uint32_t>(t & 0xFFFFFFFFu);        // .quad target
         w[17] = static_cast<uint32_t>(t >> 32);
         w[18] = 0xD503201Fu; // padding
@@ -1520,11 +1520,27 @@ public:
     }
 
     // guest JNI_OnLoad(vm, reserved)
-    bool call_onload(uint32_t fn, uint32_t& ret) {
+    bool call_onload(uint32_t fn, uint32_t& ret, bool force = false) {
         if (!fn) return false;
-        if (called_onloads_.find(fn) != called_onloads_.end()) return true;
+        if (!force && called_onloads_.find(fn) != called_onloads_.end()) return true;
         called_onloads_.insert(fn);
+        std::lock_guard<std::recursive_mutex> emu_lock(emu_mu_);
         return emu_.call(fn, {vm_shadow_, 0}, ret, "JNI_OnLoad");
+    }
+
+    bool call_guest(uint32_t fn, const std::vector<uint32_t>& args, uint32_t& ret, const char* name = "guest_call") {
+        if (!fn) return false;
+        std::lock_guard<std::recursive_mutex> emu_lock(emu_mu_);
+        return emu_.call(fn, args, ret, name, 0);
+    }
+
+    uint32_t find_native_method(const std::string& method_name, const std::string& sig = "") const {
+        for (const auto& n : natives_) {
+            if (n.name == method_name && (sig.empty() || n.sig == sig)) {
+                return n.guest_fn;
+            }
+        }
+        return 0;
     }
 
     void report_imports() { log_import_report(); }
@@ -1694,7 +1710,7 @@ public:
         return h;
     }
 
-    void* from_guest_ref(uint32_t h) {
+    void* from_guest_ref(uint32_t h) const {
         auto it = refs_.find(h);
         return it == refs_.end() ? nullptr : it->second;
     }
@@ -1784,14 +1800,23 @@ public:
         args.push_back(env_shadow_);
         args.push_back(to_guest_ref(reinterpret_cast<void*>(host_args[1])));  // thiz
 
-        // host_args layout: [0..7] integer registers, [8..15] FP registers.
+        // host_args layout: [0..7] integer registers, [8..15] FP registers, [16+] caller stack args.
         // The ARM32 guest uses the softfp ABI: a double is two core words on
         // an even register/stack slot, a float is one word.
+        auto get_int_arg = [&](size_t idx) -> uint64_t {
+            if (idx < 8) return host_args[idx];
+            return host_args[idx + 8]; // spilled at sp + 128
+        };
+        auto get_fp_arg = [&](size_t idx) -> uint64_t {
+            if (idx < 16) return host_args[idx];
+            return 0;
+        };
+
         size_t int_index = 2;   // env, thiz already consumed
         size_t fp_index = 8;
         for (char t : e.arg_types) {
             if (t == 'F' || t == 'D') {
-                const uint64_t bits = host_args[fp_index++];
+                const uint64_t bits = get_fp_arg(fp_index++);
                 if (t == 'D') {
                     if (args.size() & 1u) args.push_back(0);   // even slot
                     args.push_back(static_cast<uint32_t>(bits));
@@ -1802,7 +1827,7 @@ public:
                 continue;
             }
 
-            const uint64_t v = host_args[int_index++];
+            const uint64_t v = get_int_arg(int_index++);
             if (t == 'L' || t == '[') {
                 args.push_back(to_guest_ref(reinterpret_cast<void*>(v)));
             } else if (t == 'J') {
@@ -1863,6 +1888,13 @@ public:
             }
         }
         if (!ok) return 0;
+        if (e.ret_type == 'L' || e.ret_type == '[') {
+            return reinterpret_cast<uintptr_t>(from_guest_ref(ret));
+        } else if (e.ret_type == 'J' || e.ret_type == 'D') {
+            uint32_t r1 = 0;
+            emu_.reg_read(UC_ARM_REG_R1, r1);
+            return (static_cast<uint64_t>(r1) << 32) | ret;
+        }
         return static_cast<uint64_t>(ret);
     }
 
@@ -2279,6 +2311,15 @@ private:
             }
         }
 
+        // Ensure missing .apk path requests fall back to game.apk
+        if (in.find(".apk") != std::string::npos && ::access(out.c_str(), R_OK) != 0 && !game_root_.empty()) {
+            const std::string candidate_apk = game_root_ + "/game.apk";
+            if (::access(candidate_apk.c_str(), R_OK) == 0) {
+                out = candidate_apk;
+                changed = true;
+            }
+        }
+
         if (changed && translate_log_.insert(in).second) {
             LOGI("%s: %s -> %s", why, in.c_str(), out.c_str());
         }
@@ -2304,7 +2345,6 @@ private:
         if (name[0] == '/') {
             const std::string translated = translate_path(name, "dlopen");
             if (::access(translated.c_str(), R_OK) == 0) return translated;
-            return sysroot_library(base);
         }
 
         std::string tagged = base;
@@ -2378,6 +2418,45 @@ public:
         }
     }
 
+    const LoadedLibrary* find_lib_by_handle(uint32_t handle) const {
+        if (!handle || handle == 0xFFFFFFFFu || handle == 0xFFFFFFFEu) return nullptr;
+
+        // 1. Direct handle in dl_libs_
+        auto it = dl_libs_.find(handle);
+        if (it != dl_libs_.end()) return it->second;
+
+        // 2. Ref translation from guest handle
+        void* host_ptr = from_guest_ref(handle);
+        if (host_ptr) {
+            const uint32_t hbase = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(host_ptr));
+            auto it2 = dl_libs_.find(hbase);
+            if (it2 != dl_libs_.end()) return it2->second;
+            for (const auto* l : linker_.libs()) {
+                if (l->map_addr == hbase) return l;
+            }
+        }
+
+        // 3. dl_handles_ lookup
+        for (const auto& kv : dl_handles_) {
+            if (kv.second == handle) {
+                for (const auto* l : linker_.libs()) {
+                    std::string lib_base = l->path;
+                    size_t s = lib_base.find_last_of('/');
+                    if (s != std::string::npos) lib_base = lib_base.substr(s + 1);
+                    if (l->soname == kv.first || lib_base == kv.first) return l;
+                }
+            }
+        }
+
+        // 4. Match map_addr directly
+        for (const auto* l : linker_.libs()) {
+            if (l->map_addr == handle) return l;
+            if (reinterpret_cast<uintptr_t>(l) == static_cast<uintptr_t>(handle)) return l;
+        }
+
+        return nullptr;
+    }
+
     uint32_t guest_dlopen(const std::string& name) {
         if (name.empty()) return 0;
         auto known = dl_handles_.find(name);
@@ -2400,7 +2479,10 @@ public:
                 const uint32_t handle = to_guest_ref(
                     reinterpret_cast<void*>(static_cast<uintptr_t>(l->map_addr)));
                 dl_handles_[name] = handle;
+                dl_handles_[base] = handle;
+                if (!l->soname.empty()) dl_handles_[l->soname] = handle;
                 dl_libs_[l->map_addr] = l;
+                dl_libs_[handle] = l;
                 LOGI("dlopen(%s): already mapped as %s @ %08x (handle %08x)",
                      name.c_str(), l->path.c_str(), l->map_addr, handle);
                 return handle;
@@ -2435,7 +2517,10 @@ public:
         const uint32_t handle = to_guest_ref(
             reinterpret_cast<void*>(static_cast<uintptr_t>(img_base)));
         dl_handles_[name] = handle;
+        dl_handles_[base] = handle;
+        if (!lib->soname.empty()) dl_handles_[lib->soname] = handle;
         dl_libs_[img_base] = lib;
+        dl_libs_[handle] = lib;
         LOGI("dlopen(%s) -> %s @ %08x (guest handle %08x)", name.c_str(), path.c_str(),
              img_base, handle);
         return handle;
@@ -2449,19 +2534,54 @@ public:
             return it == lib->exports.end() ? 0u : it->second;
         };
 
-        if (handle && handle != 0xFFFFFFFFu && handle != 0xFFFFFFFEu) {
-            const uint32_t hbase = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(
-                from_guest_ref(handle)));
-            auto it = dl_libs_.find(hbase);
-            if (it != dl_libs_.end()) {
-                uint32_t at = lookup(it->second);
-                if (at) return at;
+        const LoadedLibrary* target = find_lib_by_handle(handle);
+        if (target) {
+            // Search the specific ELF library referenced by handle first
+            uint32_t at = lookup(target);
+            if (at) {
+                LOGI("dlsym(handle %08x [%s], %s) -> %08x",
+                     handle, target->path.c_str(), symbol.c_str(), at);
+                return at;
+            }
+            // Check DT_NEEDED dependencies of the target library
+            for (const auto& dep : target->needed) {
+                for (const auto* l : linker_.libs()) {
+                    std::string lib_base = l->path;
+                    size_t s = lib_base.find_last_of('/');
+                    if (s != std::string::npos) lib_base = lib_base.substr(s + 1);
+                    if (l->soname == dep || lib_base == dep) {
+                        at = lookup(l);
+                        if (at) {
+                            LOGI("dlsym(handle %08x [%s] -> dep [%s], %s) -> %08x",
+                                 handle, target->path.c_str(), l->path.c_str(), symbol.c_str(), at);
+                            return at;
+                        }
+                    }
+                }
+            }
+            LOGW("dlsym(handle %08x [%s], %s) not found in targeted library or its dependencies",
+                 handle, target->path.c_str(), symbol.c_str());
+            return 0;
+        }
+
+        // When handle is RTLD_DEFAULT (0), prioritize Unity engine library for Unity symbols
+        if (symbol == "UnityInitApplication" || symbol == "UnityLoadApplication" ||
+            symbol.find("Unity") != std::string::npos) {
+            for (const auto* lib : linker_.libs()) {
+                if (lib->path.find("unity") != std::string::npos || lib->soname.find("unity") != std::string::npos) {
+                    const uint32_t at = lookup(lib);
+                    if (at) return at;
+                }
             }
         }
-        for (const auto* lib : linker_.libs()) {
-            const uint32_t at = lookup(lib);
+
+        // Search mapped payloads in reverse order (newest library first)
+        const auto& all_libs = linker_.libs();
+        for (auto rit = all_libs.rbegin(); rit != all_libs.rend(); ++rit) {
+            const uint32_t at = lookup(*rit);
             if (at) return at;
         }
+
         if (import_handlers_.count(symbol)) {
             return import_stub(symbol);
         }
@@ -7197,12 +7317,30 @@ public:
                  fn_p, code);
         }
 
-        jint rc = env_->RegisterNatives(clazz, host_methods.data(),
-                                        static_cast<jint>(host_methods.size()));
-        LOGI("RegisterNatives: %u methods -> rc=%d%s", count, rc,
-             rc == JNI_OK ? "" : " (failed to register with ART)");
-        if (rc != JNI_OK) env_->ExceptionClear();
-        return static_cast<uint32_t>(rc);
+        std::string cls_name = class_descriptor(clazz);
+        if (cls_name.size() > 2 && cls_name.front() == 'L' && cls_name.back() == ';') {
+            cls_name = cls_name.substr(1, cls_name.size() - 2);
+        }
+
+        jint registered = 0;
+        const size_t start_idx = natives_.size() - host_methods.size();
+        for (size_t i = 0; i < host_methods.size(); ++i) {
+            const auto& hm = host_methods[i];
+            const uint32_t guest_fn = natives_[start_idx + i].guest_fn;
+            jint r = env_->RegisterNatives(clazz, &hm, 1);
+            if (r == JNI_OK) {
+                registered++;
+                LOGI("RegisterNatives: bound %s.%s%s -> 0x%08x",
+                     cls_name.c_str(), hm.name, hm.signature, guest_fn);
+            } else {
+                LOGW("RegisterNatives: skipped optional/missing method %s.%s%s with ART (rc=%d)",
+                     cls_name.c_str(), hm.name, hm.signature, r);
+                env_->ExceptionClear();
+            }
+        }
+        LOGI("RegisterNatives: %d / %zu methods registered on class %s",
+             registered, host_methods.size(), cls_name.c_str());
+        return registered > 0 ? JNI_OK : JNI_ERR;
     }
 
     // =====================================================================
@@ -8463,7 +8601,7 @@ extern "C" JNIEXPORT void android_main(
 // Unity NativeLoader exports
 // ---------------------------------------------------------------------------
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_unity3d_player_NativeLoader_load(JNIEnv* env, jclass /*clazz*/, jstring libName) {
+Java_com_unity3d_player_NativeLoader_load(JNIEnv* env, jclass clazz, jstring libName) {
     std::string name;
     if (libName && env) {
         const char* str = env->GetStringUTFChars(libName, nullptr);
@@ -8474,47 +8612,85 @@ Java_com_unity3d_player_NativeLoader_load(JNIEnv* env, jclass /*clazz*/, jstring
     }
     LOGI("Java_com_unity3d_player_NativeLoader_load('%s')", name.c_str());
 
-    if (g_bridge && !name.empty()) {
-        std::string filename = name;
-        if (filename.find(".so") == std::string::npos) {
-            if (filename.rfind("lib", 0) != 0) {
-                filename = "lib" + filename + ".so";
-            } else {
-                filename = filename + ".so";
+    if (g_bridge) {
+        if (g_guest_loader) {
+            g_bridge->set_guest_loader(g_guest_loader);
+        }
+
+        // 1. If libmain32.so registered NativeLoader.load inside Unicorn, invoke it
+        uint32_t guest_fn = g_bridge->find_native_method("load", "(Ljava/lang/String;)Z");
+        if (!guest_fn) {
+            for (const auto* lib : g_bridge->libraries()) {
+                guest_fn = JniBridge::export_of(lib, "Java_com_unity3d_player_NativeLoader_load");
+                if (!guest_fn) guest_fn = JniBridge::export_of(lib, "Java_com_unity3d_player_NativeLoader_load__Ljava_lang_String_2");
+                if (guest_fn) break;
             }
         }
-        uint32_t handle = g_bridge->guest_dlopen(filename);
-        if (handle) {
-            LOGI("NativeLoader: loaded '%s' -> 0x%08x", filename.c_str(), handle);
-        } else {
-            g_bridge->guest_dlopen(name);
+
+        if (guest_fn) {
+            LOGI("Executing guest NativeLoader.load @ 0x%08x inside Unicorn", guest_fn);
+            uint32_t guest_str = libName ? g_bridge->to_guest_ref(libName) : 0;
+            uint32_t guest_cls = clazz ? g_bridge->to_guest_ref(clazz) : 0;
+            uint32_t ret = 0;
+            g_bridge->call_guest(guest_fn, {g_bridge->env_shadow(), guest_cls, guest_str}, ret, "NativeLoader.load");
+            LOGI("Guest NativeLoader.load completed with ret=%u", ret);
+        }
+
+        // 2. If an explicit library name was provided (not a directory path)
+        if (!name.empty() && name.find('/') == std::string::npos) {
+            std::string filename = name;
+            if (filename.find(".so") == std::string::npos) {
+                if (filename.rfind("lib", 0) != 0) {
+                    filename = "lib" + filename + ".so";
+                } else {
+                    filename = filename + ".so";
+                }
+            }
+            uint32_t handle = g_bridge->guest_dlopen(filename);
+            if (handle) {
+                LOGI("NativeLoader: explicitly loaded '%s' -> 0x%08x", filename.c_str(), handle);
+            }
+        }
+
+        // 3. Always ensure the core Unity libraries (libmono and libunity) are mapped and ready
+        g_bridge->guest_dlopen("libmono.so");
+        g_bridge->guest_dlopen("libunity.so");
+
+        g_bridge->resolve_all_needed();
+        g_bridge->link_all();
+        g_bridge->run_all_constructors();
+        g_bridge->bind_java_exports();
+
+        for (const auto* lib : g_bridge->libraries()) {
+            const uint32_t onload = JniBridge::export_of(lib, "JNI_OnLoad");
+            if (onload) {
+                uint32_t ret = 0;
+                g_bridge->call_onload(onload, ret, /*force=*/true);
+            }
         }
     }
     return JNI_TRUE;
 }
 
+// 0-argument overload (used by Unity 4.x/5.x: NativeLoader.unload()Z)
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_unity3d_player_NativeLoader_unload(JNIEnv* env, jclass /*clazz*/, jstring libName) {
-    std::string name;
-    if (libName && env) {
-        const char* str = env->GetStringUTFChars(libName, nullptr);
-        if (str) {
-            name = str;
-            env->ReleaseStringUTFChars(libName, str);
-        }
-    }
-    LOGI("Java_com_unity3d_player_NativeLoader_unload('%s')", name.c_str());
+Java_com_unity3d_player_NativeLoader_unload(JNIEnv* env, jclass /*clazz*/) {
+    (void)env;
+    LOGI("Java_com_unity3d_player_NativeLoader_unload()");
+    return JNI_TRUE;
+}
+
+// 1-argument overload
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_unity3d_player_NativeLoader_unload__Ljava_lang_String_2(JNIEnv* env, jclass clazz, jstring libName) {
+    (void)env; (void)clazz; (void)libName;
+    LOGI("Java_com_unity3d_player_NativeLoader_unload(String)");
     return JNI_TRUE;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_unity3d_player_NativeLoader_load__Ljava_lang_String_2(JNIEnv* env, jclass clazz, jstring libName) {
     return Java_com_unity3d_player_NativeLoader_load(env, clazz, libName);
-}
-
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_unity3d_player_NativeLoader_unload__Ljava_lang_String_2(JNIEnv* env, jclass clazz, jstring libName) {
-    return Java_com_unity3d_player_NativeLoader_unload(env, clazz, libName);
 }
 
 extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void* reserved) {

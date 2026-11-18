@@ -12,7 +12,7 @@
 
 #include <jni.h>
 #include <android/log.h>
-
+#include <dlfcn.h>
 #include <cstdio>
 
 #define LOG_TAG "ARM64_WRAPPER"
@@ -98,19 +98,41 @@ extern "C" JNIEXPORT void android_main(
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_unity3d_player_NativeLoader_load(
-        JNIEnv* /*env*/, jclass /*clazz*/, jstring /*libName*/) {
-    return JNI_TRUE;
-}
-
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_unity3d_player_NativeLoader_unload(
-        JNIEnv* /*env*/, jclass /*clazz*/, jstring /*libName*/) {
+        JNIEnv* env, jclass clazz, jstring libName) {
+    const char* path = libName && env ? env->GetStringUTFChars(libName, nullptr) : nullptr;
+    LOGI("passthrough NativeLoader_load: %s", path ? path : "(null)");
+    typedef jint (*JNI_OnLoad_fn)(JavaVM*, void*);
+    void* h_mono = ::dlopen("libmono.so", RTLD_NOW | RTLD_GLOBAL);
+    if (h_mono) {
+        auto onload = (JNI_OnLoad_fn)::dlsym(h_mono, "JNI_OnLoad");
+        if (onload && env) {
+            JavaVM* vm = nullptr;
+            env->GetJavaVM(&vm);
+            if (vm) onload(vm, nullptr);
+        }
+    }
+    void* h_unity = ::dlopen("libunity.so", RTLD_NOW | RTLD_GLOBAL);
+    if (h_unity) {
+        auto onload = (JNI_OnLoad_fn)::dlsym(h_unity, "JNI_OnLoad");
+        if (onload && env) {
+            JavaVM* vm = nullptr;
+            env->GetJavaVM(&vm);
+            if (vm) onload(vm, nullptr);
+        }
+    }
+    if (path && env) env->ReleaseStringUTFChars(libName, path);
     return JNI_TRUE;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_unity3d_player_NativeLoader_load__Ljava_lang_String_2(
-        JNIEnv* /*env*/, jclass /*clazz*/, jstring /*libName*/) {
+        JNIEnv* env, jclass clazz, jstring libName) {
+    return Java_com_unity3d_player_NativeLoader_load(env, clazz, libName);
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_unity3d_player_NativeLoader_unload(
+        JNIEnv* /*env*/, jclass /*clazz*/) {
     return JNI_TRUE;
 }
 

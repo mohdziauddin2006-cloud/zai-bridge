@@ -2,6 +2,7 @@ package com.ziauddin.zaibridge.core;
 
 import android.content.Context;
 import android.content.ContextWrapper;
+import android.content.pm.ApplicationInfo;
 import android.content.res.AssetManager;
 import android.content.res.Resources;
 import android.util.Log;
@@ -80,6 +81,31 @@ public final class GuestContext extends ContextWrapper {
             guestTheme.setTo(super.getTheme());
         }
         return guestTheme;
+    }
+
+    @Override
+    public String getPackageCodePath() {
+        return apk.getAbsolutePath();
+    }
+
+    @Override
+    public String getPackageResourcePath() {
+        return apk.getAbsolutePath();
+    }
+
+    @Override
+    public ApplicationInfo getApplicationInfo() {
+        ApplicationInfo ai = super.getApplicationInfo();
+        if (ai != null) {
+            ApplicationInfo guestAi = new ApplicationInfo(ai);
+            guestAi.packageName = guestPackage;
+            guestAi.sourceDir = apk.getAbsolutePath();
+            guestAi.publicSourceDir = apk.getAbsolutePath();
+            guestAi.nativeLibraryDir = new File(gameDir, "native").getAbsolutePath();
+            guestAi.dataDir = new File(gameDir, "data").getAbsolutePath();
+            return guestAi;
+        }
+        return ai;
     }
 
     @Override

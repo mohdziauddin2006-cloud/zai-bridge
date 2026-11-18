@@ -135,6 +135,13 @@ public class MainActivity extends AppCompatActivity implements GameAdapter.Liste
     }
 
     @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        refreshGames();
+    }
+
+    @Override
     protected void onDestroy() {
         // A BottomSheetDialog holds a window; leaving it attached to a
         // destroyed Activity is the classic leaked-window crash on relaunch.
@@ -174,8 +181,27 @@ public class MainActivity extends AppCompatActivity implements GameAdapter.Liste
                 adapter.setGames(games);
                 emptyState.setVisibility(games.isEmpty() ? View.VISIBLE : View.GONE);
                 recycler.setVisibility(games.isEmpty() ? View.GONE : View.VISIBLE);
+                checkPendingLaunch(games);
             });
         });
+    }
+
+    private void checkPendingLaunch(List<Game> games) {
+        if (games == null || games.isEmpty()) return;
+        Intent intent = getIntent();
+        if (intent != null && intent.hasExtra("launch_package")) {
+            String pkg = intent.getStringExtra("launch_package");
+            intent.removeExtra("launch_package");
+            if (pkg != null && !pkg.isEmpty()) {
+                for (Game g : games) {
+                    if ("first".equals(pkg) || pkg.equals(g.packageName) || pkg.equals(g.directoryName)) {
+                        Log.i(TAG, "auto-launching requested game: " + g.label);
+                        launch(g);
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     @Override
