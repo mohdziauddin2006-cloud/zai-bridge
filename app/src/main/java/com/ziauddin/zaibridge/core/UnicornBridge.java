@@ -124,6 +124,21 @@ public final class UnicornBridge {
         return CORE_LOADED && nativeIsSessionActive();
     }
 
+    /**
+     * Tears the guest session down: releases the Unicorn engine, its 64 MB
+     * guest address space, and every compositor texture/program. Called when a
+     * game's host Activity is destroyed so the next import can be launched in
+     * the same process without "session already running".
+     */
+    public static void endSession() {
+        if (!CORE_LOADED) return;
+        try {
+            nativeEndSession();
+        } catch (Throwable t) {
+            Log.w(TAG, "session teardown failed", t);
+        }
+    }
+
     /** Unicorn version and guest/host architecture, for diagnostics. */
     public static native String nativeVersion();
 
@@ -138,4 +153,6 @@ public final class UnicornBridge {
     private static native void nativeSetGuestActivity(Object activity);
 
     private static native boolean nativeIsSessionActive();
+
+    private static native void nativeEndSession();
 }

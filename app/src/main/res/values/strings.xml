@@ -1,20 +1,37 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Zai-Bridge</string>
-    <string name="app_tagline">Legacy 32-bit games, native 64-bit host</string>
+    <string name="app_tagline">Legacy 32-bit games · native 64-bit host</string>
 
     <string name="import_game">Import game</string>
-    <string name="empty_title">No games yet</string>
-    <string name="empty_body">Import a 32-bit APK, attach its OBB if it has one, and Zai-Bridge will keep both in private storage.</string>
-    <string name="permission_body">Grant all-files access to browse your phone for old APKs and OBBs.</string>
+    <string name="import_first">Import your first game</string>
+    <string name="empty_title">Your library is empty</string>
+    <string name="empty_body">Bring a 32-bit APK — attach its OBB if it ships one. Zai-Bridge runs it natively and rebuilds every frame with Zai-Scale Ultra.</string>
+    <string name="permission_body">Grant all-files access so Zai-Bridge can find legacy APK and OBB pairs on this device.</string>
     <string name="permission_action">Grant access</string>
     <string name="granted">All-files access granted</string>
+
+    <string name="search_games">Search library…</string>
+    <string name="hardware_active">%1$s · Hardware GPU active</string>
+    <string name="hardware_software">%1$s · Software fallback</string>
+    <string name="engine_settings">Engine &amp; graphics</string>
 
     <string name="dialog_obb_title">Expansion file</string>
     <string name="dialog_obb_message">Does this game ship an OBB? Attach it and it will be moved into private storage, hidden from the launcher grid.</string>
     <string name="dialog_obb_choose">Attach OBB</string>
     <string name="dialog_obb_skip">No OBB</string>
     <string name="cancel">Cancel</string>
+    <string name="close">Close</string>
+
+    <string name="import_sheet_title">Import a game</string>
+    <string name="import_sheet_sub">Pick the APK, then optionally its expansion file. Everything stays in private storage.</string>
+    <string name="select_apk">Game APK</string>
+    <string name="select_obb">Expansion file (optional)</string>
+    <string name="select_apk_hint">Tap to choose a .apk</string>
+    <string name="select_obb_hint">Tap to attach an .obb</string>
+    <string name="no_file">No file selected</string>
+    <string name="start_import">Start import</string>
+    <string name="import_ready_hint">Import begins as soon as an APK is selected.</string>
 
     <string name="importing_title">Importing</string>
     <string name="importing_body">Copying into private storage…</string>
@@ -27,25 +44,58 @@
     <string name="bridge_failed">Bridge error (%1$d). See logcat tag ARM64_WRAPPER.</string>
     <string name="bridge_unavailable">Native core unavailable on this device</string>
 
-    <!-- Graphics pipeline (upscaling + frame generation) -->
-    <string name="graphics_defaults">Graphics defaults</string>
+    <!-- Zai-Scale Ultra / graphics pipeline -->
+    <string name="graphics_defaults">Engine &amp; graphics</string>
     <string name="graphics_title">Graphics</string>
     <string name="graphics_upscaler">Upscaler</string>
-    <string name="graphics_scale">Render resolution</string>
+    <string name="graphics_scale">Render scale</string>
     <string name="graphics_sharpness">Sharpness</string>
+    <string name="graphics_neural">Neural contrast &amp; lighting</string>
     <string name="graphics_frame_gen">Frame generation</string>
+    <string name="graphics_temporal">Temporal history (TSR)</string>
+    <string name="graphics_auto_mfg">Dynamic auto-MFG</string>
     <string name="graphics_off">Off</string>
-    <string name="graphics_sgsr">SGSR (Mobile Edge-Aware)</string>
-    <string name="graphics_fsr">FSR 1.0 (EASU + RCAS)</string>
+    <string name="graphics_sgsr">Mobile SGSR</string>
+    <string name="graphics_fsr">FSR temporal + EASU/RCAS</string>
+    <string name="graphics_dlss">DLSS-5 neural + MFG</string>
     <string name="graphics_scale_50">50% — Performance</string>
     <string name="graphics_scale_67">67% — Balanced</string>
     <string name="graphics_scale_75">75% — Quality</string>
-    <string name="graphics_scale_100">100% — Native</string>
-    <string name="graphics_frame_gen_2x">2x Fluid Motion</string>
+    <string name="graphics_scale_85">85% — Ultra Quality</string>
+    <string name="graphics_scale_100">100% — Native AA</string>
+    <string name="graphics_frame_gen_2x">2x MFG</string>
+    <string name="graphics_frame_gen_3x">3x MFG</string>
+    <string name="graphics_frame_gen_4x">4x MFG</string>
     <string name="graphics_save">Save</string>
     <string name="graphics_use_global">Use global defaults</string>
     <string name="graphics_saved">Graphics updated</string>
     <string name="graphics_all">All settings…</string>
     <string name="graphics_close">Close</string>
-    <string name="graphics_quick">Quick graphics</string>
+    <string name="graphics_quick">Zai-Scale control</string>
+
+    <string name="preset">All-in-one preset</string>
+    <string name="preset_off">Off</string>
+    <string name="preset_fsr_perf">FSR Performance</string>
+    <string name="preset_fsr_quality">FSR Quality</string>
+    <string name="preset_dlss_ultra">DLSS-5 Ultra</string>
+    <string name="preset_dlss_overdrive">4x Overdrive</string>
+    <string name="preset_custom">Custom</string>
+
+    <string name="orientation">Orientation lock</string>
+    <string name="orientation_auto">Auto</string>
+    <string name="orientation_landscape">Landscape</string>
+    <string name="orientation_portrait">Portrait</string>
+    <string name="obb_ready">OBB ready</string>
+    <string name="obb_none">No expansion file</string>
+    <string name="play_fullscreen">Play fullscreen</string>
+    <string name="engine_defaults_sub">Applies to every game without an override</string>
+    <string name="value_percent">%1$d%%</string>
+    <string name="value_scale">%1$d%% · %2$s</string>
+
+    <string name="telemetry">%1$s · %2$s</string>
+    <string name="exit_game">Exit game</string>
+    <string name="compare_wipe">Split compare</string>
+    <string name="compare_vanilla">Vanilla</string>
+    <string name="compare_zaiscale">Zai-Scale</string>
+    <string name="game_details">Game details</string>
 </resources>

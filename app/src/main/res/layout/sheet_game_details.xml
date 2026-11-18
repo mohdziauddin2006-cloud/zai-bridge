@@ -1,0 +1,457 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.core.widget.NestedScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:background="@drawable/bg_sheet"
+    android:overScrollMode="never">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:paddingBottom="26dp">
+
+        <!-- Banner -->
+        <FrameLayout
+            android:layout_width="match_parent"
+            android:layout_height="150dp">
+
+            <View
+                android:id="@+id/view_details_glow"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:background="@drawable/bg_ambient_glow" />
+
+            <View
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:background="@drawable/bg_scrim" />
+
+            <View
+                android:layout_width="38dp"
+                android:layout_height="4dp"
+                android:layout_gravity="top|center_horizontal"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/bg_handle" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_gravity="bottom"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingStart="22dp"
+                android:paddingEnd="22dp"
+                android:paddingBottom="16dp">
+
+                <ImageView
+                    android:id="@+id/iv_details_icon"
+                    android:layout_width="62dp"
+                    android:layout_height="62dp"
+                    android:contentDescription="@null"
+                    android:scaleType="fitCenter"
+                    tools:src="@mipmap/ic_launcher" />
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="14dp"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <TextView
+                        android:id="@+id/tv_details_name"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:ellipsize="end"
+                        android:maxLines="1"
+                        android:textColor="@color/zb_text"
+                        android:textSize="19sp"
+                        android:textStyle="bold"
+                        tools:text="Asphalt 8" />
+
+                    <TextView
+                        android:id="@+id/tv_details_package"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="2dp"
+                        android:ellipsize="middle"
+                        android:fontFeatureSettings="tnum"
+                        android:maxLines="1"
+                        android:textColor="@color/zb_text_dim"
+                        android:textSize="10.5sp"
+                        tools:text="com.gameloft.android.ANMP.GloftA8HM" />
+
+                    <TextView
+                        android:id="@+id/tv_details_obb"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="3dp"
+                        android:maxLines="1"
+                        android:textColor="@color/zb_accent"
+                        android:textSize="10.5sp"
+                        tools:text="OBB ready" />
+                </LinearLayout>
+
+                <ImageButton
+                    android:id="@+id/btn_close_details"
+                    android:layout_width="34dp"
+                    android:layout_height="34dp"
+                    android:background="@drawable/bg_icon_button"
+                    android:contentDescription="@string/close"
+                    android:padding="8dp"
+                    android:src="@drawable/ic_close" />
+            </LinearLayout>
+        </FrameLayout>
+
+        <!-- Presets -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="22dp"
+            android:layout_marginTop="16dp"
+            android:letterSpacing="0.12"
+            android:text="@string/preset"
+            android:textAllCaps="true"
+            android:textColor="@color/zb_text_dim"
+            android:textSize="9.5sp" />
+
+        <HorizontalScrollView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:clipToPadding="false"
+            android:paddingStart="22dp"
+            android:paddingEnd="22dp"
+            android:scrollbars="none">
+
+            <com.google.android.material.chip.ChipGroup
+                android:id="@+id/chips_preset"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                app:chipSpacingHorizontal="8dp"
+                app:selectionRequired="true"
+                app:singleSelection="true">
+
+                <com.google.android.material.chip.Chip
+                    android:id="@+id/chip_preset_off"
+                    style="@style/Widget.ZaiBridge.Chip"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:checkable="true"
+                    android:text="@string/preset_off" />
+
+                <com.google.android.material.chip.Chip
+                    android:id="@+id/chip_preset_fsr_perf"
+                    style="@style/Widget.ZaiBridge.Chip"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:checkable="true"
+                    android:text="@string/preset_fsr_perf" />
+
+                <com.google.android.material.chip.Chip
+                    android:id="@+id/chip_preset_fsr_quality"
+                    style="@style/Widget.ZaiBridge.Chip"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:checkable="true"
+                    android:text="@string/preset_fsr_quality" />
+
+                <com.google.android.material.chip.Chip
+                    android:id="@+id/chip_preset_dlss_ultra"
+                    style="@style/Widget.ZaiBridge.Chip"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:checkable="true"
+                    android:text="@string/preset_dlss_ultra" />
+
+                <com.google.android.material.chip.Chip
+                    android:id="@+id/chip_preset_dlss_overdrive"
+                    style="@style/Widget.ZaiBridge.Chip"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:checkable="true"
+                    android:text="@string/preset_dlss_overdrive" />
+            </com.google.android.material.chip.ChipGroup>
+        </HorizontalScrollView>
+
+        <LinearLayout
+            android:id="@+id/wrap_orientation"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="22dp"
+                android:layout_marginTop="18dp"
+                android:letterSpacing="0.12"
+                android:text="@string/orientation"
+                android:textAllCaps="true"
+                android:textColor="@color/zb_text_dim"
+                android:textSize="9.5sp" />
+
+            <com.google.android.material.chip.ChipGroup
+                android:id="@+id/chips_orientation"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="22dp"
+                android:layout_marginTop="8dp"
+                android:layout_marginEnd="22dp"
+                app:chipSpacingHorizontal="8dp"
+                app:selectionRequired="true"
+                app:singleSelection="true">
+
+                <com.google.android.material.chip.Chip
+                    android:id="@+id/chip_orient_auto"
+                    style="@style/Widget.ZaiBridge.Chip"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:checkable="true"
+                    android:text="@string/orientation_auto" />
+
+                <com.google.android.material.chip.Chip
+                    android:id="@+id/chip_orient_landscape"
+                    style="@style/Widget.ZaiBridge.Chip"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:checkable="true"
+                    android:text="@string/orientation_landscape" />
+
+                <com.google.android.material.chip.Chip
+                    android:id="@+id/chip_orient_portrait"
+                    style="@style/Widget.ZaiBridge.Chip"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:checkable="true"
+                    android:text="@string/orientation_portrait" />
+            </com.google.android.material.chip.ChipGroup>
+        </LinearLayout>
+
+        <!-- Sliders -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="22dp"
+            android:layout_marginTop="18dp"
+            android:layout_marginEnd="22dp"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:letterSpacing="0.12"
+                android:text="@string/graphics_scale"
+                android:textAllCaps="true"
+                android:textColor="@color/zb_text_dim"
+                android:textSize="9.5sp" />
+
+            <TextView
+                android:id="@+id/tv_scale_value"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:fontFeatureSettings="tnum"
+                android:textColor="@color/zb_accent"
+                android:textSize="11sp"
+                android:textStyle="bold"
+                tools:text="85%" />
+        </LinearLayout>
+
+        <com.google.android.material.slider.Slider
+            android:id="@+id/slider_scale"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="16dp"
+            android:layout_marginEnd="16dp"
+            android:stepSize="1"
+            android:value="85"
+            app:labelBehavior="gone"
+            android:valueFrom="50"
+            android:valueTo="100" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="22dp"
+            android:layout_marginTop="6dp"
+            android:layout_marginEnd="22dp"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:letterSpacing="0.12"
+                android:text="@string/graphics_sharpness"
+                android:textAllCaps="true"
+                android:textColor="@color/zb_text_dim"
+                android:textSize="9.5sp" />
+
+            <TextView
+                android:id="@+id/tv_sharp_value"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:fontFeatureSettings="tnum"
+                android:textColor="@color/zb_accent"
+                android:textSize="11sp"
+                android:textStyle="bold"
+                tools:text="45%" />
+        </LinearLayout>
+
+        <com.google.android.material.slider.Slider
+            android:id="@+id/slider_sharpness"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="16dp"
+            android:layout_marginEnd="16dp"
+            android:stepSize="1"
+            android:value="45"
+            app:labelBehavior="gone"
+            android:valueFrom="0"
+            android:valueTo="100" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="22dp"
+            android:layout_marginTop="6dp"
+            android:layout_marginEnd="22dp"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:letterSpacing="0.12"
+                android:text="@string/graphics_neural"
+                android:textAllCaps="true"
+                android:textColor="@color/zb_text_dim"
+                android:textSize="9.5sp" />
+
+            <TextView
+                android:id="@+id/tv_neural_value"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:fontFeatureSettings="tnum"
+                android:textColor="@color/zb_accent"
+                android:textSize="11sp"
+                android:textStyle="bold"
+                tools:text="55%" />
+        </LinearLayout>
+
+        <com.google.android.material.slider.Slider
+            android:id="@+id/slider_neural"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="16dp"
+            android:layout_marginEnd="16dp"
+            android:stepSize="1"
+            android:value="55"
+            app:labelBehavior="gone"
+            android:valueFrom="0"
+            android:valueTo="100" />
+
+        <!-- Frame generation -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="22dp"
+            android:layout_marginTop="12dp"
+            android:letterSpacing="0.12"
+            android:text="@string/graphics_frame_gen"
+            android:textAllCaps="true"
+            android:textColor="@color/zb_text_dim"
+            android:textSize="9.5sp" />
+
+        <com.google.android.material.chip.ChipGroup
+            android:id="@+id/chips_frame_gen"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="22dp"
+            android:layout_marginTop="8dp"
+            android:layout_marginEnd="22dp"
+            app:chipSpacingHorizontal="8dp"
+            app:selectionRequired="true"
+            app:singleSelection="true">
+
+            <com.google.android.material.chip.Chip
+                android:id="@+id/chip_fg_off"
+                style="@style/Widget.ZaiBridge.Chip"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:checkable="true"
+                android:text="@string/graphics_off" />
+
+            <com.google.android.material.chip.Chip
+                android:id="@+id/chip_fg_2x"
+                style="@style/Widget.ZaiBridge.Chip"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:checkable="true"
+                android:text="@string/graphics_frame_gen_2x" />
+
+            <com.google.android.material.chip.Chip
+                android:id="@+id/chip_fg_3x"
+                style="@style/Widget.ZaiBridge.Chip"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:checkable="true"
+                android:text="@string/graphics_frame_gen_3x" />
+
+            <com.google.android.material.chip.Chip
+                android:id="@+id/chip_fg_4x"
+                style="@style/Widget.ZaiBridge.Chip"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:checkable="true"
+                android:text="@string/graphics_frame_gen_4x" />
+        </com.google.android.material.chip.ChipGroup>
+
+        <androidx.appcompat.widget.SwitchCompat
+            android:id="@+id/switch_auto_mfg"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="22dp"
+            android:layout_marginTop="14dp"
+            android:layout_marginEnd="22dp"
+            android:text="@string/graphics_auto_mfg"
+            android:textColor="@color/zb_text"
+            android:textSize="12sp" />
+
+        <Button
+            android:id="@+id/btn_play"
+            android:layout_width="match_parent"
+            android:layout_height="57dp"
+            android:layout_marginStart="22dp"
+            android:layout_marginTop="22dp"
+            android:layout_marginEnd="22dp"
+            android:background="@drawable/bg_cta_gradient"
+            android:drawableStart="@drawable/ic_play"
+            android:drawablePadding="10dp"
+            android:gravity="center"
+            android:letterSpacing="0.10"
+            android:stateListAnimator="@null"
+            android:text="@string/play_fullscreen"
+            android:textAllCaps="true"
+            android:textColor="@color/zb_on_accent"
+            android:textSize="14sp"
+            android:textStyle="bold" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btn_use_global"
+            style="@style/Widget.Material3.Button.TextButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center_horizontal"
+            android:layout_marginTop="8dp"
+            android:text="@string/graphics_use_global"
+            android:textColor="@color/zb_text_dim"
+            android:textSize="11.5sp" />
+
+    </LinearLayout>
+
+</androidx.core.widget.NestedScrollView>

@@ -1,64 +1,119 @@
 <?xml version="1.0" encoding="utf-8"?>
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="@drawable/bg_app"
-    android:fitsSystemWindows="true">
+    android:fitsSystemWindows="true"
+    tools:context=".MainActivity">
 
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:orientation="vertical"
-        android:paddingStart="20dp"
-        android:paddingTop="22dp"
-        android:paddingEnd="20dp">
+        android:paddingStart="18dp"
+        android:paddingTop="16dp"
+        android:paddingEnd="18dp">
 
+        <!-- Glass header -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <ImageView
+                android:layout_width="44dp"
+                android:layout_height="44dp"
+                android:contentDescription="@null"
+                android:src="@drawable/ic_emblem" />
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="12dp"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:letterSpacing="0.03"
+                    android:text="@string/app_name"
+                    android:textColor="@color/zb_text"
+                    android:textSize="23sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:letterSpacing="0.02"
+                    android:text="@string/app_tagline"
+                    android:textColor="@color/zb_text_dim"
+                    android:textSize="10.5sp" />
+            </LinearLayout>
+
+            <ImageButton
+                android:id="@+id/btn_graphics_defaults"
+                android:layout_width="44dp"
+                android:layout_height="44dp"
+                android:background="@drawable/bg_icon_button"
+                android:contentDescription="@string/engine_settings"
+                android:padding="11dp"
+                android:src="@drawable/ic_tune" />
+        </LinearLayout>
+
+        <!-- Detected hardware -->
         <TextView
+            android:id="@+id/tv_hardware"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:letterSpacing="0.08"
-            android:text="@string/app_name"
-            android:textColor="@color/zb_text"
-            android:textSize="30sp"
-            android:textStyle="bold" />
-
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="2dp"
-            android:letterSpacing="0.02"
-            android:text="@string/app_tagline"
-            android:textColor="@color/zb_text_dim"
-            android:textSize="13sp" />
-
-        <!-- Global default for the upscaler / frame-generation pipeline. -->
-        <TextView
-            android:id="@+id/btn_graphics_defaults"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
+            android:layout_marginTop="14dp"
             android:background="@drawable/bg_status_pill"
-            android:paddingStart="14dp"
+            android:drawableStart="@drawable/ic_shield"
+            android:drawablePadding="7dp"
+            android:letterSpacing="0.04"
+            android:paddingStart="12dp"
             android:paddingTop="7dp"
-            android:paddingEnd="14dp"
+            android:paddingEnd="13dp"
             android:paddingBottom="7dp"
-            android:text="@string/graphics_defaults"
-            android:textAllCaps="false"
             android:textColor="@color/zb_accent"
-            android:textSize="11sp" />
+            android:textSize="10.5sp"
+            tools:text="ARM64 · Hardware GPU active" />
 
+        <!-- Library search -->
+        <androidx.appcompat.widget.AppCompatEditText
+            android:id="@+id/et_search"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:layout_marginTop="14dp"
+            android:background="@drawable/bg_search"
+            android:drawableStart="@drawable/ic_search"
+            android:drawablePadding="10dp"
+            android:hint="@string/search_games"
+            android:imeOptions="actionSearch"
+            android:inputType="text"
+            android:paddingStart="14dp"
+            android:paddingEnd="14dp"
+            android:singleLine="true"
+            android:textColor="@color/zb_text"
+            android:textColorHint="@color/zb_text_faint"
+            android:textSize="13.5sp" />
+
+        <!-- Storage permission banner -->
         <LinearLayout
             android:id="@+id/banner_permission"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="18dp"
+            android:layout_marginTop="12dp"
             android:background="@drawable/bg_banner"
             android:gravity="center_vertical"
             android:orientation="horizontal"
-            android:paddingStart="16dp"
-            android:paddingTop="12dp"
-            android:paddingEnd="12dp"
-            android:paddingBottom="12dp"
+            android:paddingStart="14dp"
+            android:paddingTop="11dp"
+            android:paddingEnd="10dp"
+            android:paddingBottom="11dp"
             android:visibility="gone">
 
             <TextView
@@ -66,46 +121,45 @@
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
+                android:lineSpacingExtra="2dp"
                 android:text="@string/permission_body"
-                android:textColor="@color/zb_text_dim"
-                android:textSize="12sp" />
+                android:textColor="#FFE0B2"
+                android:textSize="11.5sp" />
 
-            <Button
+            <com.google.android.material.button.MaterialButton
                 android:id="@+id/btn_grant"
+                style="@style/Widget.ZaiBridge.Button"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:backgroundTint="@color/zb_accent"
+                android:layout_marginStart="10dp"
                 android:minWidth="0dp"
                 android:minHeight="0dp"
                 android:paddingStart="14dp"
-                android:paddingTop="8dp"
+                android:paddingTop="7dp"
                 android:paddingEnd="14dp"
-                android:paddingBottom="8dp"
+                android:paddingBottom="7dp"
                 android:text="@string/permission_action"
-                android:textAllCaps="false"
-                android:textColor="#04121A"
-                android:textSize="12sp"
-                android:textStyle="bold" />
+                android:textSize="11.5sp"
+                app:backgroundTint="@color/zb_amber"
+                app:cornerRadius="12dp" />
         </LinearLayout>
 
         <FrameLayout
             android:layout_width="match_parent"
             android:layout_height="0dp"
-            android:layout_weight="1"
-            android:layout_marginTop="14dp">
+            android:layout_marginTop="10dp"
+            android:layout_weight="1">
 
-            <GridView
-                android:id="@+id/grid_games"
+            <androidx.recyclerview.widget.RecyclerView
+                android:id="@+id/recycler_games"
                 android:layout_width="match_parent"
                 android:layout_height="match_parent"
                 android:clipToPadding="false"
-                android:columnWidth="152dp"
-                android:horizontalSpacing="12dp"
-                android:numColumns="auto_fit"
-                android:paddingBottom="96dp"
-                android:scrollbars="none"
-                android:stretchMode="columnWidth"
-                android:verticalSpacing="12dp" />
+                android:paddingStart="2dp"
+                android:paddingTop="4dp"
+                android:paddingEnd="2dp"
+                android:paddingBottom="102dp"
+                android:scrollbars="none" />
 
             <LinearLayout
                 android:id="@+id/empty_state"
@@ -113,52 +167,66 @@
                 android:layout_height="match_parent"
                 android:gravity="center"
                 android:orientation="vertical"
-                android:paddingBottom="80dp">
+                android:paddingBottom="70dp"
+                android:visibility="gone">
 
                 <ImageView
-                    android:layout_width="96dp"
-                    android:layout_height="96dp"
-                    android:alpha="0.75"
+                    android:layout_width="104dp"
+                    android:layout_height="104dp"
+                    android:alpha="0.9"
                     android:contentDescription="@null"
-                    android:src="@drawable/ic_launcher_foreground" />
+                    android:src="@drawable/ic_emblem" />
 
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:layout_marginTop="14dp"
+                    android:layout_marginTop="18dp"
                     android:text="@string/empty_title"
                     android:textColor="@color/zb_text"
-                    android:textSize="18sp"
+                    android:textSize="19sp"
                     android:textStyle="bold" />
 
                 <TextView
-                    android:layout_width="280dp"
+                    android:layout_width="290dp"
                     android:layout_height="wrap_content"
-                    android:layout_marginTop="6dp"
+                    android:layout_marginTop="8dp"
                     android:gravity="center"
-                    android:lineSpacingExtra="3dp"
+                    android:lineSpacingExtra="4dp"
                     android:text="@string/empty_body"
                     android:textColor="@color/zb_text_dim"
-                    android:textSize="13sp" />
+                    android:textSize="12.5sp" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btn_empty_import"
+                    style="@style/Widget.ZaiBridge.Button"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="20dp"
+                    android:text="@string/import_first"
+                    android:textColor="@color/zb_on_accent"
+                    android:textSize="13sp"
+                    app:backgroundTint="@color/zb_accent"
+                    app:cornerRadius="14dp" />
             </LinearLayout>
         </FrameLayout>
     </LinearLayout>
 
-    <Button
+    <com.google.android.material.floatingactionbutton.ExtendedFloatingActionButton
         android:id="@+id/btn_import"
         android:layout_width="wrap_content"
-        android:layout_height="52dp"
+        android:layout_height="56dp"
         android:layout_gravity="bottom|end"
-        android:layout_marginEnd="22dp"
-        android:layout_marginBottom="26dp"
-        android:background="@drawable/bg_import_button"
-        android:elevation="8dp"
-        android:paddingStart="24dp"
-        android:paddingEnd="24dp"
+        android:layout_marginEnd="20dp"
+        android:layout_marginBottom="24dp"
         android:text="@string/import_game"
         android:textAllCaps="false"
-        android:textColor="#04121A"
-        android:textSize="14sp"
-        android:textStyle="bold" />
+        android:textColor="@color/zb_on_accent"
+        android:textSize="13.5sp"
+        android:textStyle="bold"
+        app:backgroundTint="@color/zb_accent"
+        app:elevation="10dp"
+        app:icon="@drawable/ic_import"
+        app:iconTint="@color/zb_on_accent"
+        app:rippleColor="#3304121A" />
 
 </FrameLayout>

@@ -2,8 +2,11 @@ package com.ziauddin.zaibridge.core;
 
 import android.util.Log;
 
+import com.ziauddin.zaibridge.data.GraphicsSettings;
+
 /**
- * Frame accounting, upscaling and frame generation at the Java EGL boundary.
+ * Frame accounting, upscaling and multi-frame generation at the Java EGL
+ * boundary.
  *
  * <p>The native core only sees {@code eglSwapBuffers} when the <em>payload</em>
  * imports it — a pure NDK game. A game whose renderer is a Java
@@ -14,12 +17,13 @@ import android.util.Log;
  *
  * <p>Both of those are {@code native} methods, so the bridge re-registers them
  * with its own JNI thunks and forwards to the real {@code libEGL.so}. The same
- * registration point runs the GPU compositor (SGSR/FSR upscaling and 2x
- * motion-compensated frame generation) before the frame is presented.
+ * registration point runs the Zai-Scale Ultra compositor (temporal SR, neural
+ * detail reconstruction and 2x/3x/4x motion-compensated frame generation)
+ * before the frame is presented.
  *
  * <p>The compositor configuration is process-wide and is applied by the native
  * side on the guest's own GL thread, so {@link #configure} may be called from
- * the launcher or from the in-game menu at any time.
+ * the launcher or from the in-game drawer at any time.
  */
 public final class EglSwapHook {
 
@@ -62,21 +66,50 @@ public final class EglSwapHook {
         return INSTALLED;
     }
 
+    /** Applies a full configuration, including the one-tap preset id. */
+    public static void configure(GraphicsSettings settings) {
+        if (settings == null) return;
+        configure(settings.upscaler, settings.scalePercent, settings.sharpnessPercent,
+                settings.neuralPercent, settings.frameGen, settings.temporal,
+                settings.autoMfg, settings.preset);
+    }
+
     /**
      * Applies the effective graphics configuration to the compositor.
      *
-     * @param upscaler         0 = off, 1 = SGSR, 2 = FSR 1.0
-     * @param scalePercent     50 / 67 / 75 / 100
-     * @param sharpnessPercent 0-100
-     * @param frameGen         0 = off, 2 = 2x fluid motion
+     * @param upscaler         0 off, 1 mobile SGSR, 2 FSR temporal, 3 DLSS-5
+     * @param scalePercent     50 / 67 / 75 / 85 / 100
+     * @param sharpnessPercent 0-100 RCAS strength
+     * @param neuralPercent    0-100 local contrast / specular / micro-detail
+     * @param frameGen         0 off, 2 / 3 / 4 synthetic frames per real frame
+     * @param temporal         0 or 1, temporal history accumulation
+     * @param autoMfg          0 or 1, dynamic multiplier from measured headroom
+     * @param preset           preset id recorded for telemetry / restore
      */
     public static void configure(int upscaler, int scalePercent, int sharpnessPercent,
-                                 int frameGen) {
+                                 int neuralPercent, int frameGen, int temporal,
+                                 int autoMfg, int preset) {
         if (!LOADED) return;
         try {
-            nativeConfigure(upscaler, scalePercent, sharpnessPercent, frameGen);
+            nativeConfigure(upscaler, scalePercent, sharpnessPercent, neuralPercent,
+                    frameGen, temporal, autoMfg, preset);
         } catch (Throwable t) {
             Log.w(TAG, "graphics configuration rejected: " + t);
+        }
+    }
+
+    /**
+     * Split-screen before/after wipe. {@code 0} disables the comparison and
+     * presents the processed frame; {@code 0.05..0.95} shows vanilla on the
+     * left of the divider and Zai-Scale on the right, live, without touching
+     * the temporal history.
+     */
+    public static void setCompare(float split) {
+        if (!LOADED) return;
+        try {
+            nativeSetCompare(split);
+        } catch (Throwable t) {
+            Log.w(TAG, "compare wipe rejected: " + t);
         }
     }
 
@@ -115,7 +148,11 @@ public final class EglSwapHook {
     private static native String nativeStats();
 
     private static native void nativeConfigure(int upscaler, int scalePercent,
-                                               int sharpnessPercent, int frameGen);
+                                               int sharpnessPercent, int neuralPercent,
+                                               int frameGen, int temporal,
+                                               int autoMfg, int preset);
+
+    private static native void nativeSetCompare(float split);
 
     private static native String nativeCompositorStats();
 

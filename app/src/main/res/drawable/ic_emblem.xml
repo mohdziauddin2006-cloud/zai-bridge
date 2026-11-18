@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="40dp"
+    android:height="40dp"
+    android:viewportWidth="40"
+    android:viewportHeight="40">
+    <!-- Hexagonal bridge emblem with the Z lightning cut. -->
+    <path
+        android:pathData="M20,2.5 L34.7,11 L34.7,29 L20,37.5 L5.3,29 L5.3,11 Z"
+        android:strokeColor="#00E5FF"
+        android:strokeWidth="1.8"
+        android:fillColor="#0B0E14" />
+    <path
+        android:pathData="M13,13.5 L27,13.5 L27,16.4 L18.4,22.6 L27,22.6 L27,26.5 L13,26.5 L13,23.6 L21.6,17.4 L13,17.4 Z"
+        android:fillColor="#00E5FF" />
+    <path
+        android:pathData="M20,5.5 L24,8 L20,10.5 L16,8 Z"
+        android:fillColor="#FFB300" />
+</vector>

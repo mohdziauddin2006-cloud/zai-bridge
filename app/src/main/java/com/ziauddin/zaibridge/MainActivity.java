@@ -1,27 +1,39 @@
 package com.ziauddin.zaibridge;
 
-import android.Manifest;
 import android.app.Activity;
-import android.app.AlertDialog;
-import android.content.ActivityNotFoundException;
 import android.content.Intent;
-import android.content.pm.PackageManager;
-import android.net.Uri;
-import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.ResultReceiver;
+
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.recyclerview.widget.GridLayoutManager;
+import androidx.recyclerview.widget.RecyclerView;
+
+import android.Manifest;
+import android.content.ActivityNotFoundException;
+import android.content.pm.PackageManager;
+import android.net.Uri;
+import android.os.Build;
+import android.provider.OpenableColumns;
 import android.provider.Settings;
+import android.text.Editable;
+import android.text.TextWatcher;
 import android.util.Log;
 import android.view.View;
+import android.view.Window;
+import android.view.WindowManager;
 import android.widget.Button;
-import android.widget.GridView;
+import android.widget.EditText;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import com.ziauddin.zaibridge.GameHostActivity;
+import com.ziauddin.zaibridge.R;
 import com.ziauddin.zaibridge.core.BridgeInstrumentation;
+import com.ziauddin.zaibridge.core.EglSwapHook;
 import com.ziauddin.zaibridge.core.GuestLauncher;
 import com.ziauddin.zaibridge.data.Game;
 import com.ziauddin.zaibridge.data.GameAdapter;
@@ -29,17 +41,18 @@ import com.ziauddin.zaibridge.data.GameRepository;
 import com.ziauddin.zaibridge.data.GraphicsSettings;
 import com.ziauddin.zaibridge.proxy.ProxyGameActivity;
 import com.ziauddin.zaibridge.service.IngestionService;
-import com.ziauddin.zaibridge.ui.GraphicsSettingsSheet;
+import com.ziauddin.zaibridge.ui.GameDetailsSheet;
+import com.ziauddin.zaibridge.ui.ImportSheet;
 
 import java.io.File;
 import java.util.List;
+import java.util.Locale;
 
 /**
- * The launcher: a grid of imported games, an import flow that pairs an APK with
- * an optional OBB, and the All-files-access gate that lets Zai-Bridge browse
- * the handset for legacy installers.
+ * The launcher: an obsidian glass header, the animated library grid, the
+ * guided import sheet and the All-files-access gate.
  */
-public class MainActivity extends Activity {
+public class MainActivity extends AppCompatActivity implements GameAdapter.Listener {
 
     private static final String TAG = "ZaiBridge";
 
@@ -47,14 +60,14 @@ public class MainActivity extends Activity {
     private static final int REQ_APK = 0x52;
     private static final int REQ_OBB = 0x53;
 
-    private GridView grid;
+    private RecyclerView recycler;
     private GameAdapter adapter;
-    private TextView permissionText;
+    private EditText search;
+    private View emptyState;
     private View permissionBanner;
-    private Button grantButton;
+    private TextView permissionText;
 
-    private Uri pendingApk;
-    private Uri pendingObb;
+    private ImportSheet importSheet;
     private boolean pickApkAfterGrant;
 
     @Override
@@ -62,24 +75,43 @@ public class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
-        grid = findViewById(R.id.grid_games);
-        adapter = new GameAdapter(this);
-        grid.setAdapter(adapter);
-        grid.setOnItemClickListener((parent, view, position, id) -> launch(adapter.getItem(position)));
-        // Long-press is the per-game graphics configuration; a tap still plays.
-        grid.setOnItemLongClickListener((parent, view, position, id) -> {
-            showGameGraphics(adapter.getItem(position));
-            return true;
-        });
-        findViewById(R.id.btn_graphics_defaults).setOnClickListener(
-                v -> showGlobalGraphics());
+        Window window = getWindow();
+        window.addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS);
+        window.setStatusBarColor(android.graphics.Color.TRANSPARENT);
+        window.setNavigationBarColor(android.graphics.Color.TRANSPARENT);
 
+        recycler = findViewById(R.id.recycler_games);
+        recycler.setLayoutManager(new GridLayoutManager(this, spanCount()));
+        adapter = new GameAdapter(this, this);
+        recycler.setAdapter(adapter);
+        recycler.setItemAnimator(null);
+
+        search = findViewById(R.id.et_search);
+        search.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) { }
+
+            @Override public void onTextChanged(CharSequence s, int a, int b, int c) {
+                adapter.setQuery(s == null ? "" : s.toString());
+            }
+
+            @Override public void afterTextChanged(Editable s) { }
+        });
+
+        emptyState = findViewById(R.id.empty_state);
         permissionBanner = findViewById(R.id.banner_permission);
         permissionText = findViewById(R.id.tv_permission);
-        grantButton = findViewById(R.id.btn_grant);
-        grantButton.setOnClickListener(v -> requestStorageAccess(false));
+        findViewById(R.id.btn_grant).setOnClickListener(v -> requestStorageAccess(false));
 
-        findViewById(R.id.btn_import).setOnClickListener(v -> beginImport());
+        View importButton = findViewById(R.id.btn_import);
+        importButton.setOnClickListener(v -> showImportSheet());
+        findViewById(R.id.btn_empty_import).setOnClickListener(v -> showImportSheet());
+        findViewById(R.id.btn_graphics_defaults)
+                .setOnClickListener(v -> showEngineSettings());
+
+        TextView hardware = findViewById(R.id.tv_hardware);
+        hardware.setText(getString(
+                EglSwapHook.isInstalled() ? R.string.hardware_active : R.string.hardware_software,
+                abiLabel()));
     }
 
     @Override
@@ -93,47 +125,36 @@ public class MainActivity extends Activity {
     // Library
     // ---------------------------------------------------------------------
 
+    private int spanCount() {
+        int widthDp = getResources().getConfiguration().screenWidthDp;
+        return widthDp >= 720 ? 4 : (widthDp >= 600 ? 3 : 2);
+    }
+
+    private String abiLabel() {
+        String abi = Build.SUPPORTED_ABIS.length > 0 ? Build.SUPPORTED_ABIS[0] : "unknown";
+        if (abi.startsWith("arm64")) return "ARM64";
+        if (abi.startsWith("armeabi")) return "ARM32";
+        return abi.toUpperCase(Locale.ROOT).replace('_', '-');
+    }
+
     private void refreshGames() {
         List<Game> games = GameRepository.loadAll(this);
         adapter.setGames(games);
-        findViewById(R.id.empty_state).setVisibility(games.isEmpty() ? View.VISIBLE : View.GONE);
+        emptyState.setVisibility(games.isEmpty() ? View.VISIBLE : View.GONE);
+        recycler.setVisibility(games.isEmpty() ? View.GONE : View.VISIBLE);
     }
 
-    // ---------------------------------------------------------------------
-    // Graphics settings (global defaults and per-game overrides)
-    // ---------------------------------------------------------------------
-
-    private void showGlobalGraphics() {
-        GraphicsSettingsSheet.show(this, getString(R.string.graphics_defaults),
-                GraphicsSettings.global(this), false, (settings, useGlobal) -> {
-                    GraphicsSettings.saveGlobal(this, settings);
-                    Toast.makeText(this, R.string.graphics_saved, Toast.LENGTH_SHORT).show();
-                    refreshGames();
-                });
+    @Override
+    public void onPlay(Game game) {
+        launch(game);
     }
 
-    private void showGameGraphics(Game game) {
-        final File dir = GameRepository.gameDir(this, game.directoryName);
-        final boolean overridden = GraphicsSettings.loadGame(dir) != null;
-        GraphicsSettingsSheet.show(this,
-                game.label + " — " + getString(R.string.graphics_title),
-                GraphicsSettings.forGame(this, dir), overridden,
-                (settings, useGlobal) -> {
-                    try {
-                        if (useGlobal) {
-                            GraphicsSettings.clearGame(dir);
-                        } else {
-                            GraphicsSettings.saveGame(dir, settings);
-                        }
-                        Toast.makeText(this, R.string.graphics_saved,
-                                Toast.LENGTH_SHORT).show();
-                    } catch (Exception e) {
-                        Log.e(TAG, "graphics settings were not saved", e);
-                        Toast.makeText(this, getString(R.string.import_failed,
-                                e.getMessage()), Toast.LENGTH_LONG).show();
-                    }
-                    refreshGames();
-                });
+    @Override
+    public void onDetails(Game game) {
+        File dir = GameRepository.gameDir(this, game.directoryName);
+        GameDetailsSheet.show(this, game, dir,
+                (saved, settings) -> refreshGames(),
+                (saved, settings) -> launch(saved));
     }
 
     private void launch(Game game) {
@@ -149,52 +170,54 @@ public class MainActivity extends Activity {
         startActivity(intent);
     }
 
+    private void showEngineSettings() {
+        GameDetailsSheet.showEngine(this, (saved, settings) -> {
+            adapter.notifyDataSetChanged();
+            Toast.makeText(this, R.string.graphics_saved, Toast.LENGTH_SHORT).show();
+        });
+    }
+
     // ---------------------------------------------------------------------
-    // Import flow: APK first, then optionally its OBB
+    // Import flow
     // ---------------------------------------------------------------------
 
-    private void beginImport() {
+    private void showImportSheet() {
         if (!hasStorageAccess()) {
-            pickApkAfterGrant = true;
-            requestStorageAccess(true);
+            requestStorageAccess(false);
             return;
         }
-        pickApk();
+        if (importSheet == null) {
+            importSheet = new ImportSheet(this, new ImportSheet.Listener() {
+                @Override public void onPickApk() { pick(REQ_APK); }
+
+                @Override public void onPickObb() { pick(REQ_OBB); }
+
+                @Override public void onStart(Uri apk, Uri obb) {
+                    startIngestion(apk, obb);
+                }
+            });
+        } else {
+            importSheet.reset();
+        }
+        importSheet.show();
     }
 
-    private void pickApk() {
+    private void pick(int requestCode) {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
         intent.setType("*/*");
-        intent.putExtra(Intent.EXTRA_MIME_TYPES,
-                new String[]{"application/vnd.android.package-archive", "application/octet-stream"});
+        if (requestCode == REQ_APK) {
+            intent.putExtra(Intent.EXTRA_MIME_TYPES,
+                    new String[]{"application/vnd.android.package-archive",
+                            "application/octet-stream"});
+        } else {
+            intent.putExtra(Intent.EXTRA_MIME_TYPES,
+                    new String[]{"application/octet-stream", "application/zip", "*/*"});
+        }
         try {
-            startActivityForResult(intent, REQ_APK);
+            startActivityForResult(intent, requestCode);
         } catch (ActivityNotFoundException e) {
             Toast.makeText(this, "No file picker available", Toast.LENGTH_LONG).show();
-        }
-    }
-
-    private void askForObb() {
-        new AlertDialog.Builder(this)
-                .setTitle(R.string.dialog_obb_title)
-                .setMessage(R.string.dialog_obb_message)
-                .setPositiveButton(R.string.dialog_obb_choose, (d, w) -> pickObb())
-                .setNegativeButton(R.string.dialog_obb_skip, (d, w) -> startIngestion())
-                .setNeutralButton(R.string.cancel, null)
-                .show();
-    }
-
-    private void pickObb() {
-        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-        intent.addCategory(Intent.CATEGORY_OPENABLE);
-        intent.setType("*/*");
-        intent.putExtra(Intent.EXTRA_MIME_TYPES,
-                new String[]{"application/octet-stream", "application/zip", "*/*"});
-        try {
-            startActivityForResult(intent, REQ_OBB);
-        } catch (ActivityNotFoundException e) {
-            startIngestion();
         }
     }
 
@@ -204,58 +227,54 @@ public class MainActivity extends Activity {
 
         if (requestCode == REQ_ALL_FILES) {
             updatePermissionBanner();
-            if (hasStorageAccess() && pickApkAfterGrant) {
-                pickApkAfterGrant = false;
-                pickApk();
-            }
+            if (hasStorageAccess()) showImportSheet();
             return;
         }
 
-        if (resultCode != RESULT_OK || data == null || data.getData() == null) {
-            return;
-        }
+        if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
 
         Uri uri = data.getData();
+        takePersistable(uri);
+        if (importSheet == null) return;
+
         if (requestCode == REQ_APK) {
-            takePersistable(uri);
-            pendingApk = uri;
-            askForObb();
+            importSheet.setApk(uri, displayName(uri));
         } else if (requestCode == REQ_OBB) {
-            takePersistable(uri);
-            pendingObb = uri;
-            startIngestion();
+            importSheet.setObb(uri, displayName(uri));
         }
     }
 
-    private void startIngestion() {
-        if (pendingApk == null) {
-            Toast.makeText(this, "Pick an APK first", Toast.LENGTH_SHORT).show();
-            return;
-        }
+    private void startIngestion(Uri apk, Uri obb) {
+        if (apk == null) return;
+        if (importSheet != null) importSheet.showProgress(getString(R.string.importing_body));
 
         ResultReceiver receiver = new ResultReceiver(new Handler(Looper.getMainLooper())) {
             @Override
-            protected void onReceiveResult(int resultCode, Bundle resultData) {
-                super.onReceiveResult(resultCode, resultData);
-                pendingApk = null;
-                pendingObb = null;
+            protected void onReceiveResult(int resultCode, Bundle data) {
+                if (importSheet == null) return;
+                if (resultCode == IngestionService.RESULT_PROGRESS) {
+                    String stage = data == null ? null
+                            : data.getString(IngestionService.EXTRA_STAGE);
+                    if (stage != null) importSheet.showProgress(stage);
+                    return;
+                }
                 if (resultCode == IngestionService.RESULT_OK) {
-                    String label = resultData == null ? ""
-                            : resultData.getString(IngestionService.EXTRA_LABEL, "Game");
+                    String label = data == null ? "Game"
+                            : data.getString(IngestionService.EXTRA_LABEL, "Game");
+                    importSheet.finish(true, label, null);
                     Toast.makeText(MainActivity.this,
                             getString(R.string.import_done, label), Toast.LENGTH_LONG).show();
                 } else {
-                    String error = resultData == null ? "unknown"
-                            : resultData.getString(IngestionService.EXTRA_ERROR, "unknown");
+                    String error = data == null ? "unknown"
+                            : data.getString(IngestionService.EXTRA_ERROR, "unknown");
+                    importSheet.finish(false, null, error);
                     Toast.makeText(MainActivity.this,
                             getString(R.string.import_failed, error), Toast.LENGTH_LONG).show();
                 }
                 refreshGames();
             }
         };
-
-        IngestionService.start(this, pendingApk, pendingObb, receiver);
-        Toast.makeText(this, R.string.importing_body, Toast.LENGTH_SHORT).show();
+        IngestionService.start(this, apk, obb, receiver);
     }
 
     private void takePersistable(Uri uri) {
@@ -265,6 +284,23 @@ public class MainActivity extends Activity {
         } catch (SecurityException | IllegalArgumentException e) {
             Log.w(TAG, "picked URI is not persistable: " + uri, e);
         }
+    }
+
+    private String displayName(Uri uri) {
+        try (android.database.Cursor c = getContentResolver()
+                .query(uri, null, null, null, null)) {
+            if (c != null && c.moveToFirst()) {
+                int index = c.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                if (index >= 0) {
+                    String name = c.getString(index);
+                    if (name != null && !name.isEmpty()) return name;
+                }
+            }
+        } catch (Exception ignored) {
+            // Provider without DISPLAY_NAME; fall back to the last path segment.
+        }
+        String last = uri.getLastPathSegment();
+        return last == null ? uri.toString() : last;
     }
 
     // ---------------------------------------------------------------------
@@ -304,10 +340,7 @@ public class MainActivity extends Activity {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == REQ_ALL_FILES) {
             updatePermissionBanner();
-            if (hasStorageAccess() && pickApkAfterGrant) {
-                pickApkAfterGrant = false;
-                pickApk();
-            }
+            if (hasStorageAccess()) showImportSheet();
         }
     }
 
@@ -315,8 +348,6 @@ public class MainActivity extends Activity {
         if (permissionBanner == null) return;
         boolean granted = hasStorageAccess();
         permissionBanner.setVisibility(granted ? View.GONE : View.VISIBLE);
-        if (!granted) {
-            permissionText.setText(R.string.permission_body);
-        }
+        if (!granted) permissionText.setText(R.string.permission_body);
     }
 }

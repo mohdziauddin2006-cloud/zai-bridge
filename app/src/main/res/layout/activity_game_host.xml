@@ -18,6 +18,33 @@
 
     </com.ziauddin.zaibridge.AspectRatioFrameLayout>
 
+    <!-- Compact live telemetry. Draggable; a tap opens the control drawer. -->
+    <TextView
+        android:id="@+id/tv_telemetry"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|start"
+        android:layout_marginStart="14dp"
+        android:layout_marginTop="46dp"
+        android:background="@drawable/bg_telemetry_pill"
+        android:fontFeatureSettings="tnum"
+        android:letterSpacing="0.02"
+        android:paddingStart="12dp"
+        android:paddingTop="6dp"
+        android:paddingEnd="12dp"
+        android:paddingBottom="6dp"
+        android:textColor="@color/zb_text"
+        android:textSize="10sp"
+        android:visibility="gone" />
+
+    <!-- 20 dp transparent strip: swipe left to slide the drawer out. -->
+    <View
+        android:id="@+id/view_edge_handle"
+        android:layout_width="20dp"
+        android:layout_height="match_parent"
+        android:layout_gravity="end|center_vertical"
+        android:background="@android:color/transparent" />
+
     <LinearLayout
         android:id="@+id/status_wrap"
         android:layout_width="wrap_content"

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="zb_chip_bg">#141A24</color>
+    <color name="zb_chip_bg_checked">#1F00E5FF</color>
+    <color name="zb_chip_text">#8A99AD</color>
+    <color name="zb_chip_text_checked">#00E5FF</color>
+    <color name="zb_chip_stroke">#263042</color>
+    <color name="zb_chip_stroke_checked">#8000E5FF</color>
+</resources>

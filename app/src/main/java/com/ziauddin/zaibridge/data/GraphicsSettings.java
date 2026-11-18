@@ -22,9 +22,12 @@ import java.io.InputStream;
  * defaults are a {@link SharedPreferences} entry, used for any game that has no
  * override of its own.
  *
- * <p>The values map directly onto the native compositor:
- * {@code upscaler} 0/1/2, {@code scalePercent} 50/67/75/100,
- * {@code sharpnessPercent} 0-100 and {@code frameGen} 0/2.
+ * <p>Every value maps onto the native Zai-Scale Ultra compositor:
+ * {@code upscaler} 0 off / 1 mobile SGSR / 2 FSR temporal / 3 DLSS-5 neural,
+ * {@code scalePercent} 50/67/75/85/100, {@code sharpnessPercent} 0-100,
+ * {@code neuralPercent} 0-100 (local contrast, specular and micro-detail
+ * reconstruction), {@code frameGen} 0/2/3/4, {@code temporal} 0/1 and
+ * {@code autoMfg} 0/1 (dynamic multiplier).
  */
 public final class GraphicsSettings {
 
@@ -35,67 +38,185 @@ public final class GraphicsSettings {
     public static final int UPSCALER_OFF = 0;
     public static final int UPSCALER_SGSR = 1;
     public static final int UPSCALER_FSR = 2;
+    public static final int UPSCALER_DLSS = 3;
 
     public static final int SCALE_PERFORMANCE = 50;
     public static final int SCALE_BALANCED = 67;
     public static final int SCALE_QUALITY = 75;
+    public static final int SCALE_ULTRA_QUALITY = 85;
     public static final int SCALE_NATIVE = 100;
 
     public static final int FRAME_GEN_OFF = 0;
     public static final int FRAME_GEN_2X = 2;
+    public static final int FRAME_GEN_3X = 3;
+    public static final int FRAME_GEN_4X = 4;
 
+    public static final int PRESET_CUSTOM = -1;
+    public static final int PRESET_OFF = 0;
+    public static final int PRESET_FSR_PERFORMANCE = 1;
+    public static final int PRESET_FSR_QUALITY = 2;
+    public static final int PRESET_DLSS_ULTRA = 3;
+    public static final int PRESET_DLSS_OVERDRIVE = 4;
+
+    public int preset = PRESET_OFF;
     public int upscaler;
     public int scalePercent;
     public int sharpnessPercent;
+    public int neuralPercent;
     public int frameGen;
+    public int temporal;
+    public int autoMfg;
 
     public GraphicsSettings() {
-        this(UPSCALER_OFF, SCALE_NATIVE, 50, FRAME_GEN_OFF);
+        this.preset = PRESET_OFF;
+        this.upscaler = UPSCALER_OFF;
+        this.scalePercent = SCALE_NATIVE;
+        this.sharpnessPercent = 0;
+        this.neuralPercent = 0;
+        this.frameGen = FRAME_GEN_OFF;
+        this.temporal = 0;
+        this.autoMfg = 0;
     }
 
     public GraphicsSettings(int upscaler, int scalePercent, int sharpnessPercent,
                             int frameGen) {
+        this.preset = PRESET_CUSTOM;
         this.upscaler = validUpscaler(upscaler);
         this.scalePercent = validScale(scalePercent);
         this.sharpnessPercent = clamp(sharpnessPercent, 0, 100);
+        this.neuralPercent = 0;
         this.frameGen = validFrameGen(frameGen);
+        this.temporal = upscaler == UPSCALER_FSR || upscaler == UPSCALER_DLSS ? 1 : 0;
+        this.autoMfg = 0;
+    }
+
+    public GraphicsSettings(GraphicsSettings other) {
+        if (other == null) return;
+        preset = other.preset;
+        upscaler = other.upscaler;
+        scalePercent = other.scalePercent;
+        sharpnessPercent = other.sharpnessPercent;
+        neuralPercent = other.neuralPercent;
+        frameGen = other.frameGen;
+        temporal = other.temporal;
+        autoMfg = other.autoMfg;
     }
 
     public static GraphicsSettings defaults() {
         return new GraphicsSettings();
     }
 
+    /** Builds the one-tap master preset with every parameter already set. */
+    public static GraphicsSettings ofPreset(int preset) {
+        GraphicsSettings s = new GraphicsSettings();
+        s.preset = preset;
+        switch (preset) {
+            case PRESET_FSR_PERFORMANCE:
+                s.upscaler = UPSCALER_FSR;
+                s.scalePercent = SCALE_PERFORMANCE;
+                s.sharpnessPercent = 45;
+                s.neuralPercent = 10;
+                s.frameGen = FRAME_GEN_2X;
+                s.temporal = 1;
+                s.autoMfg = 1;
+                break;
+            case PRESET_FSR_QUALITY:
+                s.upscaler = UPSCALER_FSR;
+                s.scalePercent = SCALE_QUALITY;
+                s.sharpnessPercent = 35;
+                s.neuralPercent = 25;
+                s.frameGen = FRAME_GEN_2X;
+                s.temporal = 1;
+                s.autoMfg = 0;
+                break;
+            case PRESET_DLSS_ULTRA:
+                s.upscaler = UPSCALER_DLSS;
+                s.scalePercent = SCALE_ULTRA_QUALITY;
+                s.sharpnessPercent = 45;
+                s.neuralPercent = 55;
+                s.frameGen = FRAME_GEN_3X;
+                s.temporal = 1;
+                s.autoMfg = 1;
+                break;
+            case PRESET_DLSS_OVERDRIVE:
+                s.upscaler = UPSCALER_DLSS;
+                s.scalePercent = SCALE_BALANCED;
+                s.sharpnessPercent = 65;
+                s.neuralPercent = 80;
+                s.frameGen = FRAME_GEN_4X;
+                s.temporal = 1;
+                s.autoMfg = 1;
+                break;
+            case PRESET_OFF:
+            default:
+                s.preset = PRESET_OFF;
+                break;
+        }
+        return s;
+    }
+
     public GraphicsSettings copy() {
-        return new GraphicsSettings(upscaler, scalePercent, sharpnessPercent, frameGen);
+        return new GraphicsSettings(this);
     }
 
     /** True when the compositor has any work to do for this configuration. */
     public boolean active() {
-        return upscaler != UPSCALER_OFF || frameGen != FRAME_GEN_OFF;
+        return upscaler != UPSCALER_OFF || frameGen != FRAME_GEN_OFF
+                || neuralPercent > 0 || temporal != 0;
+    }
+
+    public boolean isDlss() {
+        return upscaler == UPSCALER_DLSS;
     }
 
     public String upscalerName() {
         switch (upscaler) {
             case UPSCALER_SGSR: return "SGSR";
-            case UPSCALER_FSR: return "FSR 1.0";
+            case UPSCALER_FSR: return "FSR";
+            case UPSCALER_DLSS: return "DLSS-5";
             default: return "Off";
         }
     }
 
-    /** Compact label for the launcher card, e.g. "SGSR 67% · 2x". */
+    public String frameGenName() {
+        switch (frameGen) {
+            case FRAME_GEN_2X: return "2x";
+            case FRAME_GEN_3X: return "3x";
+            case FRAME_GEN_4X: return "4x";
+            default: return "Off";
+        }
+    }
+
+    /** Compact label for the launcher card, e.g. "DLSS-5 85% · 3x". */
     public String shortLabel() {
+        if (!active()) return "Native";
         StringBuilder out = new StringBuilder(upscalerName());
         if (upscaler != UPSCALER_OFF && scalePercent != SCALE_NATIVE) {
             out.append(' ').append(scalePercent).append('%');
         }
-        if (frameGen == FRAME_GEN_2X) out.append(" · 2x");
+        if (frameGen != FRAME_GEN_OFF) out.append(" · ").append(frameGenName());
+        if (autoMfg != 0) out.append(" auto");
         return out.toString();
+    }
+
+    /** Badge text for the library card: the engine family, or nothing. */
+    public String badge() {
+        if (upscaler == UPSCALER_DLSS) return "DLSS-5";
+        if (upscaler == UPSCALER_FSR) return "FSR";
+        if (upscaler == UPSCALER_SGSR) return "SGSR";
+        return "";
+    }
+
+    /** Marks the configuration as manually edited, so no preset stays lit. */
+    public void markCustom() {
+        preset = PRESET_CUSTOM;
     }
 
     @Override
     public String toString() {
-        return "GraphicsSettings{u=" + upscaler + ", scale=" + scalePercent
-                + ", sharp=" + sharpnessPercent + ", fg=" + frameGen + '}';
+        return "GraphicsSettings{p=" + preset + ", u=" + upscaler + ", scale=" + scalePercent
+                + ", sharp=" + sharpnessPercent + ", neural=" + neuralPercent
+                + ", fg=" + frameGen + ", temporal=" + temporal + ", auto=" + autoMfg + '}';
     }
 
     // ------------------------------------------------------------------
@@ -105,10 +226,14 @@ public final class GraphicsSettings {
     public JSONObject toJson() {
         JSONObject o = new JSONObject();
         try {
+            o.put("preset", preset);
             o.put("upscaler", upscaler);
             o.put("scale", scalePercent);
             o.put("sharpness", sharpnessPercent);
+            o.put("neural", neuralPercent);
             o.put("frameGen", frameGen);
+            o.put("temporal", temporal);
+            o.put("autoMfg", autoMfg);
         } catch (Exception ignored) {
             // JSONObject.put only throws for non-finite numbers; these are ints.
         }
@@ -118,11 +243,16 @@ public final class GraphicsSettings {
     public static GraphicsSettings fromJson(JSONObject o, GraphicsSettings fallback) {
         GraphicsSettings base = fallback == null ? defaults() : fallback.copy();
         if (o == null) return base;
-        return new GraphicsSettings(
-                o.optInt("upscaler", base.upscaler),
-                o.optInt("scale", base.scalePercent),
-                o.optInt("sharpness", base.sharpnessPercent),
-                o.optInt("frameGen", base.frameGen));
+        GraphicsSettings out = new GraphicsSettings();
+        out.upscaler = validUpscaler(o.optInt("upscaler", base.upscaler));
+        out.scalePercent = validScale(o.optInt("scale", base.scalePercent));
+        out.sharpnessPercent = clamp(o.optInt("sharpness", base.sharpnessPercent), 0, 100);
+        out.neuralPercent = clamp(o.optInt("neural", base.neuralPercent), 0, 100);
+        out.frameGen = validFrameGen(o.optInt("frameGen", base.frameGen));
+        out.temporal = o.optInt("temporal", base.temporal) != 0 ? 1 : 0;
+        out.autoMfg = o.optInt("autoMfg", base.autoMfg) != 0 ? 1 : 0;
+        out.preset = o.optInt("preset", base.preset);
+        return out;
     }
 
     // ------------------------------------------------------------------
@@ -191,21 +321,30 @@ public final class GraphicsSettings {
 
     public static GraphicsSettings global(Context context) {
         SharedPreferences prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
-        return new GraphicsSettings(
-                prefs.getInt("upscaler", UPSCALER_OFF),
-                prefs.getInt("scale", SCALE_NATIVE),
-                prefs.getInt("sharpness", 50),
-                prefs.getInt("frameGen", FRAME_GEN_OFF));
+        GraphicsSettings s = defaults();
+        s.preset = prefs.getInt("preset", PRESET_OFF);
+        s.upscaler = validUpscaler(prefs.getInt("upscaler", UPSCALER_OFF));
+        s.scalePercent = validScale(prefs.getInt("scale", SCALE_NATIVE));
+        s.sharpnessPercent = clamp(prefs.getInt("sharpness", 0), 0, 100);
+        s.neuralPercent = clamp(prefs.getInt("neural", 0), 0, 100);
+        s.frameGen = validFrameGen(prefs.getInt("frameGen", FRAME_GEN_OFF));
+        s.temporal = prefs.getInt("temporal", 0) != 0 ? 1 : 0;
+        s.autoMfg = prefs.getInt("autoMfg", 0) != 0 ? 1 : 0;
+        return s;
     }
 
     public static void saveGlobal(Context context, GraphicsSettings settings) {
         if (settings == null) return;
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                 .edit()
+                .putInt("preset", settings.preset)
                 .putInt("upscaler", settings.upscaler)
                 .putInt("scale", settings.scalePercent)
                 .putInt("sharpness", settings.sharpnessPercent)
+                .putInt("neural", settings.neuralPercent)
                 .putInt("frameGen", settings.frameGen)
+                .putInt("temporal", settings.temporal)
+                .putInt("autoMfg", settings.autoMfg)
                 .apply();
     }
 
@@ -231,23 +370,25 @@ public final class GraphicsSettings {
     }
 
     private static int validUpscaler(int value) {
-        return (value == UPSCALER_SGSR || value == UPSCALER_FSR) ? value : UPSCALER_OFF;
+        return (value == UPSCALER_SGSR || value == UPSCALER_FSR
+                || value == UPSCALER_DLSS) ? value : UPSCALER_OFF;
     }
 
     private static int validScale(int value) {
-        switch (value) {
-            case SCALE_PERFORMANCE:
-            case SCALE_BALANCED:
-            case SCALE_QUALITY:
-            case SCALE_NATIVE:
-                return value;
-            default:
-                return SCALE_NATIVE;
-        }
+        // The sliders expose the full 50-100% range; the compositor clamps its
+        // own render target dimensions from this percentage.
+        return clamp(value, SCALE_PERFORMANCE, SCALE_NATIVE);
     }
 
     private static int validFrameGen(int value) {
-        return value == FRAME_GEN_2X ? FRAME_GEN_2X : FRAME_GEN_OFF;
+        switch (value) {
+            case FRAME_GEN_2X:
+            case FRAME_GEN_3X:
+            case FRAME_GEN_4X:
+                return value;
+            default:
+                return FRAME_GEN_OFF;
+        }
     }
 
     private static int clamp(int value, int lo, int hi) {

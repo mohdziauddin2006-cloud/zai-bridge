@@ -1,24 +1,18 @@
 // =============================================================================
-//  gpu_compositor.h  (Zai-Bridge: GPU upscaling + frame generation compositor)
+//  gpu_compositor.h  (Zai-Bridge: "Zai-Scale Ultra" pipeline)
 //
-//  One offscreen compositor sits at the EGL swap boundary and does two things:
+//  A single offscreen compositor at the EGL swap boundary that combines:
 //
-//    * Spatial upscaling. The guest renders into an internal render target at
-//      50/67/75/100% of the display resolution; a single-pass SGSR (12-tap
-//      edge-adaptive Lanczos + directional sharpen) or FSR 1.0 style EASU+RCAS
-//      pass resolves it to the physical SurfaceView. ES 2 drivers get a
-//      bilinear + unsharp fallback.
+//    * spatial upscaling       SGSR / FSR 1.0 EASU+RCAS / DLSS-5-style detail
+//    * temporal super res      YCoCg neighbourhood clamping, 3-frame history
+//    * multi-frame generation  2x / 3x / 4x with hierarchical optical flow
+//    * lighting reconstruction local contrast + specular + micro-detail pass
+//    * comparison split        live vanilla vs. Zai-Scale wipe
 //
-//    * 2x frame generation. The previous and current frames are kept on the
-//      GPU; a block-matching pass over 8x8 blocks derives per-block motion
-//      vectors, and a synthesis pass warps the pair halfway between them. The
-//      intermediate frame is presented before the real one, so a 20-30 fps
-//      title is scanned out at 40-60 Hz. HUD/UI blocks are detected by their
-//      near-zero motion and scene cuts by a large residual, so neither ghosts.
-//
-//  All of it is vendor neutral: no depth buffer, no motion vectors, no
-//  compute shaders, no extensions. It runs on Adreno, Mali, Immortalis,
-//  PowerVR and Xclipse with plain GLES2 FBOs.
+//  Vendor neutral on purpose: plain GLES3 FBOs and RGBA8 targets, strict
+//  `#version 300 es` shaders with an automatic ES 2.0 demotion, no compute, no
+//  extensions, no depth/motion buffers from the guest. Runs on Adreno,
+//  Mali/Immortalis, PowerVR/IMG and Xclipse.
 // =============================================================================
 #pragma once
 
@@ -30,66 +24,87 @@ namespace zai {
 
 enum GraphicsUpscaler : int {
     kUpscalerOff = 0,
-    kUpscalerSgsr = 1,
-    kUpscalerFsr = 2,
+    kUpscalerSgsr = 1,   // mobile edge-aware spatial
+    kUpscalerFsr = 2,    // FSR EASU + RCAS
+    kUpscalerDlss = 3,   // temporal + neural detail
+};
+
+enum GraphicsPreset : int {
+    kPresetCustom = 0,
+    kPresetOff = 1,
+    kPresetFsrPerformance2x = 2,
+    kPresetFsrQuality2x = 3,
+    kPresetDlssUltra3x = 4,
+    kPresetDlssOverdrive4x = 5,
 };
 
 enum GraphicsFrameGen : int {
     kFrameGenOff = 0,
     kFrameGen2x = 2,
+    kFrameGen3x = 3,
+    kFrameGen4x = 4,
 };
 
 struct GraphicsConfig {
+    int preset = kPresetOff;
     int upscaler = kUpscalerOff;
-    int scale_percent = 100;      // 50 | 67 | 75 | 100
-    int sharpness_percent = 50;   // 0..100
-    int frame_gen = kFrameGenOff; // 0 | 2
+    int scale_percent = 100;       // 50 | 67 | 75 | 85 | 100
+    int sharpness_percent = 50;    // RCAS / directional sharpen
+    int neural_percent = 0;        // lighting + micro-detail reconstruction
+    int frame_gen = kFrameGenOff;  // 0 | 2 | 3 | 4
+    int temporal = 0;              // TSR accumulation
+    int auto_mfg = 0;              // scale generation down when already fast
+
+    bool effects() const {
+        return upscaler != kUpscalerOff || frame_gen != kFrameGenOff ||
+               neural_percent > 0;
+    }
 };
 
 class GpuCompositor {
 public:
     static GpuCompositor& instance();
 
-    // Called from EglSwapHook.nativeConfigure (any thread).
-    void configure(int upscaler, int scale_percent, int sharpness_percent,
-                   int frame_gen);
+    // Any thread. Compare is separate so changing it never resets history.
+    void configure(const GraphicsConfig& config);
     GraphicsConfig config() const;
+    void set_compare(float split);          // 0 = off, 0.02..0.98 = wipe
+    float compare() const;
 
-    bool active() const;             // any effect enabled
-    bool frame_generation() const;
-    bool internal_scaling() const;   // upscaler on and scale below 100%
+    bool active() const;
+    bool internal_scaling() const;
+    int synthetic_count() const;            // frames to emit before the real one
 
-    // ---- translation-core path -------------------------------------------
-    // Ensures the offscreen targets exist and binds the internal render target.
-    // Returns its FBO (0 when the compositor is inactive or unavailable), and
-    // the internal resolution the guest's viewport should be scaled to.
+    // Translation-core path: guest renders into this FBO at the scaled size.
     unsigned int bind_internal_target(int display_width, int display_height,
                                       int* out_width, int* out_height);
     void release_internal_target();
 
-    // ---- swap boundary ----------------------------------------------------
-    // Captures the frame that is about to be presented. When the guest drew
-    // into the internal target, the capture is taken from there instead of the
-    // window backbuffer.
+    // Swap boundary. Captures, runs flow + TSR + enhancement. Returns false
+    // when the compositor cannot present (no context / no complete FBO), in
+    // which case the caller swaps the untouched guest frame.
     bool begin(EGLDisplay display, EGLSurface surface, bool guest_drew_internal);
 
-    // Resolves the current frame to the window (FBO 0).
+    // Intermediate at (index + 1) / (generated + 1) between previous and
+    // current. index is 0-based.
+    bool present_synthetic(int index);
+
+    // The real current frame, resolved through the selected upscaler.
     void present_current();
 
-    // Synthesises and presents F_{t-0.5}. Returns false when there is no
-    // previous frame yet (first frame after a resize or a setting change).
-    bool present_intermediate();
+    // Paced scan-out for one synthetic slot.
+    void wait_subframe();
 
-    // Half a measured refresh interval, clamped; keeps the generated frame
-    // evenly spaced when the backend does not buffer-swap fast enough.
-    void wait_half_frame();
-
-    // Rotates the history ring: the frame just presented becomes F_{t-1}.
+    // Rotates the 3-frame history ring and retires TSR history.
     void end_frame();
 
     std::string stats() const;
     std::string gpu_description();
     void note_shader_failure(const std::string& reason);
+
+    // Session teardown: deletes every GL object and resets history. Must be
+    // called with a GL context current when possible.
+    void teardown();
 
 private:
     GpuCompositor();

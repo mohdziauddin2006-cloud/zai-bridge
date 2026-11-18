@@ -125,8 +125,7 @@ public final class GuestLauncher {
             // before its renderer is created. The native compositor reads them
             // on the guest's GL thread at the first swap.
             GraphicsSettings graphics = GraphicsSettings.forGame(ctx, gameDir);
-            EglSwapHook.configure(graphics.upscaler, graphics.scalePercent,
-                    graphics.sharpnessPercent, graphics.frameGen);
+            EglSwapHook.configure(graphics);
 
             // Legacy ports ship their data as assets/files.zip and unpack it to
             // external storage from a splash Activity. The guest's external
@@ -278,6 +277,13 @@ public final class GuestLauncher {
                 && UnicornBridge.isSessionActive()) {
             Log.i(TAG, "native session already live for " + pkg);
             return;
+        }
+        // A different import is starting: close the previous guest first so its
+        // Unicorn address space and compositor textures are released.
+        if (UnicornBridge.isSessionActive()) {
+            Log.i(TAG, "closing previous guest session before " + pkg);
+            UnicornBridge.endSession();
+            sessionGameDir = null;
         }
         if (!UnicornBridge.isCoreLoaded()) {
             if (UnicornBridge.isPassthrough()) {

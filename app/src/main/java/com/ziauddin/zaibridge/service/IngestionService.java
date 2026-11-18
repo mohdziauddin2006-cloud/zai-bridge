@@ -38,6 +38,9 @@ public class IngestionService extends Service {
 
     public static final int RESULT_OK = 0;
     public static final int RESULT_ERROR = 1;
+    /** One extraction stage; {@link #EXTRA_STAGE} carries its human label. */
+    public static final int RESULT_PROGRESS = 2;
+    public static final String EXTRA_STAGE = "com.ziauddin.zaibridge.extra.STAGE";
 
     private ExecutorService executor;
 
@@ -72,8 +75,15 @@ public class IngestionService extends Service {
 
         executor.execute(() -> {
             try {
+                GameImporter.Progress progress = message -> {
+                    Log.i(TAG, "ingest: " + message);
+                    if (receiver == null) return;
+                    android.os.Bundle stage = new android.os.Bundle();
+                    stage.putString(EXTRA_STAGE, message);
+                    receiver.send(RESULT_PROGRESS, stage);
+                };
                 Game game = GameImporter.importGame(getApplicationContext(), apkUri, obbUri,
-                        message -> Log.i(TAG, "ingest: " + message));
+                        progress);
                 finish(receiver, RESULT_OK, game.label, null);
             } catch (Exception e) {
                 Log.e(TAG, "ingestion failed", e);

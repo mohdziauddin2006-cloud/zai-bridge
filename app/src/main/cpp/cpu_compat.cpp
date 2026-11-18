@@ -189,16 +189,16 @@ const Topology& topology() {
     static std::once_flag once;
     std::call_once(once, [] {
         detected = detect();
+        // Build the core list into a named string: returning c_str() from a
+        // temporary would log a dangling pointer.
+        std::string perf;
+        for (int c : detected.performance_cores) {
+            if (!perf.empty()) perf += ",";
+            perf += std::to_string(c);
+        }
         LOGI("CPU topology: cores=%d conf=%d clusters=%d soc=%s perf=[%s]",
              detected.cores_online, detected.cores_conf, detected.clusters,
-             detected.soc.c_str(), [&] {
-                 std::string list;
-                 for (int c : detected.performance_cores) {
-                     if (!list.empty()) list += ",";
-                     list += std::to_string(c);
-                 }
-                 return list.c_str();
-             }());
+             detected.soc.c_str(), perf.c_str());
     });
     return detected;
 }

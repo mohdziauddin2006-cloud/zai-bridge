@@ -1,9 +1,14 @@
 package com.ziauddin.zaibridge;
 
 import android.app.Activity;
+import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
+import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
@@ -11,19 +16,17 @@ import android.view.View;
 import android.view.Window;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
-import android.graphics.drawable.GradientDrawable;
-import android.view.Gravity;
-import android.view.MotionEvent;
 import android.view.WindowManager;
+import android.view.animation.DecelerateInterpolator;
 import android.widget.Button;
-import android.widget.CheckBox;
 import android.widget.FrameLayout;
+import android.widget.ImageButton;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
-import android.widget.RadioButton;
-import android.widget.RadioGroup;
+import android.widget.ScrollView;
 import android.widget.SeekBar;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import com.ziauddin.zaibridge.core.EglSwapHook;
 import com.ziauddin.zaibridge.core.GameOrientation;
@@ -32,9 +35,9 @@ import com.ziauddin.zaibridge.core.UnicornBridge;
 import com.ziauddin.zaibridge.data.Game;
 import com.ziauddin.zaibridge.data.GameRepository;
 import com.ziauddin.zaibridge.data.GraphicsSettings;
-import com.ziauddin.zaibridge.ui.GraphicsSettingsSheet;
 
 import java.io.File;
+import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -45,11 +48,9 @@ import dalvik.system.DexClassLoader;
  *
  * <p>Nothing about this activity is windowed: it uses the NoTitleBar.Fullscreen
  * theme, clears the decor, and asks the SystemUI for
- * {@link View#SYSTEM_UI_FLAG_IMMERSIVE_STICKY}. The game's dex is loaded through
- * a {@link DexClassLoader}; the guest Activity is instantiated from it and the
- * lifecycle is delegated where the framework permits. The guest's ARM32 payload
- * is mapped from private storage, and its EGL calls are forwarded to the host's
- * real EGL/GLES drivers bound to this activity's SurfaceView window.
+ * {@link View#SYSTEM_UI_FLAG_IMMERSIVE_STICKY}. On top of the guest surface it
+ * hosts two pieces of bridge chrome: a draggable telemetry pill and a
+ * slide-out Zai-Scale drawer with a live vanilla/Zai-Scale compare wipe.
  */
 public class GameHostActivity extends Activity {
 
@@ -62,6 +63,7 @@ public class GameHostActivity extends Activity {
     private TextView status;
     private ProgressBar progress;
     private SurfaceView surfaceView;
+    private TextView telemetry;
 
     private File gameDir;
     private Game game;
@@ -74,22 +76,26 @@ public class GameHostActivity extends Activity {
     private volatile boolean pureJavaMode;
 
     private GraphicsSettings graphics;
-    private View quickMenu;
-    private TextView quickStats;
+
+    private View drawer;
+    private TextView drawerStats;
+    private int drawerWidth;
+    private boolean drawerOpen;
+
+    private final Handler telemetryHandler = new Handler(Looper.getMainLooper());
+    private final Runnable telemetryTick = new Runnable() {
+        @Override
+        public void run() {
+            updateTelemetry();
+            telemetryHandler.postDelayed(this, 800);
+        }
+    };
 
     private final Object startLock = new Object();
 
     /**
      * Surface callbacks are handed to the core from this single background
      * thread, never from the main looper.
-     *
-     * <p>{@code surfaceChanged} is delivered inside the framework's traversal,
-     * and a legacy guest answers it by waiting for its own {@code GLThread} to
-     * finish the engine's {@code resize}. Everything that call can touch lives
-     * inside the emulator, so doing it here would hold the input dispatcher for
-     * as long as the engine takes to load its course, font and HUD data. One
-     * ordered queue keeps created -> changed -> destroyed in the right order
-     * without any of it running on the UI thread.
      */
     private static final ExecutorService SURFACE_QUEUE = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "zai-bridge-surface");
@@ -99,7 +105,6 @@ public class GameHostActivity extends Activity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
-        // Must be requested before the content view is attached.
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         super.onCreate(savedInstanceState);
 
@@ -111,14 +116,13 @@ public class GameHostActivity extends Activity {
         status = findViewById(R.id.tv_status);
         progress = findViewById(R.id.progress);
         surfaceView = findViewById(R.id.game_surface);
+        telemetry = findViewById(R.id.tv_telemetry);
 
-        // Legacy titles are 4:3 or 16:9; keep their ratio on tall panels.
         AspectRatioFrameLayout aspect = findViewById(R.id.game_aspect);
         boolean portrait = getResources().getConfiguration().orientation
                 == android.content.res.Configuration.ORIENTATION_PORTRAIT;
         aspect.setAspectRatio(portrait ? 3f / 4f : 16f / 9f);
 
-        // Draw into the cutout instead of letterboxing below it.
         if (Build.VERSION.SDK_INT >= 28) {
             WindowManager.LayoutParams attrs = getWindow().getAttributes();
             attrs.layoutInDisplayCutoutMode =
@@ -135,16 +139,11 @@ public class GameHostActivity extends Activity {
         }
         gameDir = new File(dir);
         game = GameRepository.load(gameDir);
-        // The direct host has no guest Activity to inherit the manifest from.
         GameOrientation.apply(this, gameDir);
 
-        // Apply this game's upscaler / frame-generation configuration before
-        // the first surface exists, so the very first swapped frame already
-        // goes through the compositor.
         graphics = GraphicsSettings.forGame(this, gameDir);
-        EglSwapHook.configure(graphics.upscaler, graphics.scalePercent,
-                graphics.sharpnessPercent, graphics.frameGen);
-        installEdgeMenu();
+        EglSwapHook.configure(graphics);
+        installOverlay();
         applyFrameRateHint(graphics);
 
         String label = getIntent().getStringExtra(EXTRA_GAME_LABEL);
@@ -175,17 +174,6 @@ public class GameHostActivity extends Activity {
         prepareGuest();
     }
 
-    /**
-     * Publishes a surface (and its size) to the core without blocking the UI
-     * thread.
-     *
-     * <p>{@link UnicornBridge#setSurface} only stores the ANativeWindow, but the
-     * guest's surface change that follows it is a guest call: the engine's
-     * {@code resize} loads every course, font and HUD texture and can take
-     * seconds on software GL. Queuing it means the main looper is free within
-     * microseconds of the callback, so the input dispatcher can never time out
-     * waiting for the engine.
-     */
     private void onSurface(final Surface surface, final int width, final int height) {
         if (surface == null || !surface.isValid()) return;
         surfaceReady = true;
@@ -202,6 +190,10 @@ public class GameHostActivity extends Activity {
         super.onResume();
         enterImmersive();
         if (guestHost != null) guestHost.onResume();
+        if (telemetry.getVisibility() == View.VISIBLE) {
+            telemetryHandler.removeCallbacks(telemetryTick);
+            telemetryHandler.post(telemetryTick);
+        }
     }
 
     @Override
@@ -212,6 +204,7 @@ public class GameHostActivity extends Activity {
 
     @Override
     protected void onPause() {
+        telemetryHandler.removeCallbacks(telemetryTick);
         if (guestHost != null) guestHost.onPause();
         super.onPause();
     }
@@ -224,9 +217,15 @@ public class GameHostActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        telemetryHandler.removeCallbacks(telemetryTick);
         if (guestHost != null) guestHost.onDestroy();
         surfaceReady = false;
-        SURFACE_QUEUE.execute(() -> UnicornBridge.setSurface(null));
+        // The guest is gone; release its EGL surface, the compositor textures
+        // and the Unicorn address space so the next game can start cleanly.
+        SURFACE_QUEUE.execute(() -> {
+            UnicornBridge.setSurface(null);
+            UnicornBridge.endSession();
+        });
         super.onDestroy();
     }
 
@@ -285,9 +284,6 @@ public class GameHostActivity extends Activity {
                     optimized = getCodeCacheDir();
                 }
 
-                // A dex failure (for example, an archive ART still considers
-                // writable) must not stop the ARM32 bridge: the native session
-                // and its EGL surface do not depend on the guest class loader.
                 ClassLoader loader = null;
                 try {
                     loader = new DexClassLoader(apk.getAbsolutePath(),
@@ -299,8 +295,6 @@ public class GameHostActivity extends Activity {
                 }
                 guestLoader = loader;
 
-                // Pure Dalvik/Java imports have no ARM32 libraries: nothing to
-                // translate, so the guest Activity is hosted directly.
                 if (loader != null && !hasNativePayload) {
                     pureJavaMode = true;
                     launchPureJava(loader, pkgName, launcher);
@@ -309,16 +303,9 @@ public class GameHostActivity extends Activity {
                 }
 
                 if (loader != null) {
-                    String pkg = game != null ? game.packageName : gameDir.getName();
                     final GuestActivityHost host =
-                            new GuestActivityHost(this, gameDir, pkg, loader);
+                            new GuestActivityHost(this, gameDir, pkgName, loader);
                     guestHost = host;
-                    // The engine's native half calls back into the Activity it was
-                    // started with, so an instance is required even when the
-                    // import metadata carries no launcher Activity.
-                    // Activity's constructor allocates a Handler, so the instance
-                    // can only be built on a thread that has a Looper: the UI
-                    // thread. The session thread then waits for it.
                     String launch = game != null && !game.launcherActivity.isEmpty()
                             ? game.launcherActivity : "";
                     final String launchName = launch;
@@ -349,22 +336,12 @@ public class GameHostActivity extends Activity {
         }, "zai-bridge-prepare").start();
     }
 
-    /**
-     * Starts the native session only once both prerequisites exist: the guest
-     * loader/dex and a live host Surface. EGL then binds guest window surfaces
-     * to the SurfaceView's ANativeWindow.
-     */
     private static boolean hasNativePayload(File payload) {
         if (!payload.isDirectory()) return false;
         File[] libs = payload.listFiles((dir, name) -> name.endsWith("32.so"));
         return libs != null && libs.length > 0;
     }
 
-    /**
-     * Legacy Java-only APKs run as guest dex on the host runtime: the loader is
-     * positioned on the APK, the Activity is created inside the guest context and
-     * its decor view (when the framework produces one) becomes the content view.
-     */
     private void launchPureJava(ClassLoader loader, String pkg, String launcher) {
         if (launcher.isEmpty()) {
             Log.w(TAG, "pure-Java import declares no launchable Activity");
@@ -424,41 +401,52 @@ public class GameHostActivity extends Activity {
     }
 
     // ---------------------------------------------------------------------
-    // Graphics: live quick menu and per-game configuration
+    // Telemetry pill and slide-out drawer
     // ---------------------------------------------------------------------
 
     private int dp(float value) {
         return Math.round(value * getResources().getDisplayMetrics().density);
     }
 
-    /**
-     * A transparent 18 dp strip on the right edge. Swiping left from it opens
-     * the quick graphics panel; only that strip is consumed, so the rest of the
-     * screen keeps delivering input to the guest untouched.
-     */
-    private void installEdgeMenu() {
+    private void installOverlay() {
         FrameLayout root = findViewById(android.R.id.content);
         if (root == null) return;
-        View handle = new View(this);
-        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
-                dp(18), FrameLayout.LayoutParams.MATCH_PARENT);
-        params.gravity = Gravity.END;
-        handle.setLayoutParams(params);
-        handle.setOnTouchListener(new View.OnTouchListener() {
-            private float downX;
-            private float downY;
+
+        telemetry.setOnTouchListener(new View.OnTouchListener() {
+            private float downRawX;
+            private float downRawY;
+            private int startLeft;
+            private int startTop;
+            private long downAt;
+            private boolean moved;
 
             @Override
             public boolean onTouch(View view, MotionEvent event) {
+                FrameLayout.LayoutParams params =
+                        (FrameLayout.LayoutParams) view.getLayoutParams();
                 switch (event.getActionMasked()) {
                     case MotionEvent.ACTION_DOWN:
-                        downX = event.getX();
-                        downY = event.getY();
+                        downRawX = event.getRawX();
+                        downRawY = event.getRawY();
+                        startLeft = params.leftMargin;
+                        startTop = params.topMargin;
+                        downAt = System.currentTimeMillis();
+                        moved = false;
                         return true;
+                    case MotionEvent.ACTION_MOVE: {
+                        float dx = event.getRawX() - downRawX;
+                        float dy = event.getRawY() - downRawY;
+                        if (Math.abs(dx) > dp(4) || Math.abs(dy) > dp(4)) moved = true;
+                        int maxLeft = Math.max(0, root.getWidth() - view.getWidth() - dp(8));
+                        int maxTop = Math.max(0, root.getHeight() - view.getHeight() - dp(8));
+                        params.leftMargin = clampInt(startLeft + (int) dx, dp(4), maxLeft);
+                        params.topMargin = clampInt(startTop + (int) dy, dp(4), maxTop);
+                        view.setLayoutParams(params);
+                        return true;
+                    }
                     case MotionEvent.ACTION_UP:
-                        if (downX - event.getX() > dp(22)
-                                && Math.abs(event.getY() - downY) < dp(90)) {
-                            toggleQuickMenu();
+                        if (!moved && System.currentTimeMillis() - downAt < 280) {
+                            toggleDrawer();
                         }
                         return true;
                     default:
@@ -466,209 +454,375 @@ public class GameHostActivity extends Activity {
                 }
             }
         });
-        root.addView(handle);
+
+        View handle = findViewById(R.id.view_edge_handle);
+        handle.setOnTouchListener(new View.OnTouchListener() {
+            private float downRawX;
+
+            @Override
+            public boolean onTouch(View view, MotionEvent event) {
+                if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                    downRawX = event.getRawX();
+                    return true;
+                }
+                if (event.getActionMasked() == MotionEvent.ACTION_UP) {
+                    if (downRawX - event.getRawX() > dp(22)) openDrawer();
+                    return true;
+                }
+                return true;
+            }
+        });
     }
 
-    private void toggleQuickMenu() {
-        if (quickMenu == null) quickMenu = buildQuickMenu();
-        final boolean show = quickMenu.getVisibility() != View.VISIBLE;
-        quickMenu.setVisibility(show ? View.VISIBLE : View.GONE);
-        if (show) refreshQuickStats();
+    private void updateTelemetry() {
+        if (telemetry == null || graphics == null) return;
+        String stats = EglSwapHook.compositorStats();
+        int guestFps = (int) Math.round(number(stats, "guestFps"));
+        int outputFps = (int) Math.round(number(stats, "outputFps"));
+        String text = guestFps > 0
+                ? String.format(Locale.US, "%d → %d FPS · %s MFG · %s %d%%",
+                guestFps, outputFps, graphics.frameGenName(),
+                graphics.upscalerName(), graphics.scalePercent)
+                : String.format(Locale.US, "%s MFG · %s %d%%",
+                graphics.frameGenName(), graphics.upscalerName(), graphics.scalePercent);
+        telemetry.setText(text);
+        if (drawerStats != null) drawerStats.setText(stats);
     }
 
-    private void rebuildQuickMenu() {
+    private static double number(String stats, String key) {
+        int at = stats.indexOf(key + "=");
+        if (at < 0) return 0;
+        int start = at + key.length() + 1;
+        int end = start;
+        while (end < stats.length()) {
+            char c = stats.charAt(end);
+            if ((c >= '0' && c <= '9') || c == '.') ++end;
+            else break;
+        }
+        try {
+            return Double.parseDouble(stats.substring(start, end));
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    private void toggleDrawer() {
+        if (drawerOpen) closeDrawer();
+        else openDrawer();
+    }
+
+    private void openDrawer() {
+        if (graphics == null) return;
+        if (drawer == null) drawer = buildDrawer();
+        if (drawer.getParent() == null) {
+            FrameLayout root = findViewById(android.R.id.content);
+            if (root == null) return;
+            root.addView(drawer);
+        }
+        drawerOpen = true;
+        drawer.setVisibility(View.VISIBLE);
+        drawer.setTranslationX(drawerWidth);
+        drawer.animate().translationX(0f).setDuration(230)
+                .setInterpolator(new DecelerateInterpolator()).start();
+        // Show the split comparison while the drawer is up.
+        EglSwapHook.setCompare(0.5f);
+        updateTelemetry();
+    }
+
+    private void closeDrawer() {
+        if (drawer == null) return;
+        drawerOpen = false;
+        EglSwapHook.setCompare(0f);
+        drawer.animate().translationX(drawerWidth).setDuration(190)
+                .withEndAction(() -> drawer.setVisibility(View.GONE)).start();
+    }
+
+    private View buildDrawer() {
         FrameLayout root = findViewById(android.R.id.content);
-        if (quickMenu != null && root != null) root.removeView(quickMenu);
-        quickMenu = null;
-        quickStats = null;
-    }
+        drawerWidth = Math.min(dp(330), root == null ? dp(330) : root.getWidth() - dp(24));
 
-    private View buildQuickMenu() {
-        FrameLayout root = findViewById(android.R.id.content);
-        LinearLayout panel = new LinearLayout(this);
-        panel.setOrientation(LinearLayout.VERTICAL);
-        panel.setPadding(dp(16), dp(14), dp(16), dp(12));
-
-        GradientDrawable background = new GradientDrawable();
-        background.setColor(0xE6111A26);
-        background.setCornerRadius(dp(16));
-        background.setStroke(dp(1), 0xFF22303F);
-        panel.setBackground(background);
-
+        FrameLayout panel = new FrameLayout(this);
         FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
-                dp(292), FrameLayout.LayoutParams.WRAP_CONTENT);
-        params.gravity = Gravity.END | Gravity.CENTER_VERTICAL;
-        params.setMargins(0, 0, dp(24), 0);
+                drawerWidth, FrameLayout.LayoutParams.MATCH_PARENT);
+        params.gravity = Gravity.END;
         panel.setLayoutParams(params);
+        panel.setBackgroundResource(R.drawable.bg_drawer);
+        panel.setClickable(true);
 
+        ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(true);
+        scroll.setLayoutParams(new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        panel.addView(scroll);
+
+        LinearLayout body = new LinearLayout(this);
+        body.setOrientation(LinearLayout.VERTICAL);
+        body.setPadding(dp(18), dp(18), dp(18), dp(22));
+        scroll.addView(body);
+
+        // Title row ------------------------------------------------------
+        LinearLayout titleRow = new LinearLayout(this);
+        titleRow.setOrientation(LinearLayout.HORIZONTAL);
+        titleRow.setGravity(Gravity.CENTER_VERTICAL);
         TextView title = new TextView(this);
         title.setText(R.string.graphics_quick);
-        title.setTextColor(0xFFEAF2FA);
-        title.setTextSize(14f);
+        title.setTextColor(0xFFE8EEF7);
+        title.setTextSize(15f);
         title.setTypeface(title.getTypeface(), android.graphics.Typeface.BOLD);
-        panel.addView(title);
+        title.setLayoutParams(new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        titleRow.addView(title);
+        ImageButton close = new ImageButton(this);
+        close.setBackgroundResource(R.drawable.bg_icon_button);
+        close.setImageResource(R.drawable.ic_close);
+        close.setContentDescription(getString(R.string.close));
+        close.setPadding(dp(8), dp(8), dp(8), dp(8));
+        LinearLayout.LayoutParams closeParams =
+                new LinearLayout.LayoutParams(dp(34), dp(34));
+        close.setLayoutParams(closeParams);
+        close.setOnClickListener(v -> closeDrawer());
+        titleRow.addView(close);
+        body.addView(titleRow);
 
-        panel.addView(quickLabel(R.string.graphics_upscaler));
-        RadioGroup upscaler = new RadioGroup(this);
-        upscaler.setOrientation(RadioGroup.HORIZONTAL);
-        upscaler.addView(quickRadio(getString(R.string.graphics_off),
-                graphics.upscaler == GraphicsSettings.UPSCALER_OFF, () -> {
-                    graphics.upscaler = GraphicsSettings.UPSCALER_OFF;
-                    applyGraphics();
-                }));
-        upscaler.addView(quickRadio("SGSR",
-                graphics.upscaler == GraphicsSettings.UPSCALER_SGSR, () -> {
-                    graphics.upscaler = GraphicsSettings.UPSCALER_SGSR;
-                    applyGraphics();
-                }));
-        upscaler.addView(quickRadio("FSR",
-                graphics.upscaler == GraphicsSettings.UPSCALER_FSR, () -> {
-                    graphics.upscaler = GraphicsSettings.UPSCALER_FSR;
-                    applyGraphics();
-                }));
-        panel.addView(upscaler);
+        // Preset chips ---------------------------------------------------
+        body.addView(sectionLabel(R.string.preset));
+        body.addView(chipRow(new String[][]{
+                {getString(R.string.preset_off), "0"},
+                {getString(R.string.preset_fsr_perf), "1"},
+                {getString(R.string.preset_fsr_quality), "2"},
+                {getString(R.string.preset_dlss_ultra), "3"},
+                {getString(R.string.preset_dlss_overdrive), "4"}
+        }, String.valueOf(graphics.preset), value -> {
+            int preset = Integer.parseInt(value);
+            GraphicsSettings next = GraphicsSettings.ofPreset(preset);
+            graphics = next;
+            applyGraphics();
+            rebuildDrawer();
+        }));
 
-        panel.addView(quickLabel(R.string.graphics_scale));
-        RadioGroup scale = new RadioGroup(this);
-        scale.setOrientation(RadioGroup.HORIZONTAL);
-        scale.addView(quickRadio("50%",
-                graphics.scalePercent == GraphicsSettings.SCALE_PERFORMANCE, () -> {
-                    graphics.scalePercent = GraphicsSettings.SCALE_PERFORMANCE;
+        // Render scale ---------------------------------------------------
+        body.addView(sliderRow(R.string.graphics_scale, 50, 100,
+                graphics.scalePercent, value -> {
+                    graphics.scalePercent = value;
+                    graphics.markCustom();
                     applyGraphics();
                 }));
-        scale.addView(quickRadio("67%",
-                graphics.scalePercent == GraphicsSettings.SCALE_BALANCED, () -> {
-                    graphics.scalePercent = GraphicsSettings.SCALE_BALANCED;
-                    applyGraphics();
-                }));
-        scale.addView(quickRadio("75%",
-                graphics.scalePercent == GraphicsSettings.SCALE_QUALITY, () -> {
-                    graphics.scalePercent = GraphicsSettings.SCALE_QUALITY;
-                    applyGraphics();
-                }));
-        scale.addView(quickRadio("100%",
-                graphics.scalePercent == GraphicsSettings.SCALE_NATIVE, () -> {
-                    graphics.scalePercent = GraphicsSettings.SCALE_NATIVE;
-                    applyGraphics();
-                }));
-        panel.addView(scale);
 
-        panel.addView(quickLabel(R.string.graphics_sharpness));
-        SeekBar sharpness = new SeekBar(this);
-        sharpness.setMax(100);
-        sharpness.setProgress(graphics.sharpnessPercent);
-        sharpness.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+        body.addView(sliderRow(R.string.graphics_sharpness, 0, 100,
+                graphics.sharpnessPercent, value -> {
+                    graphics.sharpnessPercent = value;
+                    graphics.markCustom();
+                    applyGraphics();
+                }));
+
+        body.addView(sliderRow(R.string.graphics_neural, 0, 100,
+                graphics.neuralPercent, value -> {
+                    graphics.neuralPercent = value;
+                    graphics.markCustom();
+                    applyGraphics();
+                }));
+
+        // Frame generation ----------------------------------------------
+        body.addView(sectionLabel(R.string.graphics_frame_gen));
+        body.addView(chipRow(new String[][]{
+                {getString(R.string.graphics_off), "0"},
+                {"2x", "2"},
+                {"3x", "3"},
+                {"4x", "4"}
+        }, String.valueOf(graphics.frameGen), value -> {
+            graphics.frameGen = Integer.parseInt(value);
+            if (graphics.frameGen != GraphicsSettings.FRAME_GEN_OFF
+                    && graphics.upscaler == GraphicsSettings.UPSCALER_OFF) {
+                graphics.upscaler = GraphicsSettings.UPSCALER_DLSS;
+                graphics.temporal = 1;
+            }
+            graphics.markCustom();
+            applyGraphics();
+            rebuildDrawer();
+        }));
+
+        // Compare wipe ---------------------------------------------------
+        body.addView(sectionLabel(R.string.compare_wipe));
+        LinearLayout compareLabels = new LinearLayout(this);
+        compareLabels.setOrientation(LinearLayout.HORIZONTAL);
+        TextView vanilla = new TextView(this);
+        vanilla.setText(R.string.compare_vanilla);
+        vanilla.setTextColor(0xFF8A99AD);
+        vanilla.setTextSize(10f);
+        vanilla.setLayoutParams(new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        TextView zaiscale = new TextView(this);
+        zaiscale.setText(R.string.compare_zaiscale);
+        zaiscale.setTextColor(0xFF00E5FF);
+        zaiscale.setTextSize(10f);
+        zaiscale.setGravity(Gravity.END);
+        zaiscale.setLayoutParams(new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        compareLabels.addView(vanilla);
+        compareLabels.addView(zaiscale);
+        body.addView(compareLabels);
+
+        SeekBar compare = new SeekBar(this);
+        compare.setMax(100);
+        compare.setProgress(50);
+        compare.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
-            public void onProgressChanged(SeekBar bar, int progress, boolean fromUser) {
-                if (fromUser) graphics.sharpnessPercent = progress;
+            public void onProgressChanged(SeekBar bar, int value, boolean fromUser) {
+                if (fromUser) {
+                    EglSwapHook.setCompare(value <= 2 ? 0f
+                            : Math.min(0.98f, value / 100f));
+                }
             }
 
             @Override public void onStartTrackingTouch(SeekBar bar) { }
 
-            @Override
-            public void onStopTrackingTouch(SeekBar bar) {
-                applyGraphics();
-            }
+            @Override public void onStopTrackingTouch(SeekBar bar) { }
         });
-        panel.addView(sharpness);
+        body.addView(compare);
 
-        CheckBox frameGen = new CheckBox(this);
-        frameGen.setText(R.string.graphics_frame_gen_2x);
-        frameGen.setTextSize(11.5f);
-        frameGen.setTextColor(0xFFEAF2FA);
-        frameGen.setChecked(graphics.frameGen == GraphicsSettings.FRAME_GEN_2X);
-        frameGen.setButtonTintList(
-                android.content.res.ColorStateList.valueOf(0xFF3BE0F2));
-        frameGen.setOnCheckedChangeListener((button, checked) -> {
-            graphics.frameGen = checked ? GraphicsSettings.FRAME_GEN_2X
-                    : GraphicsSettings.FRAME_GEN_OFF;
-            applyGraphics();
-        });
-        panel.addView(frameGen);
+        // Live counters --------------------------------------------------
+        drawerStats = new TextView(this);
+        drawerStats.setTextSize(8.5f);
+        drawerStats.setTextColor(0xFF5F6E80);
+        drawerStats.setMaxLines(8);
+        drawerStats.setPadding(0, dp(12), 0, dp(10));
+        drawerStats.setText(EglSwapHook.compositorStats());
+        body.addView(drawerStats);
 
-        Button more = new Button(this);
-        more.setText(R.string.graphics_all);
-        more.setAllCaps(false);
-        more.setTextSize(11f);
-        more.setOnClickListener(v -> openFullGraphicsSheet());
-        panel.addView(more);
+        Button exit = new Button(this);
+        exit.setText(R.string.exit_game);
+        exit.setAllCaps(false);
+        exit.setTextSize(13f);
+        exit.setTextColor(0xFFFFB300);
+        GradientDrawable exitBackground = new GradientDrawable();
+        exitBackground.setColor(0x1AFFB300);
+        exitBackground.setCornerRadius(dp(14));
+        exitBackground.setStroke(dp(1), 0x66FFB300);
+        exit.setBackground(exitBackground);
+        exit.setLayoutParams(new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(50)));
+        exit.setOnClickListener(v -> finish());
+        body.addView(exit);
 
-        quickStats = new TextView(this);
-        quickStats.setTextSize(9.5f);
-        quickStats.setTextColor(0xFF8FA3B8);
-        quickStats.setMaxLines(3);
-        panel.addView(quickStats);
-
-        if (root != null) root.addView(panel);
+        panel.addView(scroll);
         return panel;
     }
 
-    private TextView quickLabel(int textRes) {
+    private void rebuildDrawer() {
+        FrameLayout root = findViewById(android.R.id.content);
+        if (root == null) return;
+        if (drawer != null) root.removeView(drawer);
+        drawer = buildDrawer();
+        drawer.setVisibility(View.VISIBLE);
+        root.addView(drawer);
+        updateTelemetry();
+    }
+
+    private interface ValueSink {
+        void accept(String value);
+    }
+
+    private interface IntSink {
+        void accept(int value);
+    }
+
+    private TextView sectionLabel(int textRes) {
         TextView label = new TextView(this);
         label.setText(textRes);
-        label.setTextSize(9.5f);
+        label.setTextSize(9f);
         label.setAllCaps(true);
-        label.setTextColor(0xFF8FA3B8);
-        label.setPadding(0, dp(9), 0, dp(1));
+        label.setLetterSpacing(0.12f);
+        label.setTextColor(0xFF8A99AD);
+        label.setPadding(0, dp(16), 0, dp(6));
         return label;
     }
 
-    private RadioButton quickRadio(String text, boolean checked, Runnable onPick) {
-        RadioButton button = new RadioButton(this);
-        button.setText(text);
-        button.setTextSize(10.5f);
-        button.setTextColor(0xFFEAF2FA);
-        button.setChecked(checked);
-        button.setButtonTintList(
-                android.content.res.ColorStateList.valueOf(0xFF3BE0F2));
-        button.setPadding(0, 0, dp(4), 0);
-        button.setOnClickListener(v -> onPick.run());
-        return button;
+    private View chipRow(String[][] chips, String selected, ValueSink sink) {
+        ScrollView scroll = new ScrollView(this);
+        scroll.setHorizontalScrollBarEnabled(false);
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        for (String[] chip : chips) {
+            TextView view = new TextView(this);
+            view.setText(chip[0]);
+            view.setTextSize(10.5f);
+            boolean on = chip[1].equals(selected);
+            view.setTextColor(on ? 0xFF00E5FF : 0xFF8A99AD);
+            GradientDrawable background = new GradientDrawable();
+            background.setColor(on ? 0x2600E5FF : 0x141A24);
+            background.setCornerRadius(dp(13));
+            background.setStroke(dp(1), on ? 0x9900E5FF : 0xFF263042);
+            view.setBackground(background);
+            view.setPadding(dp(12), dp(7), dp(12), dp(7));
+            LinearLayout.LayoutParams params =
+                    new LinearLayout.LayoutParams(
+                            LinearLayout.LayoutParams.WRAP_CONTENT,
+                            LinearLayout.LayoutParams.WRAP_CONTENT);
+            params.setMarginEnd(dp(7));
+            view.setLayoutParams(params);
+            view.setOnClickListener(v -> sink.accept(chip[1]));
+            row.addView(view);
+        }
+        scroll.addView(row);
+        return scroll;
+    }
+
+    private View sliderRow(int labelRes, int min, int max, int value, IntSink sink) {
+        LinearLayout wrap = new LinearLayout(this);
+        wrap.setOrientation(LinearLayout.VERTICAL);
+
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        TextView label = new TextView(this);
+        label.setText(labelRes);
+        label.setTextSize(9f);
+        label.setAllCaps(true);
+        label.setLetterSpacing(0.12f);
+        label.setTextColor(0xFF8A99AD);
+        label.setLayoutParams(new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        TextView badge = new TextView(this);
+        badge.setText(String.format(Locale.US, "%d%%", value));
+        badge.setTextSize(10.5f);
+        badge.setTextColor(0xFF00E5FF);
+        badge.setTypeface(badge.getTypeface(), android.graphics.Typeface.BOLD);
+        header.addView(label);
+        header.addView(badge);
+        wrap.addView(header);
+
+        SeekBar bar = new SeekBar(this);
+        bar.setMax(max - min);
+        bar.setProgress(Math.max(0, value - min));
+        bar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                badge.setText(String.format(Locale.US, "%d%%", progress + min));
+            }
+
+            @Override public void onStartTrackingTouch(SeekBar seekBar) { }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar) {
+                sink.accept(seekBar.getProgress() + min);
+            }
+        });
+        wrap.addView(bar);
+        return wrap;
     }
 
     private void applyGraphics() {
-        EglSwapHook.configure(graphics.upscaler, graphics.scalePercent,
-                graphics.sharpnessPercent, graphics.frameGen);
+        EglSwapHook.configure(graphics);
         applyFrameRateHint(graphics);
         try {
             GraphicsSettings.saveGame(gameDir, graphics);
         } catch (Exception e) {
             Log.w(TAG, "graphics settings were not saved", e);
         }
-        refreshQuickStats();
     }
 
-    private void openFullGraphicsSheet() {
-        GraphicsSettingsSheet.show(this,
-                (game != null ? game.label + " — " : "")
-                        + getString(R.string.graphics_title),
-                graphics, true, (settings, useGlobal) -> {
-                    if (useGlobal) {
-                        GraphicsSettings.clearGame(gameDir);
-                        graphics = GraphicsSettings.global(this);
-                    } else {
-                        graphics = settings.copy();
-                    }
-                    applyGraphics();
-                    rebuildQuickMenu();
-                });
-    }
-
-    private void refreshQuickStats() {
-        if (quickStats == null) return;
-        String stats = EglSwapHook.stats();
-        if (stats.length() > 260) stats = stats.substring(0, 260) + "…";
-        quickStats.setText(stats);
-    }
-
-    /**
-     * Asks the display to run at 120 Hz for 2x frame generation (and 60 Hz
-     * otherwise) where the panel and the framework support it. Frames are still
-     * presented at the guest's own rate; this only unlocks the scan-out rate.
-     */
     private void applyFrameRateHint(GraphicsSettings settings) {
         if (surfaceView == null || settings == null || Build.VERSION.SDK_INT < 30) return;
-        final float rate = settings.frameGen == GraphicsSettings.FRAME_GEN_2X ? 120f : 60f;
+        final float rate = settings.frameGen != GraphicsSettings.FRAME_GEN_OFF ? 120f : 60f;
         try {
             Surface surface = surfaceView.getHolder().getSurface();
             if (surface != null && surface.isValid()) {
@@ -680,7 +834,10 @@ public class GameHostActivity extends Activity {
         }
     }
 
-    /** OBBs are discovered by the host only; they are never shown in the grid. */
+    private static int clampInt(int value, int lo, int hi) {
+        return value < lo ? lo : (value > hi ? hi : value);
+    }
+
     private static String findObb(File gameDir) {
         File obbDir = new File(gameDir, "obb");
         File[] files = obbDir.listFiles();
@@ -703,6 +860,10 @@ public class GameHostActivity extends Activity {
             status.setText(R.string.bridge_ready);
             applyFrameRateHint(graphics);
             statusWrap.postDelayed(this::fadeStatus, 1500);
+            telemetry.setVisibility(View.VISIBLE);
+            updateTelemetry();
+            telemetryHandler.removeCallbacks(telemetryTick);
+            telemetryHandler.post(telemetryTick);
         } else {
             status.setText(getString(R.string.bridge_failed, result));
             Log.e(TAG, "bridge refused to start: " + result);
@@ -712,9 +873,7 @@ public class GameHostActivity extends Activity {
     private void status(String text, boolean keepVisible) {
         if (status == null) return;
         status.setText(text);
-        if (!keepVisible) {
-            statusWrap.postDelayed(this::fadeStatus, 2500);
-        }
+        if (!keepVisible) statusWrap.postDelayed(this::fadeStatus, 2500);
     }
 
     private void fadeStatus() {

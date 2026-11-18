@@ -187,18 +187,17 @@ bool present_frame(EGLDisplay dpy, EGLSurface surf) {
     zai::GpuCompositor& compositor = zai::GpuCompositor::instance();
     if (!compositor.begin(dpy, surf, /*guest_drew_internal=*/false)) return false;
 
-    bool generated = false;
-    if (compositor.frame_generation() && compositor.present_intermediate()) {
-        // Present F_{t-0.5} now, wait half a refresh, then let the caller's
-        // swap present F_t. That is what makes the extra frame visible.
-        const EGLBoolean intermediate = g_egl_swap(dpy, surf);
-        if (intermediate == EGL_TRUE) ++g_generated;
-        compositor.wait_half_frame();
-        generated = true;
+    // Emit 1..3 synthetic frames ahead of the real one, evenly spaced by the
+    // measured guest interval.
+    const int extras = compositor.synthetic_count();
+    for (int i = 0; i < extras; ++i) {
+        if (!compositor.present_synthetic(i)) break;
+        if (g_egl_swap(dpy, surf) == EGL_TRUE) ++g_generated;
+        compositor.wait_subframe();
     }
     compositor.present_current();
     compositor.end_frame();
-    return generated;
+    return extras > 0;
 }
 
 // One clock for every swap the bridge can observe from Java.
@@ -529,9 +528,24 @@ Java_com_ziauddin_zaibridge_core_EglSwapHook_nativeStats(JNIEnv* env, jclass /*c
 extern "C" JNIEXPORT void JNICALL
 Java_com_ziauddin_zaibridge_core_EglSwapHook_nativeConfigure(
         JNIEnv* /*env*/, jclass /*clazz*/, jint upscaler, jint scale_percent,
-        jint sharpness_percent, jint frame_gen) {
-    zai::GpuCompositor::instance().configure(
-            upscaler, scale_percent, sharpness_percent, frame_gen);
+        jint sharpness_percent, jint neural_percent, jint frame_gen,
+        jint temporal, jint auto_mfg, jint preset) {
+    zai::GraphicsConfig config;
+    config.preset = preset;
+    config.upscaler = upscaler;
+    config.scale_percent = scale_percent;
+    config.sharpness_percent = sharpness_percent;
+    config.neural_percent = neural_percent;
+    config.frame_gen = frame_gen;
+    config.temporal = temporal;
+    config.auto_mfg = auto_mfg;
+    zai::GpuCompositor::instance().configure(config);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_ziauddin_zaibridge_core_EglSwapHook_nativeSetCompare(
+        JNIEnv* /*env*/, jclass /*clazz*/, jfloat split) {
+    zai::GpuCompositor::instance().set_compare(split);
 }
 
 extern "C" JNIEXPORT jstring JNICALL

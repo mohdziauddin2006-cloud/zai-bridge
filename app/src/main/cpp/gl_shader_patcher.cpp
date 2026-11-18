@@ -99,6 +99,38 @@ Patch patch_shader_source(const std::string& source, Stage stage, int gles_major
         }
     }
 
+    // ---- strict ES 3 source on an ES 2 driver ----------------------------
+    // The compositor authors every shader in `#version 300 es` with explicit
+    // precision. A GPU without ES3 gets the same body demoted to ES 1.00
+    // instead of the compositor silently disappearing.
+    if (declared >= 300 && gles_major < 3) {
+        const std::string before = s;
+        if (version_at != std::string::npos) {
+            s.replace(version_at, version_end - version_at, "#version 100");
+            version_end = version_at + std::strlen("#version 100");
+        }
+        s = replace_all(s, "precision highp float;", "precision mediump float;");
+        s = replace_all(s, "precision highp sampler2D;", "");
+        s = replace_all(s, "precision mediump sampler2D;", "");
+        s = replace_all(s, "precision highp samplerCube;", "");
+
+        if (stage == Stage::Vertex) {
+            s = replace_all(s, "in ", "attribute ");
+            s = replace_all(s, "out ", "varying ");
+        } else {
+            s = replace_all(s, "in ", "varying ");
+            // Drop the ES3 fragment output declaration and go back to
+            // gl_FragColor. The output is always named fragColor by policy.
+            s = replace_all(s, "out vec4 fragColor;", "");
+            s = replace_all(s, "fragColor", "gl_FragColor");
+        }
+        s = replace_all(s, "texture(", "texture2D(");
+        patch.added_precision = false;
+        patch.translated_es3 = true;
+        patch.changed = (s != before);
+        return patch;
+    }
+
     // ---- legacy syntax on a strict ES 3 context ---------------------------
     const bool es3 = declared >= 300;
     const bool needs_translation = es3 && gles_major >= 3;

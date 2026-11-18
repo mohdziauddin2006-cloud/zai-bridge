@@ -719,6 +719,18 @@ private:
     }
 
     uc_engine* uc_ = nullptr;
+
+public:
+    // A session owns its engine: ending it must actually release the 64 MB
+    // guest address space, otherwise launching a second game leaks one heap.
+    ~Emulator() {
+        if (uc_) {
+            uc_close(uc_);
+            uc_ = nullptr;
+        }
+    }
+
+private:
     uc_hook    mem_hook_ = 0;
     uint32_t   heap_cursor_ = kHeapBase;
     uint32_t   depth_ = 0;                   // nested call depth
@@ -3357,13 +3369,13 @@ private:
             const bool composited = compositor.begin(dpy, surf, compositor_bound_);
             if (composited) {
                 ++swap_count_;
-                if (compositor.frame_generation() && compositor.present_intermediate()) {
-                    fn(dpy, surf);                  // intermediate frame
-                    compositor.wait_half_frame();
-                    compositor.present_current();   // real frame
-                } else {
-                    compositor.present_current();
+                const int extras = compositor.synthetic_count();
+                for (int i = 0; i < extras; ++i) {
+                    if (!compositor.present_synthetic(i)) break;
+                    fn(dpy, surf);
+                    compositor.wait_subframe();
                 }
+                compositor.present_current();
                 compositor.end_frame();
             }
 
@@ -7080,6 +7092,7 @@ const char* JniBridge::jni_vm_name(int idx) {
 }
 
 JniBridge* g_bridge = nullptr;
+Emulator*  g_emulator = nullptr;
 JavaVM*    g_vm = nullptr;
 
 // One emulator per process: the guest address space is fixed (see the layout
@@ -7196,12 +7209,14 @@ Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeStartSession(
         return -2;
     }
 
-    static Emulator emu;
-    g_bridge = new JniBridge(emu);
-    if (!emu.init() || !g_bridge->init(g_vm, env)) {
+    g_emulator = new Emulator();
+    g_bridge = new JniBridge(*g_emulator);
+    if (!g_emulator->init() || !g_bridge->init(g_vm, env)) {
         LOGE("bridge initialisation failed");
         delete g_bridge;
         g_bridge = nullptr;
+        delete g_emulator;
+        g_emulator = nullptr;
         return -1;
     }
 
@@ -7360,6 +7375,23 @@ extern "C" JNIEXPORT jboolean JNICALL
 Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeIsSessionActive(
         JNIEnv* /*env*/, jclass /*clazz*/) {
     return g_session_active ? JNI_TRUE : JNI_FALSE;
+}
+
+// Clean session teardown. The guest Activity is already destroyed when the
+// launcher calls this; the compositor and the Unicorn engine are released so a
+// second game can be launched in the same process with a fresh address space.
+extern "C" JNIEXPORT void JNICALL
+Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeEndSession(
+        JNIEnv* /*env*/, jclass /*clazz*/) {
+    if (!g_session_active && g_bridge == nullptr && g_emulator == nullptr) return;
+    LOGI("Zai-Bridge: closing guest session");
+    zai::GpuCompositor::instance().teardown();
+    delete g_bridge;
+    g_bridge = nullptr;
+    delete g_emulator;
+    g_emulator = nullptr;
+    g_session_active = false;
+    LOGI("Zai-Bridge: session closed; a new import can start");
 }
 
 extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void* reserved) {
