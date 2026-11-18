@@ -9,10 +9,12 @@ android {
 
     defaultConfig {
         applicationId 'com.ziauddin.zaibridge'
-        minSdk 24
+        // Android 8.0 is the floor for the foreground dataSync import service
+        // and for the Material 3 launcher without legacy shims.
+        minSdk 26
         targetSdk 34
-        versionCode 2
-        versionName '2.0'
+        versionCode 3
+        versionName '2.0.0'
 
         // One universal APK for every phone architecture:
         //   arm64-v8a / x86_64 -> Unicorn ARM32 translation core

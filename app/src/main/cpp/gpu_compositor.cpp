@@ -597,6 +597,25 @@ struct GpuCompositor::Impl {
     std::string last_error;
 
     double interval_ms = 16.7;
+
+    // Rolling window of guest frame intervals (ours are subtracted below).
+    static constexpr int kIntervalWindow = 8;
+    double interval_samples[kIntervalWindow] = {0.0};
+    int interval_count = 0;
+    int interval_next = 0;
+    double interval_sum = 0.0;
+
+    // Auto-MFG hysteresis: one multiplier step at a time, and only once the
+    // window has been consistently fast (reduce) or slow (raise).
+    int extras_latched = 0;
+    int frames_fast = 0;
+    int frames_slow = 0;
+
+    // Synthetic-frame pacing clocks.
+    std::chrono::steady_clock::time_point frame_started{};
+    int pace_step = 0;
+    double mfg_added_ms = 0.0;
+    double mfg_added_last = 0.0;
     std::chrono::steady_clock::time_point last_frame{};
     std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
 
@@ -1056,15 +1075,68 @@ struct GpuCompositor::Impl {
         return true;
     }
 
-    int effective_extras() const {
-        int gen = frame_gen.load();
-        if (gen < 2) return 0;
-        int extras = gen - 1;
-        if (auto_mfg.load() != 0) {
-            if (interval_ms < 12.0) extras = 0;
-            else if (interval_ms < 20.0) extras = std::min(extras, 1);
+    void push_interval(double observed) {
+        if (interval_count < kIntervalWindow) {
+            ++interval_count;
+        } else {
+            interval_sum -= interval_samples[interval_next];
         }
-        return std::max(0, std::min(extras, 3));
+        interval_samples[interval_next] = observed;
+        interval_sum += observed;
+        interval_next = (interval_next + 1) % kIntervalWindow;
+        interval_ms = interval_sum / static_cast<double>(interval_count);
+    }
+
+    // Multiplier the rolling average asks for, before hysteresis.
+    int target_extras() const {
+        const int extras = std::max(0, frame_gen.load() - 1);
+        if (auto_mfg.load() == 0) return extras;
+        // Already above ~87 fps: the panel cannot show more. Between ~51 and
+        // ~87 fps a single synthetic frame is enough for a 100-120 Hz panel.
+        if (interval_ms < 11.5) return 0;
+        if (interval_ms < 19.5) return std::min(extras, 1);
+        return extras;
+    }
+
+    // Called once per real frame, after the rolling average is updated.
+    void update_auto_mfg() {
+        const int gen = frame_gen.load();
+        const int wanted = gen < 2 ? 0 : gen - 1;
+        if (auto_mfg.load() == 0) {
+            extras_latched = wanted;
+            frames_fast = 0;
+            frames_slow = 0;
+            return;
+        }
+        if (extras_latched > wanted) extras_latched = wanted;
+        const int target = target_extras();
+        if (extras_latched > target) {
+            // Guest is comfortably faster than the panel needs: drop one step
+            // after four consistent frames instead of oscillating.
+            if (++frames_fast >= 4) {
+                --extras_latched;
+                frames_fast = 0;
+            }
+            frames_slow = 0;
+        } else if (extras_latched < target) {
+            // Guest is slower: ease up one step after six consistent frames.
+            if (++frames_slow >= 6) {
+                ++extras_latched;
+                frames_slow = 0;
+            }
+            frames_fast = 0;
+        } else {
+            frames_fast = 0;
+            frames_slow = 0;
+        }
+    }
+
+    int effective_extras() const {
+        if (frame_gen.load() < 2) return 0;
+        if (auto_mfg.load() == 0) {
+            return std::max(0, std::min(frame_gen.load() - 1, 3));
+        }
+        return std::max(0, std::min(extras_latched, 3));
     }
 };
 
@@ -1104,6 +1176,11 @@ void GpuCompositor::configure(const GraphicsConfig& config) {
         d.ring_head = 0;
         ++d.epoch;
     }
+    // Start a new configuration at its full multiplier and let the rolling
+    // window ease it down; never inherit a stale latch from another preset.
+    d.extras_latched = d.frame_gen.load() >= 2 ? d.frame_gen.load() - 1 : 0;
+    d.frames_fast = 0;
+    d.frames_slow = 0;
     LOGI("Zai-Scale: preset=%d up=%d scale=%d%% sharp=%d%% neural=%d%% gen=%dx temporal=%d auto=%d",
          d.preset.load(), d.upscaler.load(), d.scale.load(), d.sharpness.load(),
          d.neural.load(), d.frame_gen.load(), d.temporal.load(), d.auto_mfg.load());
@@ -1226,13 +1303,19 @@ bool GpuCompositor::begin(EGLDisplay display, EGLSurface surface,
 
     const auto now = std::chrono::steady_clock::now();
     if (d.last_frame.time_since_epoch().count() != 0) {
-        const double observed =
+        // Subtract the synthetic presents and pacing this hook added last time:
+        // otherwise a 4x MFG frame looks like a slow guest and auto-MFG keeps
+        // climbing, which is the classic stutter feedback loop.
+        const double wall =
                 std::chrono::duration<double, std::milli>(now - d.last_frame).count();
-        if (observed > 0.5 && observed < 200.0) {
-            d.interval_ms = d.interval_ms * 0.86 + observed * 0.14;
-        }
+        const double observed = wall - d.mfg_added_last;
+        if (observed > 1.0 && observed < 200.0) d.push_interval(observed);
     }
     d.last_frame = now;
+    d.frame_started = now;
+    d.pace_step = 0;
+    d.mfg_added_ms = 0.0;
+    d.update_auto_mfg();
 
     const GraphicsConfig cfg = d.snapshot();
     const bool want_flow = d.ring_count >= 1 &&
@@ -1268,6 +1351,7 @@ bool GpuCompositor::present_synthetic(int index) {
     const int prev = (cur + 2) % 3;
     const float alpha = static_cast<float>(index + 1) / static_cast<float>(extras + 1);
 
+    const auto started = std::chrono::steady_clock::now();
     GlState saved;
     d.save_state(saved);
     const bool ok = d.run_synthetic(d.ring[prev], d.ring[cur], alpha);
@@ -1276,6 +1360,8 @@ bool GpuCompositor::present_synthetic(int index) {
         ++d.generated_frames;
     }
     d.restore_state(saved);
+    d.mfg_added_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - started).count();
     return ok;
 }
 
@@ -1290,13 +1376,29 @@ void GpuCompositor::present_current() {
 void GpuCompositor::wait_subframe() {
     Impl& d = *impl_;
     const int extras = d.effective_extras();
+    if (extras <= 0) return;
     double slice = d.interval_ms / static_cast<double>(extras + 1);
     slice = std::max(2.0, std::min(slice, 9.0));
-    std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(slice));
+
+    // Absolute pacing: wait until this synthetic frame's slot boundary rather
+    // than sleeping a fixed slice on top of the present cost. A frame that is
+    // already late is presented immediately instead of accumulating latency.
+    ++d.pace_step;
+    const double target = slice * static_cast<double>(d.pace_step);
+    const double elapsed = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - d.frame_started).count();
+    const double remaining = target - elapsed;
+    if (remaining > 0.2) {
+        std::this_thread::sleep_for(
+                std::chrono::duration<double, std::milli>(remaining));
+        d.mfg_added_ms += remaining;
+    }
 }
 
 void GpuCompositor::end_frame() {
     Impl& d = *impl_;
+    d.mfg_added_last = d.mfg_added_ms;
+    d.mfg_added_ms = 0.0;
     d.ring_head = (d.ring_head + 1) % 3;
     if (d.ring_count < 3) ++d.ring_count;
 }

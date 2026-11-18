@@ -38,6 +38,9 @@ public final class UnicornBridge {
     /** Architecture the legacy payloads are compiled for. */
     public static final String GUEST_ABI = "armeabi-v7a";
 
+    private static final java.util.concurrent.atomic.AtomicInteger GENERATION =
+            new java.util.concurrent.atomic.AtomicInteger();
+
     private static final boolean CORE_LOADED;
 
     static {
@@ -87,6 +90,9 @@ public final class UnicornBridge {
      */
     public static int startSession(String gameDir, String obbPath, String packageName,
                                    ClassLoader guestLoader, Object guestActivity) {
+        // Claim the bridge before doing any work: a teardown queued by the host
+        // Activity that is finishing must not run once this session exists.
+        GENERATION.incrementAndGet();
         if (isPassthrough()) {
             Log.i(TAG, "32-bit host: guest libraries run natively (passthrough)");
             return SESSION_PASSTHROUGH;
@@ -137,6 +143,24 @@ public final class UnicornBridge {
         } catch (Throwable t) {
             Log.w(TAG, "session teardown failed", t);
         }
+    }
+
+    /** Id of the most recent {@link #startSession} attempt in this process. */
+    public static int sessionGeneration() {
+        return GENERATION.get();
+    }
+
+    /**
+     * Ends the session only when no newer session has been claimed since
+     * {@code generation}. This is what makes repeated relaunches safe when the
+     * previous host Activity is destroyed after the new one already started.
+     */
+    public static void endSession(int generation) {
+        if (GENERATION.get() != generation) {
+            Log.i(TAG, "teardown skipped: a newer session owns the bridge");
+            return;
+        }
+        endSession();
     }
 
     /** Unicorn version and guest/host architecture, for diagnostics. */

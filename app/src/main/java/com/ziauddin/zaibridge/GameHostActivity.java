@@ -74,6 +74,7 @@ public class GameHostActivity extends Activity {
     private volatile boolean surfaceReady;
     private boolean sessionDispatched;
     private volatile boolean pureJavaMode;
+    private volatile int sessionGeneration = -1;
 
     private GraphicsSettings graphics;
 
@@ -222,9 +223,12 @@ public class GameHostActivity extends Activity {
         surfaceReady = false;
         // The guest is gone; release its EGL surface, the compositor textures
         // and the Unicorn address space so the next game can start cleanly.
+        final int generation = sessionGeneration;
         SURFACE_QUEUE.execute(() -> {
             UnicornBridge.setSurface(null);
-            UnicornBridge.endSession();
+            // Never tear down a session another host Activity claimed while
+            // this one was finishing.
+            if (generation >= 0) UnicornBridge.endSession(generation);
         });
         super.onDestroy();
     }
@@ -234,6 +238,30 @@ public class GameHostActivity extends Activity {
         super.onWindowFocusChanged(hasFocus);
         if (hasFocus) enterImmersive();
         if (guestHost != null) guestHost.onWindowFocusChanged(hasFocus);
+    }
+
+    @Override
+    public void onConfigurationChanged(android.content.res.Configuration config) {
+        super.onConfigurationChanged(config);
+        AspectRatioFrameLayout aspect = findViewById(R.id.game_aspect);
+        if (aspect != null) {
+            boolean portrait = config.orientation
+                    == android.content.res.Configuration.ORIENTATION_PORTRAIT;
+            aspect.setAspectRatio(portrait ? 3f / 4f : 16f / 9f);
+        }
+        // The drawer's width is derived from the old window; rebuild on demand
+        // instead of animating a stale panel.
+        if (drawerOpen) closeDrawer();
+        applyFrameRateHint(graphics);
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (drawerOpen) {
+            closeDrawer();
+            return;
+        }
+        super.onBackPressed();
     }
 
     private void enterImmersive() {
@@ -394,6 +422,7 @@ public class GameHostActivity extends Activity {
             Object guestActivity = guestHost != null ? guestHost.getGuest() : null;
             result = UnicornBridge.startSession(gameDir.getAbsolutePath(), obb, pkg,
                     guestLoader, guestActivity);
+            sessionGeneration = UnicornBridge.sessionGeneration();
         } catch (Throwable t) {
             Log.e(TAG, "native session crashed", t);
         }

@@ -68,7 +68,6 @@ public class MainActivity extends AppCompatActivity implements GameAdapter.Liste
     private TextView permissionText;
 
     private ImportSheet importSheet;
-    private boolean pickApkAfterGrant;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -119,6 +118,15 @@ public class MainActivity extends AppCompatActivity implements GameAdapter.Liste
         super.onResume();
         refreshGames();
         updatePermissionBanner();
+    }
+
+    @Override
+    protected void onDestroy() {
+        // A BottomSheetDialog holds a window; leaving it attached to a
+        // destroyed Activity is the classic leaked-window crash on relaunch.
+        if (importSheet != null) importSheet.dismiss();
+        importSheet = null;
+        super.onDestroy();
     }
 
     // ---------------------------------------------------------------------
@@ -316,7 +324,6 @@ public class MainActivity extends AppCompatActivity implements GameAdapter.Liste
     }
 
     private void requestStorageAccess(boolean pickAfterGrant) {
-        pickApkAfterGrant = pickAfterGrant;
         if (Build.VERSION.SDK_INT >= 30) {
             try {
                 Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
