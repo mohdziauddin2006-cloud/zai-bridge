@@ -747,6 +747,7 @@ private:
 struct LoadedLibrary {
     std::string path;
     std::string soname;
+    std::vector<std::string> needed;
     uint32_t    bias = 0;
     uint32_t    map_addr = 0;
     uint32_t    map_size = 0;
@@ -1010,9 +1011,11 @@ private:
         uint32_t symtab = 0, strtab = 0, strsz = 0, hash_v = 0;
         uint32_t rel = 0, relsz = 0, jmprel = 0, pltrelsz = 0;
         uint32_t init_array = 0, init_arraysz = 0;
+        std::vector<uint32_t> needed_offsets;
 
         for (size_t i = 0; i < n; ++i) {
             switch (dyn[i].d_tag) {
+                case DT_NEEDED:     needed_offsets.push_back(dyn[i].d_un.d_val); break;
                 case DT_SYMTAB:     symtab = dyn[i].d_un.d_ptr; break;
                 case DT_STRTAB:     strtab = dyn[i].d_un.d_ptr; break;
                 case DT_STRSZ:      strsz = dyn[i].d_un.d_val; break;
@@ -1034,6 +1037,14 @@ private:
         if (!symtab || !strtab) {
             LOGW("%s: no dynamic symbol table", lib.path.c_str());
             return true;
+        }
+
+        // ---- DT_NEEDED dependencies ----------------------------------------
+        for (uint32_t off : needed_offsets) {
+            std::string dep = sym_name(lib, strtab, strsz, off);
+            if (!dep.empty()) {
+                lib.needed.push_back(dep);
+            }
         }
 
         // ---- exports -------------------------------------------------------
@@ -1491,9 +1502,13 @@ public:
     std::string runtime_sysroot() const {
         if (runtime_root_.empty()) return {};
 #if defined(__x86_64__)
-        return runtime_root_ + "/sysroot_x86";
+        std::string cand = runtime_root_ + "/sysroot_x86";
+        if (::access(cand.c_str(), R_OK) == 0) return cand;
+        return runtime_root_ + "/sysroot_x86_64";
 #else
-        return runtime_root_ + "/sysroot_arm32";
+        std::string cand = runtime_root_ + "/sysroot_arm32";
+        if (::access(cand.c_str(), R_OK) == 0) return cand;
+        return runtime_root_ + "/sysroot_arm64";
 #endif
     }
 
@@ -1502,18 +1517,28 @@ public:
     // imports self-contained and offline: no host system image is required to
     // satisfy libGLESv1_CM, libOpenSLES, libz, libc++_shared, ...
     std::string sysroot_library(const std::string& name) const {
-        const std::string root = runtime_sysroot();
-        if (root.empty()) return {};
+        if (runtime_root_.empty() || name.empty()) return {};
 
         std::string base = name;
         const size_t slash = base.find_last_of('/');
         if (slash != std::string::npos) base = base.substr(slash + 1);
         if (base.empty()) return {};
 
+        const std::string roots[] = {
+            runtime_sysroot(),
+            runtime_root_ + "/sysroot_arm32",
+            runtime_root_ + "/sysroot_x86",
+            runtime_root_ + "/sysroot_arm64",
+            runtime_root_ + "/sysroot_x86_64"
+        };
+
         const char* dirs[] = {"/", "/lib/", "/system/lib/", "/vendor/lib/"};
-        for (const char* d : dirs) {
-            const std::string candidate = root + d + base;
-            if (::access(candidate.c_str(), R_OK) == 0) return candidate;
+        for (const auto& r : roots) {
+            if (r.empty()) continue;
+            for (const char* d : dirs) {
+                const std::string candidate = r + d + base;
+                if (::access(candidate.c_str(), R_OK) == 0) return candidate;
+            }
         }
         return {};
     }
@@ -2155,6 +2180,48 @@ private:
         return from_runtime;
     }
 
+public:
+    void resolve_all_needed() {
+        bool added = true;
+        while (added) {
+            added = false;
+            const auto& current_libs = linker_.libs();
+            const size_t count = current_libs.size();
+            for (size_t i = 0; i < count; ++i) {
+                const auto* lib = current_libs[i];
+                for (const auto& dep : lib->needed) {
+                    bool found = false;
+                    for (const auto* l : linker_.libs()) {
+                        if (l->soname == dep || l->path.find(dep) != std::string::npos) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (found) continue;
+
+                    std::string path = payload_library_path(dep);
+                    if (path.empty() || ::access(path.c_str(), R_OK) != 0) {
+                        continue;
+                    }
+
+                    if (next_runtime_slot_ >= (kStackTop - kImageBase0) / kImageStride) {
+                        LOGE("DT_NEEDED(%s): no free guest image slots", dep.c_str());
+                        break;
+                    }
+
+                    const uint32_t base = kImageBase0 + (next_runtime_slot_++) * kImageStride;
+                    LoadedLibrary* child = linker_.load(path, base);
+                    if (child) {
+                        LOGI("DT_NEEDED: %s -> mapped %s (%s) at %08x",
+                             lib->soname.empty() ? lib->path.c_str() : lib->soname.c_str(),
+                             dep.c_str(), path.c_str(), base);
+                        added = true;
+                    }
+                }
+            }
+        }
+    }
+
     uint32_t guest_dlopen(const std::string& name) {
         if (name.empty()) return 0;
         auto known = dl_handles_.find(name);
@@ -2178,6 +2245,7 @@ private:
         LoadedLibrary* lib = linker_.load(path, base);
         if (!lib) return 0;
 
+        resolve_all_needed();
         linker_.link_all();   // relocates only the newly loaded object
         run_constructors(*lib);
         bind_exports_of(lib);
@@ -7267,6 +7335,9 @@ Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeStartSession(
             return -3;
         }
     }
+
+    // Resolve and map DT_NEEDED dependencies from payload/ and bundled sysroot
+    g_bridge->resolve_all_needed();
 
     // ---- Phase 2: relocate across the whole link set, then run DT_INIT ----
     g_bridge->link_all();

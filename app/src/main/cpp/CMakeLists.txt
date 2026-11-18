@@ -5,6 +5,9 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Ensure 16 KB page-size compatibility for Android 15/16
+add_link_options("-Wl,-z,max-page-size=16384")
+
 # =============================================================================
 # One APK, four ABIs, two backends.
 #

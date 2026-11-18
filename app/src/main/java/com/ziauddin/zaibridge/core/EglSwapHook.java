@@ -30,40 +30,35 @@ public final class EglSwapHook {
     private static final String TAG = "ZaiBridge";
 
     /** The bridge shared library is resident. */
-    private static final boolean LOADED;
+    private static volatile boolean sLoaded = false;
     /** The Java EGL hooks were installed by the core. */
-    private static final boolean INSTALLED;
-
-    static {
-        boolean loaded = false;
-        boolean installed = false;
-        try {
-            System.loadLibrary("wrapper");
-            loaded = true;
-            installed = nativeInstall();
-        } catch (Throwable t) {
-            // A missing or older core must never stop a game from starting.
-            Log.w(TAG, "EGL swap hook unavailable: " + t);
-        }
-        LOADED = loaded;
-        INSTALLED = installed;
-    }
+    private static volatile boolean sInstalled = false;
 
     private EglSwapHook() {
     }
 
     /**
-     * Installs the hooks once per process. Called from
-     * {@code Application.attachBaseContext}, before any Activity (and therefore
-     * any GLSurfaceView) exists.
+     * Lazily installs the hooks once per process when a guest game launches.
      */
-    public static boolean install() {
-        Log.i(TAG, "EGL swap hook " + (INSTALLED ? "installed" : "not installed"));
-        return INSTALLED;
+    public static synchronized boolean install() {
+        if (sInstalled) return true;
+        try {
+            if (!sLoaded) {
+                System.loadLibrary("wrapper");
+                sLoaded = true;
+            }
+            sInstalled = nativeInstall();
+        } catch (Throwable t) {
+            // A missing or older core must never stop a game from starting.
+            Log.w(TAG, "EGL swap hook unavailable or blocked by OEM: " + t);
+            sInstalled = false;
+        }
+        Log.i(TAG, "EGL swap hook " + (sInstalled ? "installed" : "not installed"));
+        return sInstalled;
     }
 
     public static boolean isInstalled() {
-        return INSTALLED;
+        return sInstalled;
     }
 
     /** Applies a full configuration, including the one-tap preset id. */
@@ -89,7 +84,7 @@ public final class EglSwapHook {
     public static void configure(int upscaler, int scalePercent, int sharpnessPercent,
                                  int neuralPercent, int frameGen, int temporal,
                                  int autoMfg, int preset) {
-        if (!LOADED) return;
+        if (!sLoaded) return;
         try {
             nativeConfigure(upscaler, scalePercent, sharpnessPercent, neuralPercent,
                     frameGen, temporal, autoMfg, preset);
@@ -105,7 +100,7 @@ public final class EglSwapHook {
      * the temporal history.
      */
     public static void setCompare(float split) {
-        if (!LOADED) return;
+        if (!sLoaded) return;
         try {
             nativeSetCompare(split);
         } catch (Throwable t) {
@@ -115,7 +110,7 @@ public final class EglSwapHook {
 
     /** Frame counters for diagnostics: swaps, fps and forward failures. */
     public static String stats() {
-        if (!LOADED) return "unavailable";
+        if (!sLoaded) return "unavailable";
         try {
             return nativeStats();
         } catch (Throwable t) {
@@ -125,7 +120,7 @@ public final class EglSwapHook {
 
     /** Compositor counters: scale, generated frames, shader failures, GL version. */
     public static String compositorStats() {
-        if (!LOADED) return "unavailable";
+        if (!sLoaded) return "unavailable";
         try {
             return nativeCompositorStats();
         } catch (Throwable t) {
@@ -135,7 +130,7 @@ public final class EglSwapHook {
 
     /** Detected GPU model, driver and CPU topology, for the settings sheet. */
     public static String graphicsInfo() {
-        if (!LOADED) return "native core unavailable";
+        if (!sLoaded) return "native core unavailable";
         try {
             return nativeGraphicsInfo();
         } catch (Throwable t) {

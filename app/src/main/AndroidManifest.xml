@@ -44,6 +44,7 @@
     <application
         android:name=".core.BridgeApplication"
         android:allowBackup="false"
+        android:extractNativeLibs="true"
         android:hardwareAccelerated="true"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
@@ -56,12 +57,19 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:launchMode="singleTop">
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.ZaiBridge">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name=".ui.CrashActivity"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:theme="@style/Theme.ZaiBridge" />
 
         <!-- =================================================================
              The virtualized execution surface.

@@ -33,6 +33,7 @@ import android.widget.Toast;
 import com.ziauddin.zaibridge.GameHostActivity;
 import com.ziauddin.zaibridge.R;
 import com.ziauddin.zaibridge.core.BridgeInstrumentation;
+import com.ziauddin.zaibridge.core.BridgeRuntime;
 import com.ziauddin.zaibridge.core.EglSwapHook;
 import com.ziauddin.zaibridge.core.GuestLauncher;
 import com.ziauddin.zaibridge.data.Game;
@@ -166,7 +167,8 @@ public class MainActivity extends AppCompatActivity implements GameAdapter.Liste
     }
 
     private void launch(Game game) {
-        final boolean virtualized = BridgeInstrumentation.isInstalled();
+        BridgeRuntime.ensureInitialized(this);
+        final boolean virtualized = BridgeRuntime.isInstrumentationInstalled();
         Intent intent = new Intent(this, virtualized
                 ? ProxyGameActivity.class : GameHostActivity.class);
         intent.putExtra(GuestLauncher.EXTRA_GAME_DIR,

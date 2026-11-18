@@ -92,6 +92,7 @@ public final class GuestLauncher {
      *         proxy Activity is then used and shows the failure)
      */
     public static Activity createGuest(Context ctx, Intent intent) {
+        BridgeRuntime.ensureInitialized(ctx);
         final String dir = intent.getStringExtra(EXTRA_GAME_DIR);
         if (dir == null || dir.isEmpty()) {
             Log.w(TAG, "proxy launch without a game directory");

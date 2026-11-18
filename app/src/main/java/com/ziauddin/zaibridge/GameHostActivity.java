@@ -28,6 +28,7 @@ import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import com.ziauddin.zaibridge.core.BridgeRuntime;
 import com.ziauddin.zaibridge.core.EglSwapHook;
 import com.ziauddin.zaibridge.core.GameOrientation;
 import com.ziauddin.zaibridge.core.GuestActivityHost;
@@ -108,6 +109,7 @@ public class GameHostActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         super.onCreate(savedInstanceState);
+        BridgeRuntime.ensureInitialized(this);
 
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
                 | WindowManager.LayoutParams.FLAG_FULLSCREEN);
