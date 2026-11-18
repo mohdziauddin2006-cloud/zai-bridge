@@ -31,10 +31,14 @@ public final class Game {
     public final String abi;
     public final long importedAt;
     public final long sizeBytes;
+    /** NativeActivity metadata: android.app.func_name (custom entry point, e.g. UnityInitApplication) */
+    public final String funcName;
+    /** NativeActivity metadata: android.app.lib_name (native library name, e.g. "unity") */
+    public final String libName;
 
     public Game(String directoryName, String packageName, String label, String launcherActivity,
                 String orientation, String iconFile, String obbFile, String abi,
-                long importedAt, long sizeBytes) {
+                long importedAt, long sizeBytes, String funcName, String libName) {
         this.directoryName = directoryName;
         this.packageName = packageName;
         this.label = label;
@@ -46,6 +50,8 @@ public final class Game {
         this.abi = abi;
         this.importedAt = importedAt;
         this.sizeBytes = sizeBytes;
+        this.funcName = funcName;
+        this.libName = libName;
     }
 
     public boolean hasObb() {
@@ -64,6 +70,8 @@ public final class Game {
         o.put("abi", abi);
         o.put("importedAt", importedAt);
         o.put("sizeBytes", sizeBytes);
+        o.put("funcName", funcName == null ? "" : funcName);
+        o.put("libName", libName == null ? "" : libName);
         return o;
     }
 
@@ -88,7 +96,9 @@ public final class Game {
                     o.optString("obb"),
                     o.optString("abi", "armeabi-v7a"),
                     o.optLong("importedAt", 0L),
-                    o.optLong("sizeBytes", 0L));
+                    o.optLong("sizeBytes", 0L),
+                    o.optString("funcName", ""),
+                    o.optString("libName", ""));
         } catch (Exception e) {
             Log.w(TAG, "unreadable game metadata in " + dir.getName(), e);
             return null;

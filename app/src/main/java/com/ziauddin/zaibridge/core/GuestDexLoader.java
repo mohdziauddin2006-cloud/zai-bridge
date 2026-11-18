@@ -63,13 +63,20 @@ public final class GuestDexLoader extends DexClassLoader {
             // The runtime is linked against the shared C++ runtime, so the alias
             // directory must stay self-contained for the guest's dlopen.
             copySibling("libc++_shared.so");
-            File target = new File(aliasDir, "lib" + name + ".so");
-            if (target.isFile() && target.length() > 0) return target;
-            try (InputStream in = new FileInputStream(hostLibrary);
+            String fileName = name.startsWith("lib")
+                    ? (name.endsWith(".so") ? name : name + ".so")
+                    : "lib" + name + ".so";
+            File target = new File(aliasDir, fileName);
+            File src = new File(hostLibrary);
+            if (target.isFile() && target.length() == src.length() && target.lastModified() >= src.lastModified()) {
+                return target;
+            }
+            try (InputStream in = new FileInputStream(src);
                  OutputStream out = new FileOutputStream(target)) {
                 byte[] buf = new byte[64 * 1024];
                 int n;
                 while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                Log.i(TAG, "staged bridge library alias: " + target.getName() + " (" + target.length() + " bytes)");
                 return target;
             } catch (Throwable t) {
                 Log.e(TAG, "bridge alias copy failed for " + name, t);

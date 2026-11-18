@@ -297,6 +297,9 @@ public final class GuestLauncher {
 
         File runtime = RuntimeAssets.ensure(ctx);
         UnicornBridge.setRuntimeSysroot(runtime.getAbsolutePath());
+        if (game != null) {
+            UnicornBridge.setNativeActivityInfo(game.funcName, game.libName);
+        }
 
         String obb = findObb(gameDir);
         int result = UnicornBridge.startSession(gameDir.getAbsolutePath(), obb, pkg,

@@ -51,6 +51,11 @@ Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeSetRuntimeSysroot(
 }
 
 extern "C" JNIEXPORT void JNICALL
+Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeSetNativeActivityInfo(
+        JNIEnv* /*env*/, jclass /*clazz*/, jstring /*funcName*/, jstring /*libName*/) {
+}
+
+extern "C" JNIEXPORT void JNICALL
 Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeSetGuestActivity(
         JNIEnv* /*env*/, jclass /*clazz*/, jobject /*activity*/) {
 }
@@ -59,6 +64,31 @@ extern "C" JNIEXPORT jboolean JNICALL
 Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeIsSessionActive(
         JNIEnv* /*env*/, jclass /*clazz*/) {
     return JNI_FALSE;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeEndSession(
+        JNIEnv* /*env*/, jclass /*clazz*/) {
+}
+
+extern "C" JNIEXPORT void ANativeActivity_onCreate(
+        void* /*activity*/, void* /*savedState*/, size_t /*savedStateSize*/) {
+}
+
+extern "C" JNIEXPORT void UnityInitApplication(
+        void* /*activity*/, void* /*savedState*/, size_t /*savedStateSize*/) {
+}
+
+extern "C" JNIEXPORT void UnityLoadApplication(
+        void* /*activity*/, void* /*savedState*/, size_t /*savedStateSize*/) {
+}
+
+extern "C" JNIEXPORT void native_activity_create(
+        void* /*activity*/, void* /*savedState*/, size_t /*savedStateSize*/) {
+}
+
+extern "C" JNIEXPORT void android_main(
+        void* /*activity*/, void* /*savedState*/, size_t /*savedStateSize*/) {
 }
 
 extern "C" JNIEXPORT jstring JNICALL

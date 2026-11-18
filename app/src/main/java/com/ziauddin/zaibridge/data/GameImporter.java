@@ -98,6 +98,18 @@ public final class GameImporter {
             String orientation = GameOrientation.nameOf(launchActivity == null
                     ? ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
                     : launchActivity.screenOrientation);
+
+            // Extract NativeActivity metadata (android.app.func_name, android.app.lib_name)
+            String funcName = "";
+            String libName = "";
+            if (launchActivity != null && "android.app.NativeActivity".equals(launchActivity.name)) {
+                if (launchActivity.metaData != null) {
+                    funcName = launchActivity.metaData.getString("android.app.func_name", "");
+                    libName = launchActivity.metaData.getString("android.app.lib_name", "");
+                    Log.i(TAG, "NativeActivity metadata: func_name=" + funcName + ", lib_name=" + libName);
+                }
+            }
+
             Log.i(TAG, "guest manifest: launcher=" + launcher
                     + " screenOrientation=" + (launchActivity == null
                             ? "<not parsed>" : String.valueOf(launchActivity.screenOrientation))
@@ -139,7 +151,9 @@ public final class GameImporter {
                     obbName,
                     "armeabi-v7a",
                     System.currentTimeMillis(),
-                    size);
+                    size,
+                    funcName,
+                    libName);
 
             step(progress, "Finalising");
             writeMeta(staging, game);

@@ -110,14 +110,16 @@ public final class UnicornBridge {
         nativeSetSurface(surface);
     }
 
-    /**
-     * Root of the unpacked 32-bit runtime bundle. The core searches
-     * {@code <root>/sysroot_arm32} (and {@code sysroot_x86}) after the payload
-     * directory when a guest binary requests a library by name.
-     */
+    /** Root of the unpacked 32-bit runtime bundle. */
     public static void setRuntimeSysroot(String path) {
         if (!CORE_LOADED) return;
         nativeSetRuntimeSysroot(path);
+    }
+
+    /** Sets NativeActivity metadata (android.app.func_name, android.app.lib_name). */
+    public static void setNativeActivityInfo(String funcName, String libName) {
+        if (!CORE_LOADED) return;
+        nativeSetNativeActivityInfo(funcName != null ? funcName : "", libName != null ? libName : "");
     }
 
     /** Attaches the guest Activity instance once it exists. */
@@ -173,6 +175,8 @@ public final class UnicornBridge {
     private static native void nativeSetSurface(Surface surface);
 
     private static native void nativeSetRuntimeSysroot(String path);
+
+    private static native void nativeSetNativeActivityInfo(String funcName, String libName);
 
     private static native void nativeSetGuestActivity(Object activity);
 

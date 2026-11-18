@@ -82,12 +82,15 @@
 #include <cstdlib>
 #include <chrono>
 #include <mutex>
+#include <condition_variable>
+#include <memory>
 #include <thread>
 #include <cstring>
 #include <ctime>
 #include <functional>
 #include <iterator>
 #include <map>
+#include <set>
 #include <string>
 #include <sys/time.h>
 #include <unordered_map>
@@ -103,8 +106,76 @@
 // module-directory probe before their definitions are reached.
 extern "C" uint64_t bridge_native_entry(uint32_t id, uint64_t* host_args);
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved);
+extern "C" JNIEXPORT void ANativeActivity_onCreate(ANativeActivity* activity, void* savedState, size_t savedStateSize);
 
 namespace {
+
+struct MemoryRegion {
+    uint32_t guest_addr;
+    size_t size;
+    void* host_ptr;
+    uint32_t perms;
+    std::string what;
+};
+
+static std::mutex s_active_engines_mtx;
+static std::vector<uc_engine*> s_active_engines;
+static thread_local uc_engine* t_current_uc = nullptr;
+
+class Emulator;
+class JniBridge;
+extern Emulator* g_emulator;
+extern JniBridge* g_bridge;
+extern bool g_session_active;
+
+inline uc_engine* current_uc() {
+    return t_current_uc ? t_current_uc : (g_emulator ? reinterpret_cast<uc_engine*>(*(void**)g_emulator) : nullptr);
+}
+
+static std::string g_custom_func_name;
+static std::string g_custom_lib_name;
+static ANativeActivity* g_host_activity = nullptr;
+
+struct GuestSem {
+    std::mutex mtx;
+    std::condition_variable cv;
+    int count = 0;
+};
+static std::mutex s_sem_map_mtx;
+static std::unordered_map<uint32_t, std::shared_ptr<GuestSem>> s_sem_map;
+
+inline std::shared_ptr<GuestSem> get_guest_sem(uint32_t addr) {
+    std::lock_guard<std::mutex> lk(s_sem_map_mtx);
+    auto it = s_sem_map.find(addr);
+    if (it != s_sem_map.end()) return it->second;
+    auto s = std::make_shared<GuestSem>();
+    s_sem_map[addr] = s;
+    return s;
+}
+
+static std::mutex s_mutex_map_mtx;
+static std::unordered_map<uint32_t, std::shared_ptr<std::recursive_mutex>> s_mutex_map;
+
+inline std::shared_ptr<std::recursive_mutex> get_guest_mutex(uint32_t addr) {
+    std::lock_guard<std::mutex> lk(s_mutex_map_mtx);
+    auto it = s_mutex_map.find(addr);
+    if (it != s_mutex_map.end()) return it->second;
+    auto m = std::make_shared<std::recursive_mutex>();
+    s_mutex_map[addr] = m;
+    return m;
+}
+
+static std::mutex s_cond_map_mtx;
+static std::unordered_map<uint32_t, std::shared_ptr<std::condition_variable_any>> s_cond_map;
+
+inline std::shared_ptr<std::condition_variable_any> get_guest_cond(uint32_t addr) {
+    std::lock_guard<std::mutex> lk(s_cond_map_mtx);
+    auto it = s_cond_map.find(addr);
+    if (it != s_cond_map.end()) return it->second;
+    auto c = std::make_shared<std::condition_variable_any>();
+    s_cond_map[addr] = c;
+    return c;
+}
 
 // Name of the import handler currently running, for crash diagnostics.
 std::string g_last_import;
@@ -285,6 +356,11 @@ public:
             LOGE("uc_open(ARM32) failed: %s", uc_strerror(err));
             return false;
         }
+        t_current_uc = uc_;
+        {
+            std::lock_guard<std::mutex> alk(s_active_engines_mtx);
+            s_active_engines.push_back(uc_);
+        }
 
         // ---- VFP / NEON bring-up ------------------------------------------
         // A real kernel enables CP10/CP11 in CPACR and sets FPEXC.EN before it
@@ -349,6 +425,14 @@ public:
             LOGW("uc_hook_add(mem faults) failed: %s", uc_strerror(err));
         }
 
+        // ARM32 CP15 TPIDRURO TLS initialisation
+        uint32_t main_tls = alloc(64 * 4, 8);
+        if (main_tls) {
+            write_u32(main_tls, main_tls); // slot 0 points to self
+            reg_write(UC_ARM_REG_C13_C0_3, main_tls);
+            LOGI("ARM32 main thread TLS initialised at %08x (TPIDRURO)", main_tls);
+        }
+
         LOGI("uc_open(UC_ARCH_ARM, ARM|THUMB) ok - guest heap @ %08x, stack @ %08x",
              kHeapBase, kStackTop - static_cast<uint32_t>(kStackSize));
         return true;
@@ -380,19 +464,46 @@ public:
     uc_engine* uc() const { return uc_; }
 
     bool map(uint32_t addr, size_t size, const char* what) {
-        uc_err err = uc_mem_map(uc_, addr, size, UC_PROT_READ | UC_PROT_WRITE | UC_PROT_EXEC);
-        if (err != UC_ERR_OK) {
-            LOGE("uc_mem_map(%s) %08x+%zu failed: %s", what, addr, size, uc_strerror(err));
+        const size_t aligned_size = align_up(static_cast<uint32_t>(size), kPageSize);
+        const uint32_t aligned_addr = align_down(addr, kPageSize);
+
+        void* host_ptr = mmap(nullptr, aligned_size, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (host_ptr == MAP_FAILED) {
+            LOGE("mmap failed for %s (%08x+%zu): %s", what, aligned_addr, aligned_size, strerror(errno));
             return false;
+        }
+
+        const uint32_t perms = UC_PROT_READ | UC_PROT_WRITE | UC_PROT_EXEC;
+        uc_err err = uc_mem_map_ptr(uc_, aligned_addr, aligned_size, perms, host_ptr);
+        if (err != UC_ERR_OK) {
+            LOGE("uc_mem_map_ptr(%s) %08x+%zu failed: %s", what, aligned_addr, aligned_size, uc_strerror(err));
+            munmap(host_ptr, aligned_size);
+            return false;
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(regions_mtx_);
+            regions_.push_back({aligned_addr, aligned_size, host_ptr, perms, what});
+            std::lock_guard<std::mutex> alk(s_active_engines_mtx);
+            for (uc_engine* other_uc : s_active_engines) {
+                if (other_uc != uc_) {
+                    uc_mem_map_ptr(other_uc, aligned_addr, aligned_size, perms, host_ptr);
+                }
+            }
         }
         return true;
     }
+
+    const std::vector<MemoryRegion>& regions() const { return regions_; }
+    std::mutex& regions_mutex() { return regions_mtx_; }
 
     // Guest heap: a bump allocator over a fixed arena with a first-fit free
     // list. A pure bump allocator survives startup but dies a few thousand
     // frames into a render loop, because games churn the allocator constantly
     // and a host pointer can never be handed back to 32-bit code.
     uint32_t alloc(size_t bytes, size_t alignment = 8) {
+        std::lock_guard<std::mutex> lk(alloc_mtx_);
         if (bytes == 0) bytes = 1;
         const uint32_t want = align_up(static_cast<uint32_t>(bytes), 8);
 
@@ -417,6 +528,7 @@ public:
 
     // Return a guest block to the free list and coalesce with its neighbours.
     void release(uint32_t p, size_t bytes) {
+        std::lock_guard<std::mutex> lk(alloc_mtx_);
         if (p < kHeapBase || p >= kHeapBase + kHeapSize || bytes == 0) return;
         const uint32_t want = align_up(static_cast<uint32_t>(bytes), 8);
         auto ins = free_list_.emplace(p, want).first;
@@ -726,13 +838,29 @@ public:
     // A session owns its engine: ending it must actually release the 64 MB
     // guest address space, otherwise launching a second game leaks one heap.
     ~Emulator() {
+        {
+            std::lock_guard<std::mutex> alk(s_active_engines_mtx);
+            auto it = std::find(s_active_engines.begin(), s_active_engines.end(), uc_);
+            if (it != s_active_engines.end()) s_active_engines.erase(it);
+        }
         if (uc_) {
             uc_close(uc_);
             uc_ = nullptr;
         }
+        std::lock_guard<std::mutex> lk(regions_mtx_);
+        for (auto& r : regions_) {
+            if (r.host_ptr && r.host_ptr != MAP_FAILED) {
+                munmap(r.host_ptr, r.size);
+                r.host_ptr = nullptr;
+            }
+        }
+        regions_.clear();
     }
 
 private:
+    std::mutex alloc_mtx_;
+    std::mutex regions_mtx_;
+    std::vector<MemoryRegion> regions_;
     uc_hook    mem_hook_ = 0;
     uint32_t   heap_cursor_ = kHeapBase;
     uint32_t   depth_ = 0;                   // nested call depth
@@ -2007,7 +2135,8 @@ private:
         const size_t slot = (pc - kStubBase) / kStubStride;
         if (slot >= slots_.size()) return;
 
-        redirected_ = false;
+        static thread_local bool t_redirected = false;
+        t_redirected = false;
         const StubSlot& s = slots_[slot];
         uint32_t ret = 0;
         switch (s.kind) {
@@ -2022,9 +2151,12 @@ private:
 
         // A handler may have re-pointed PC itself (an in-guest call such as
         // pthread_once); in that case returning to LR here would skip it.
-        if (redirected_) return;
+        if (t_redirected) return;
 
-        emu_.reg_write(UC_ARM_REG_R0, ret);
+        uc_engine* uc = current_uc();
+        if (uc) {
+            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        }
         // Leave PC on the stub's `bx lr`. Executing the real branch is what
         // preserves ARM/Thumb interworking: writing PC from the hook clears
         // CPSR.T, so the next Thumb opcode decodes as an ARM coprocessor
@@ -2037,25 +2169,30 @@ private:
     // target. The guest's own `ret` then lands back in the caller.
     uint32_t call_in_guest(uint32_t fn, uint32_t first_arg = 0) {
         if (!fn || !return_gadget_) return 0;
+        uc_engine* uc = current_uc();
+        if (!uc) return 0;
         uint32_t sp = 0, lr = 0;
-        emu_.reg_read(UC_ARM_REG_SP, sp);
-        emu_.reg_read(UC_ARM_REG_LR, lr);
+        uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+        uc_reg_read(uc, UC_ARM_REG_LR, &lr);
         if (sp < kHeapBase || sp > kStackTop) {
             LOGW("call_in_guest(%08x): implausible SP %08x", fn, sp);
             return 0;
         }
         if (!emu_.write_u32(sp - 4, lr)) return 0;
-        emu_.reg_write(UC_ARM_REG_SP, sp - 4);
-        emu_.reg_write(UC_ARM_REG_R0, first_arg);
-        emu_.reg_write(UC_ARM_REG_LR, return_gadget_);
-        emu_.reg_write(UC_ARM_REG_PC, fn);
-        redirected_ = true;
+        uint32_t new_sp = sp - 4;
+        uc_reg_write(uc, UC_ARM_REG_SP, &new_sp);
+        uc_reg_write(uc, UC_ARM_REG_R0, &first_arg);
+        uc_reg_write(uc, UC_ARM_REG_LR, &return_gadget_);
+        uc_reg_write(uc, UC_ARM_REG_PC, &fn);
         return 0;
     }
 
     uint32_t arg(size_t i) {
         uint32_t v = 0;
-        emu_.reg_read(UC_ARM_REG_R0 + static_cast<int>(i), v);
+        uc_engine* uc = current_uc();
+        if (uc) {
+            uc_reg_read(uc, UC_ARM_REG_R0 + static_cast<int>(i), &v);
+        }
         return v;
     }
 
@@ -2173,6 +2310,16 @@ private:
         const std::string untagged = payload_dir_ + "/" + base;
         if (::access(untagged.c_str(), R_OK) == 0) return untagged;
 
+        const std::string native_dir = game_root_ + "/native";
+        const std::string native_tagged = native_dir + "/" + tagged;
+        if (::access(native_tagged.c_str(), R_OK) == 0) return native_tagged;
+
+        const std::string native_untagged = native_dir + "/" + base;
+        if (::access(native_untagged.c_str(), R_OK) == 0) return native_untagged;
+
+        const std::string root_untagged = game_root_ + "/" + base;
+        if (::access(root_untagged.c_str(), R_OK) == 0) return root_untagged;
+
         // Last resort: the bundled 32-bit compatibility sysroot.
         const std::string from_runtime = sysroot_library(base);
         if (!from_runtime.empty()) {
@@ -2229,22 +2376,42 @@ public:
         auto known = dl_handles_.find(name);
         if (known != dl_handles_.end()) return known->second;
 
+        std::string base = name;
+        size_t slash = base.find_last_of('/');
+        if (slash != std::string::npos) base = base.substr(slash + 1);
+        std::string tagged = base;
+        if (tagged.size() > 3 && tagged.compare(tagged.size() - 3, 3, ".so") == 0) {
+            tagged = tagged.substr(0, tagged.size() - 3) + "32.so";
+        }
+
+        // Check if already mapped in linker_
+        for (auto* l : linker_.libs()) {
+            std::string lib_base = l->path;
+            size_t s = lib_base.find_last_of('/');
+            if (s != std::string::npos) lib_base = lib_base.substr(s + 1);
+            if (l->soname == name || l->soname == base || lib_base == name || lib_base == base || lib_base == tagged) {
+                const uint32_t handle = to_guest_ref(
+                    reinterpret_cast<void*>(static_cast<uintptr_t>(l->map_addr)));
+                dl_handles_[name] = handle;
+                dl_libs_[l->map_addr] = l;
+                LOGI("dlopen(%s): already mapped as %s @ %08x (handle %08x)",
+                     name.c_str(), l->path.c_str(), l->map_addr, handle);
+                return handle;
+            }
+        }
+
         const std::string path = payload_library_path(name);
         if (path.empty() || ::access(path.c_str(), R_OK) != 0) {
-            LOGW("dlopen(%s): not found in payload/ or the bundled sysroot", name.c_str());
+            LOGW("dlopen(%s): not found in payload/, native/, or bundled sysroot", name.c_str());
             return 0;
         }
 
-        // Guest images live between kImageBase0 and the stack top. There are
-        // at most 60 usable 16 MB slots before that would collide with the
-        // stack, so a runaway dlopen loop is refused rather than corrupting
-        // the address space.
         if (next_runtime_slot_ >= (kStackTop - kImageBase0) / kImageStride) {
             LOGE("dlopen(%s): no free guest image slots", name.c_str());
             return 0;
         }
-        const uint32_t base = kImageBase0 + (next_runtime_slot_++) * kImageStride;
-        LoadedLibrary* lib = linker_.load(path, base);
+        const uint32_t img_base = kImageBase0 + (next_runtime_slot_++) * kImageStride;
+        LoadedLibrary* lib = linker_.load(path, img_base);
         if (!lib) return 0;
 
         resolve_all_needed();
@@ -2259,11 +2426,11 @@ public:
         }
 
         const uint32_t handle = to_guest_ref(
-            reinterpret_cast<void*>(static_cast<uintptr_t>(base)));
+            reinterpret_cast<void*>(static_cast<uintptr_t>(img_base)));
         dl_handles_[name] = handle;
-        dl_libs_[base] = lib;
+        dl_libs_[img_base] = lib;
         LOGI("dlopen(%s) -> %s @ %08x (guest handle %08x)", name.c_str(), path.c_str(),
-             base, handle);
+             img_base, handle);
         return handle;
     }
 
@@ -2275,15 +2442,21 @@ public:
             return it == lib->exports.end() ? 0u : it->second;
         };
 
-        if (handle) {
-            const uint32_t base = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(
+        if (handle && handle != 0xFFFFFFFFu && handle != 0xFFFFFFFEu) {
+            const uint32_t hbase = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(
                 from_guest_ref(handle)));
-            auto it = dl_libs_.find(base);
-            if (it != dl_libs_.end()) return lookup(it->second);
+            auto it = dl_libs_.find(hbase);
+            if (it != dl_libs_.end()) {
+                uint32_t at = lookup(it->second);
+                if (at) return at;
+            }
         }
         for (const auto* lib : linker_.libs()) {
             const uint32_t at = lookup(lib);
             if (at) return at;
+        }
+        if (import_handlers_.count(symbol)) {
+            return import_stub(symbol);
         }
         LOGW("dlsym(handle %08x, %s) not found in any mapped payload", handle,
              symbol.c_str());
@@ -2770,12 +2943,14 @@ public:
     }
 
     uint32_t imp_pthread_getspecific() {
-        auto it = tls_values_.find(arg(0));
-        return it == tls_values_.end() ? 0 : it->second;
+        static thread_local std::unordered_map<uint32_t, uint32_t> t_tls_values;
+        auto it = t_tls_values.find(arg(0));
+        return it == t_tls_values.end() ? 0 : it->second;
     }
 
     uint32_t imp_pthread_setspecific() {
-        tls_values_[arg(0)] = arg(1);
+        static thread_local std::unordered_map<uint32_t, uint32_t> t_tls_values;
+        t_tls_values[arg(0)] = arg(1);
         return 0;
     }
 
@@ -4496,8 +4671,32 @@ public:
         install_asset_handlers();
         install_config_handlers();
         install_input_handlers();
+        install_native_activity_handlers();
         install_opensles_handlers();
         current_assets();
+    }
+
+    void install_native_activity_handlers() {
+        import_handlers_["ANativeActivity_finish"] = [this] {
+            if (g_host_activity) ANativeActivity_finish(g_host_activity);
+            return 0u;
+        };
+        import_handlers_["ANativeActivity_setWindowFormat"] = [this] {
+            if (g_host_activity) ANativeActivity_setWindowFormat(g_host_activity, static_cast<int32_t>(arg(1)));
+            return 0u;
+        };
+        import_handlers_["ANativeActivity_setWindowFlags"] = [this] {
+            if (g_host_activity) ANativeActivity_setWindowFlags(g_host_activity, arg(1), arg(2));
+            return 0u;
+        };
+        import_handlers_["ANativeActivity_showSoftInput"] = [this] {
+            if (g_host_activity) ANativeActivity_showSoftInput(g_host_activity, arg(1));
+            return 0u;
+        };
+        import_handlers_["ANativeActivity_hideSoftInput"] = [this] {
+            if (g_host_activity) ANativeActivity_hideSoftInput(g_host_activity, arg(1));
+            return 0u;
+        };
     }
 
     void install_looper_handlers() {
@@ -5573,25 +5772,173 @@ public:
         import_handlers_["pthread_key_create"] = [this] { return imp_pthread_key_create(); };
         import_handlers_["pthread_getspecific"] = [this] { return imp_pthread_getspecific(); };
         import_handlers_["pthread_setspecific"] = [this] { return imp_pthread_setspecific(); };
-        import_handlers_["pthread_self"] = [] { return 1u; };
+        import_handlers_["__set_tls"] = [this] {
+            uint32_t tls_ptr = arg(0);
+            uc_engine* uc = current_uc();
+            if (uc) {
+                uc_reg_write(uc, UC_ARM_REG_C13_C0_3, &tls_ptr);
+            }
+            return 0u;
+        };
+        import_handlers_["__get_tls"] = [this] {
+            uint32_t tls_ptr = 0;
+            uc_engine* uc = current_uc();
+            if (uc) {
+                uc_reg_read(uc, UC_ARM_REG_C13_C0_3, &tls_ptr);
+            }
+            return tls_ptr;
+        };
+        import_handlers_["pthread_self"] = [this] {
+            uint32_t tls_ptr = 0;
+            uc_engine* uc = current_uc();
+            if (uc) {
+                uc_reg_read(uc, UC_ARM_REG_C13_C0_3, &tls_ptr);
+            }
+            return tls_ptr ? tls_ptr : 1u;
+        };
         import_handlers_["pthread_equal"] = [this] {
             return arg(0) == arg(1) ? 1u : 0u;
         };
         import_handlers_["pthread_create"] = [this] {
-            LOGW("pthread_create(%s): guest threads are not emulated, returning EAGAIN",
-                 guest_string(arg(2)).c_str());
-            return 11u;   // EAGAIN: the engine falls back to its sync path
+            const uint32_t thread_out = arg(0);
+            const uint32_t start_routine = arg(2);
+            const uint32_t start_arg = arg(3);
+
+            if (!start_routine) {
+                LOGE("pthread_create: null start_routine");
+                return 22u; // EINVAL
+            }
+
+            static std::atomic<uint32_t> s_next_tid{100};
+            const uint32_t tid = s_next_tid++;
+            if (thread_out) {
+                emu_.write_u32(thread_out, tid);
+            }
+
+            // Allocate 1 MB dedicated stack in guest heap for the child thread
+            const size_t stack_sz = 1024u * 1024u;
+            const uint32_t stack_base = emu_.alloc(stack_sz, 4096);
+            if (!stack_base) {
+                LOGE("pthread_create: failed to allocate guest stack");
+                return 11u; // EAGAIN
+            }
+            const uint32_t child_sp = align_down(stack_base + static_cast<uint32_t>(stack_sz) - 64, 8);
+
+            // Allocate per-thread ARM32 TLS block
+            const uint32_t child_tls = emu_.alloc(64 * 4, 8);
+            if (child_tls) {
+                emu_.write_u32(child_tls, child_tls); // TLS slot 0 = self
+            }
+
+            LOGI("pthread_create: spawned thread tid=%u routine=%08x arg=%08x sp=%08x tls=%08x",
+                 tid, start_routine, start_arg, child_sp, child_tls);
+
+            std::thread([this, tid, start_routine, start_arg, child_sp, child_tls]() {
+                pthread_setname_np(pthread_self(), "ZaiGuestThread");
+
+                uc_engine* child_uc = nullptr;
+                const uc_mode mode = static_cast<uc_mode>(UC_MODE_ARM | UC_MODE_THUMB);
+                uc_err err = uc_open(UC_ARCH_ARM, mode, &child_uc);
+                if (err != UC_ERR_OK || !child_uc) {
+                    LOGE("child thread %u uc_open failed: %s", tid, uc_strerror(err));
+                    return;
+                }
+                t_current_uc = child_uc;
+
+                // VFP / NEON enable
+                int32_t cpacr = 0x00F00000;
+                int32_t fpexc = 0x40000000;
+                uc_reg_write(child_uc, UC_ARM_REG_C1_C0_2, &cpacr);
+                uc_reg_write(child_uc, UC_ARM_REG_FPEXC, &fpexc);
+
+                // Map all shared host-backed memory regions into this engine
+                {
+                    std::lock_guard<std::mutex> lk(emu_.regions_mutex());
+                    for (const auto& r : emu_.regions()) {
+                        uc_mem_map_ptr(child_uc, r.guest_addr, r.size, r.perms, r.host_ptr);
+                    }
+                    std::lock_guard<std::mutex> alk(s_active_engines_mtx);
+                    s_active_engines.push_back(child_uc);
+                }
+
+                // Add code hook on trap page
+                uc_hook child_hook = 0;
+                uc_hook_add(child_uc, &child_hook, UC_HOOK_CODE,
+                            reinterpret_cast<void*>(&JniBridge::code_hook_thunk),
+                            this, static_cast<uint64_t>(kStubBase),
+                            static_cast<uint64_t>(kStubBase + kStubRegionSz - 1));
+
+                // Add mem fault hook
+                uc_hook child_mem_hook = 0;
+                uc_hook_add(child_uc, &child_mem_hook,
+                            UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED | UC_HOOK_MEM_FETCH_UNMAPPED,
+                            reinterpret_cast<void*>(&Emulator::mem_fault_thunk),
+                            &emu_, 1, 0);
+
+                // Setup registers
+                uint32_t r0 = start_arg;
+                uint32_t sp = child_sp;
+                uint32_t lr = kReturnSentinel;
+                uint32_t tls = child_tls;
+                uc_reg_write(child_uc, UC_ARM_REG_R0, &r0);
+                uc_reg_write(child_uc, UC_ARM_REG_SP, &sp);
+                uc_reg_write(child_uc, UC_ARM_REG_LR, &lr);
+                uc_reg_write(child_uc, UC_ARM_REG_C13_C0_3, &tls);
+
+                // Set Thumb bit in CPSR if start_routine is Thumb (bit 0 set)
+                uint32_t cpsr = 0;
+                uc_reg_read(child_uc, UC_ARM_REG_CPSR, &cpsr);
+                cpsr = (start_routine & 1u) ? (cpsr | 0x20u) : (cpsr & ~0x20u);
+                uc_reg_write(child_uc, UC_ARM_REG_CPSR, &cpsr);
+
+                uint32_t pc = start_routine;
+                LOGI("guest thread %u running at pc=%08x (Thumb=%d)", tid, pc, (start_routine & 1u));
+
+                constexpr uint32_t kChunk = 4u * 1000u * 1000u;
+                while (g_session_active) {
+                    err = uc_emu_start(child_uc, pc, kReturnSentinel, 0, kChunk);
+                    if (err != UC_ERR_OK) {
+                        uint32_t cur_pc = 0, cur_lr = 0, cur_sp = 0;
+                        uc_reg_read(child_uc, UC_ARM_REG_PC, &cur_pc);
+                        uc_reg_read(child_uc, UC_ARM_REG_LR, &cur_lr);
+                        uc_reg_read(child_uc, UC_ARM_REG_SP, &cur_sp);
+                        if (cur_pc == kReturnSentinel) {
+                            LOGI("guest thread %u returned normally", tid);
+                            break;
+                        }
+                        LOGE("guest thread %u error: %s (pc=%08x lr=%08x sp=%08x)",
+                             tid, uc_strerror(err), cur_pc, cur_lr, cur_sp);
+                        break;
+                    }
+                    uint32_t cur_pc = 0;
+                    uc_reg_read(child_uc, UC_ARM_REG_PC, &cur_pc);
+                    if (cur_pc == kReturnSentinel) {
+                        LOGI("guest thread %u reached sentinel", tid);
+                        break;
+                    }
+                    uint32_t cur_cpsr = 0;
+                    const bool cur_thumb = uc_reg_read(child_uc, UC_ARM_REG_CPSR, &cur_cpsr) == UC_ERR_OK &&
+                                           (cur_cpsr & 0x20u) != 0;
+                    pc = cur_pc | (cur_thumb ? 1u : 0u);
+                }
+
+                {
+                    std::lock_guard<std::mutex> alk(s_active_engines_mtx);
+                    auto it = std::find(s_active_engines.begin(), s_active_engines.end(), child_uc);
+                    if (it != s_active_engines.end()) s_active_engines.erase(it);
+                }
+                t_current_uc = nullptr;
+                uc_close(child_uc);
+                LOGI("guest thread %u exited", tid);
+            }).detach();
+
+            return 0u;
         };
         import_handlers_["pthread_join"] = [] { return 0u; };
         import_handlers_["pthread_detach"] = [] { return 0u; };
-        for (const char* n : {"pthread_mutex_init", "pthread_mutex_lock", "pthread_mutex_trylock",
-                              "pthread_mutex_unlock", "pthread_mutex_destroy",
-                              "pthread_mutexattr_init", "pthread_mutexattr_settype",
+        for (const char* n : {"pthread_mutexattr_init", "pthread_mutexattr_settype",
                               "pthread_mutexattr_destroy",
-                              "pthread_cond_init", "pthread_cond_wait", "pthread_cond_timedwait",
-                              "pthread_cond_signal", "pthread_cond_broadcast",
-                              "pthread_cond_destroy", "pthread_condattr_init",
-                              "pthread_condattr_destroy", "pthread_condattr_setclock",
+                              "pthread_condattr_init", "pthread_condattr_destroy", "pthread_condattr_setclock",
                               "pthread_rwlock_init", "pthread_rwlock_rdlock",
                               "pthread_rwlock_wrlock", "pthread_rwlock_unlock",
                               "pthread_rwlock_destroy", "pthread_attr_init",
@@ -5602,19 +5949,195 @@ public:
             import_handlers_[n] = [] { return 0u; };
         }
 
-        import_handlers_["sem_init"] = [this] {
-            const uint32_t sem = arg(0);
-            if (sem) emu_.write_u32(sem, arg(2));
+        // Mutexes
+        import_handlers_["pthread_mutex_init"] = [this] {
+            const uint32_t m_addr = arg(0);
+            if (m_addr) get_guest_mutex(m_addr);
             return 0u;
         };
-        import_handlers_["sem_destroy"] = [] { return 0u; };
-        import_handlers_["sem_wait"] = [] { return 0u; };
-        import_handlers_["sem_trywait"] = [] { return 0u; };
-        import_handlers_["sem_timedwait"] = [] { return 0u; };
-        import_handlers_["sem_post"] = [] { return 0u; };
+        import_handlers_["pthread_mutex_destroy"] = [this] {
+            const uint32_t m_addr = arg(0);
+            if (m_addr) {
+                std::lock_guard<std::mutex> lk(s_mutex_map_mtx);
+                s_mutex_map.erase(m_addr);
+            }
+            return 0u;
+        };
+        import_handlers_["pthread_mutex_lock"] = [this] {
+            const uint32_t m_addr = arg(0);
+            if (m_addr) get_guest_mutex(m_addr)->lock();
+            return 0u;
+        };
+        import_handlers_["pthread_mutex_trylock"] = [this] {
+            const uint32_t m_addr = arg(0);
+            if (m_addr) {
+                return get_guest_mutex(m_addr)->try_lock() ? 0u : 16u; // 16 = EBUSY
+            }
+            return 0u;
+        };
+        import_handlers_["pthread_mutex_unlock"] = [this] {
+            const uint32_t m_addr = arg(0);
+            if (m_addr) get_guest_mutex(m_addr)->unlock();
+            return 0u;
+        };
+
+        // Condition variables
+        import_handlers_["pthread_cond_init"] = [this] {
+            const uint32_t c_addr = arg(0);
+            if (c_addr) get_guest_cond(c_addr);
+            return 0u;
+        };
+        import_handlers_["pthread_cond_destroy"] = [this] {
+            const uint32_t c_addr = arg(0);
+            if (c_addr) {
+                std::lock_guard<std::mutex> lk(s_cond_map_mtx);
+                s_cond_map.erase(c_addr);
+            }
+            return 0u;
+        };
+        import_handlers_["pthread_cond_signal"] = [this] {
+            const uint32_t c_addr = arg(0);
+            if (c_addr) get_guest_cond(c_addr)->notify_one();
+            return 0u;
+        };
+        import_handlers_["pthread_cond_broadcast"] = [this] {
+            const uint32_t c_addr = arg(0);
+            if (c_addr) get_guest_cond(c_addr)->notify_all();
+            return 0u;
+        };
+        import_handlers_["pthread_cond_wait"] = [this] {
+            const uint32_t c_addr = arg(0);
+            const uint32_t m_addr = arg(1);
+            if (c_addr && m_addr) {
+                auto c = get_guest_cond(c_addr);
+                auto m = get_guest_mutex(m_addr);
+                c->wait(*m);
+            }
+            return 0u;
+        };
+        import_handlers_["pthread_cond_timedwait"] = [this] {
+            const uint32_t c_addr = arg(0);
+            const uint32_t m_addr = arg(1);
+            const uint32_t ts_ptr = arg(2);
+            if (c_addr && m_addr) {
+                auto c = get_guest_cond(c_addr);
+                auto m = get_guest_mutex(m_addr);
+                if (ts_ptr) {
+                    uint32_t sec = emu_.read_u32(ts_ptr);
+                    uint32_t nsec = emu_.read_u32(ts_ptr + 4);
+                    struct timespec now;
+                    clock_gettime(CLOCK_REALTIME, &now);
+                    int64_t diff_ms = (static_cast<int64_t>(sec) - now.tv_sec) * 1000 +
+                                      (static_cast<int64_t>(nsec) - now.tv_nsec) / 1000000;
+                    if (diff_ms <= 0) diff_ms = 1;
+                    if (diff_ms > 5000) diff_ms = 5000;
+                    if (c->wait_for(*m, std::chrono::milliseconds(diff_ms)) == std::cv_status::timeout) {
+                        return 110u; // ETIMEDOUT
+                    }
+                    return 0u;
+                } else {
+                    c->wait(*m);
+                    return 0u;
+                }
+            }
+            return 0u;
+        };
+
+        // Semaphores
+        import_handlers_["sem_init"] = [this] {
+            const uint32_t sem_addr = arg(0);
+            const uint32_t val = arg(2);
+            if (sem_addr) {
+                auto s = get_guest_sem(sem_addr);
+                std::lock_guard<std::mutex> lk(s->mtx);
+                s->count = static_cast<int>(val);
+                emu_.write_u32(sem_addr, val);
+            }
+            return 0u;
+        };
+        import_handlers_["sem_destroy"] = [this] {
+            const uint32_t sem_addr = arg(0);
+            if (sem_addr) {
+                std::lock_guard<std::mutex> lk(s_sem_map_mtx);
+                s_sem_map.erase(sem_addr);
+            }
+            return 0u;
+        };
+        import_handlers_["sem_wait"] = [this] {
+            const uint32_t sem_addr = arg(0);
+            if (sem_addr) {
+                auto s = get_guest_sem(sem_addr);
+                std::unique_lock<std::mutex> lk(s->mtx);
+                s->cv.wait(lk, [&] { return s->count > 0; });
+                s->count--;
+            }
+            return 0u;
+        };
+        import_handlers_["sem_trywait"] = [this] {
+            const uint32_t sem_addr = arg(0);
+            if (sem_addr) {
+                auto s = get_guest_sem(sem_addr);
+                std::unique_lock<std::mutex> lk(s->mtx);
+                if (s->count > 0) {
+                    s->count--;
+                    return 0u;
+                }
+                return 11u; // EAGAIN
+            }
+            return 0u;
+        };
+        import_handlers_["sem_timedwait"] = [this] {
+            const uint32_t sem_addr = arg(0);
+            const uint32_t ts_ptr = arg(1);
+            if (sem_addr) {
+                auto s = get_guest_sem(sem_addr);
+                std::unique_lock<std::mutex> lk(s->mtx);
+                if (s->count > 0) {
+                    s->count--;
+                    return 0u;
+                }
+                if (ts_ptr) {
+                    uint32_t sec = emu_.read_u32(ts_ptr);
+                    uint32_t nsec = emu_.read_u32(ts_ptr + 4);
+                    struct timespec now;
+                    clock_gettime(CLOCK_REALTIME, &now);
+                    int64_t diff_ms = (static_cast<int64_t>(sec) - now.tv_sec) * 1000 +
+                                      (static_cast<int64_t>(nsec) - now.tv_nsec) / 1000000;
+                    if (diff_ms <= 0) diff_ms = 1;
+                    if (diff_ms > 5000) diff_ms = 5000;
+                    if (s->cv.wait_for(lk, std::chrono::milliseconds(diff_ms), [&] { return s->count > 0; })) {
+                        s->count--;
+                        return 0u;
+                    }
+                    return 110u; // ETIMEDOUT
+                } else {
+                    s->cv.wait(lk, [&] { return s->count > 0; });
+                    s->count--;
+                    return 0u;
+                }
+            }
+            return 0u;
+        };
+        import_handlers_["sem_post"] = [this] {
+            const uint32_t sem_addr = arg(0);
+            if (sem_addr) {
+                auto s = get_guest_sem(sem_addr);
+                {
+                    std::lock_guard<std::mutex> lk(s->mtx);
+                    s->count++;
+                }
+                s->cv.notify_one();
+            }
+            return 0u;
+        };
         import_handlers_["sem_getvalue"] = [this] {
+            const uint32_t sem_addr = arg(0);
             const uint32_t out = arg(1);
-            if (out) emu_.write_u32(out, 1);
+            if (sem_addr && out) {
+                auto s = get_guest_sem(sem_addr);
+                std::lock_guard<std::mutex> lk(s->mtx);
+                emu_.write_u32(out, static_cast<uint32_t>(s->count));
+            }
             return 0u;
         };
 
@@ -7203,29 +7726,46 @@ namespace {
 // libapp.so, libNimble.so or libfmodex.so by name.
 std::vector<std::string> discover_payloads(const std::string& dir) {
     std::vector<std::string> out;
-    const std::string root = dir.empty() ? std::string(".") : dir;
+    std::set<std::string> seen;
 
-    DIR* d = opendir(root.c_str());
-    if (!d) {
-        LOGE("opendir(%s): %s", root.c_str(), strerror(errno));
-        return out;
-    }
-    const std::string suffix = "32.so";
-    while (struct dirent* e = readdir(d)) {
-        const std::string name = e->d_name;
-        if (name.size() <= suffix.size()) continue;
-        if (name.compare(0, 3, "lib") != 0) continue;
-        if (name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
-        out.push_back(root + "/" + name);
-    }
-    closedir(d);
+    auto scan_dir = [&](const std::string& d) {
+        if (d.empty()) return;
+        DIR* dp = opendir(d.c_str());
+        if (!dp) return;
+        while (struct dirent* e = readdir(dp)) {
+            const std::string name = e->d_name;
+            if (name.compare(0, 3, "lib") != 0) continue;
+            std::string base_id;
+            if (name.size() > 5 && name.compare(name.size() - 5, 5, "32.so") == 0) {
+                base_id = name.substr(0, name.size() - 5);
+            } else if (name.size() > 3 && name.compare(name.size() - 3, 3, ".so") == 0) {
+                base_id = name.substr(0, name.size() - 3);
+            }
+            if (!base_id.empty() && seen.insert(base_id).second) {
+                out.push_back(d + "/" + name);
+            }
+        }
+        closedir(dp);
+    };
 
-    // C++ runtime first (every payload imports from it), then the rest by
-    // name, then the application payload last (it imports from all of them).
+    scan_dir(dir);
+    // Also scan native/ if dir is <game>/payload
+    size_t last_slash = dir.find_last_of("/\\");
+    if (last_slash != std::string::npos) {
+        std::string game_root = dir.substr(0, last_slash);
+        scan_dir(game_root + "/native");
+    }
+
+    // Rank libraries so dependencies are mapped and linked before dependents:
+    // STL shared runtimes first, then Mono GC runtime, then Unity engine, then payloads.
     auto rank = [](const std::string& p) {
-        if (p.find("libc++_shared32.so") != std::string::npos) return 0;
-        if (p.find("libapp32.so") != std::string::npos) return 2;
-        return 1;
+        if (p.find("libc++_shared") != std::string::npos ||
+            p.find("libgnustl_shared") != std::string::npos ||
+            p.find("libstlport_shared") != std::string::npos) return 0;
+        if (p.find("libmono") != std::string::npos) return 1;
+        if (p.find("libunity") != std::string::npos) return 2;
+        if (p.find("libmain") != std::string::npos || p.find("libapp") != std::string::npos) return 4;
+        return 3;
     };
     std::sort(out.begin(), out.end(), [&](const std::string& a, const std::string& b) {
         const int ra = rank(a), rb = rank(b);
@@ -7444,6 +7984,19 @@ Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeSetGuestActivity(
     LOGI("guest Activity registered with the core");
 }
 
+extern "C" JNIEXPORT void JNICALL
+Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeSetNativeActivityInfo(
+        JNIEnv* env, jclass /*clazz*/, jstring funcName, jstring libName) {
+    if (funcName) {
+        g_custom_func_name = jstring_to_std(env, funcName);
+    }
+    if (libName) {
+        g_custom_lib_name = jstring_to_std(env, libName);
+    }
+    LOGI("NativeActivity metadata registered: func_name='%s', lib_name='%s'",
+         g_custom_func_name.c_str(), g_custom_lib_name.c_str());
+}
+
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeIsSessionActive(
         JNIEnv* /*env*/, jclass /*clazz*/) {
@@ -7467,98 +8020,385 @@ Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeEndSession(
     LOGI("Zai-Bridge: session closed; a new import can start");
 }
 
-// NATIVE_ACTIVITY_BRIDGE_START
+// ===========================================================================
+// NativeActivity Struct Bridge (64-bit host <-> 32-bit guest)
+// ===========================================================================
+#pragma pack(push, 4)
 struct ANativeActivityCallbacks32 {
-    uint32_t onStart, onResume, onSaveInstanceState, onPause, onStop, onDestroy;
-    uint32_t onWindowFocusChanged, onNativeWindowCreated, onNativeWindowResized;
-    uint32_t onNativeWindowRedrawNeeded, onNativeWindowDestroyed;
-    uint32_t onInputQueueCreated, onInputQueueDestroyed, onContentRectChanged;
-    uint32_t onConfigurationChanged, onLowMemory;
+    uint32_t onStart;
+    uint32_t onResume;
+    uint32_t onSaveInstanceState;
+    uint32_t onPause;
+    uint32_t onStop;
+    uint32_t onDestroy;
+    uint32_t onWindowFocusChanged;
+    uint32_t onNativeWindowCreated;
+    uint32_t onNativeWindowResized;
+    uint32_t onNativeWindowRedrawNeeded;
+    uint32_t onNativeWindowDestroyed;
+    uint32_t onInputQueueCreated;
+    uint32_t onInputQueueDestroyed;
+    uint32_t onContentRectChanged;
+    uint32_t onConfigurationChanged;
+    uint32_t onLowMemory;
 };
+
 struct ANativeActivity32 {
-    uint32_t callbacks, vm, env, clazz, internalDataPath, externalDataPath;
-    int32_t sdkVersion; uint32_t instance, assetManager, obbPath;
+    uint32_t callbacks;
+    uint32_t vm;
+    uint32_t env;
+    uint32_t clazz;
+    uint32_t internalDataPath;
+    uint32_t externalDataPath;
+    int32_t  sdkVersion;
+    uint32_t instance;
+    uint32_t assetManager;
+    uint32_t obbPath;
 };
-static uint32_t g_guest_onStart=0,g_guest_onResume=0,g_guest_onPause=0,g_guest_onStop=0,g_guest_onDestroy=0;
-static uint32_t g_guest_onWindowFocusChanged=0,g_guest_onLowMemory=0,g_guest_onConfigurationChanged=0,g_guest_onSaveInstanceState=0;
-static uint32_t g_guest_onNativeWindowCreated=0,g_guest_onNativeWindowResized=0,g_guest_onNativeWindowRedrawNeeded=0,g_guest_onNativeWindowDestroyed=0;
-static uint32_t g_guest_onInputQueueCreated=0,g_guest_onInputQueueDestroyed=0,g_guest_onContentRectChanged=0;
-static uint32_t g_shadow_activity_addr=0;
-static void host_fwd_void(uint32_t cb){ if(!cb||!g_emulator) return; uint32_t r=0; g_emulator->call(cb,{g_shadow_activity_addr},r,"NA fwd"); }
-static void hc_onStart(ANativeActivity*a){(void)a;host_fwd_void(g_guest_onStart);}
-static void hc_onResume(ANativeActivity*a){(void)a;host_fwd_void(g_guest_onResume);}
-static void hc_onPause(ANativeActivity*a){(void)a;host_fwd_void(g_guest_onPause);}
-static void hc_onStop(ANativeActivity*a){(void)a;host_fwd_void(g_guest_onStop);}
-static void hc_onDestroy(ANativeActivity*a){(void)a;host_fwd_void(g_guest_onDestroy);}
-static void hc_onLowMemory(ANativeActivity*a){(void)a;host_fwd_void(g_guest_onLowMemory);}
-static void hc_onConfigurationChanged(ANativeActivity*a){(void)a;host_fwd_void(g_guest_onConfigurationChanged);}
-static void hc_onWindowFocusChanged(ANativeActivity*a,int f){(void)a;(void)f;host_fwd_void(g_guest_onWindowFocusChanged);}
-static void* hc_onSaveInstanceState(ANativeActivity*a,size_t*out){(void)a;if(out)*out=0;if(!g_guest_onSaveInstanceState||!g_emulator)return nullptr;uint32_t r=0;g_emulator->call(g_guest_onSaveInstanceState,{g_shadow_activity_addr},r,"NA save");return nullptr;}
-static void hc_onNativeWindowCreated(ANativeActivity*a,ANativeWindow*w){(void)a;(void)w;host_fwd_void(g_guest_onNativeWindowCreated);}
-static void hc_onNativeWindowResized(ANativeActivity*a,ANativeWindow*w){(void)a;(void)w;host_fwd_void(g_guest_onNativeWindowResized);}
-static void hc_onNativeWindowRedrawNeeded(ANativeActivity*a,ANativeWindow*w){(void)a;(void)w;host_fwd_void(g_guest_onNativeWindowRedrawNeeded);}
-static void hc_onNativeWindowDestroyed(ANativeActivity*a,ANativeWindow*w){(void)a;(void)w;host_fwd_void(g_guest_onNativeWindowDestroyed);}
-static void hc_onInputQueueCreated(ANativeActivity*a,AInputQueue*q){(void)a;(void)q;host_fwd_void(g_guest_onInputQueueCreated);}
-static void hc_onInputQueueDestroyed(ANativeActivity*a,AInputQueue*q){(void)a;(void)q;host_fwd_void(g_guest_onInputQueueDestroyed);}
-static void hc_onContentRectChanged(ANativeActivity*a,const ARect*r){(void)a;(void)r;host_fwd_void(g_guest_onContentRectChanged);}
-static ANativeActivityCallbacks g_host_callbacks={};
-static bool g_cb_init=false;
-static void init_host_callbacks(){ if(g_cb_init) return;
-g_host_callbacks.onStart=hc_onStart;g_host_callbacks.onResume=hc_onResume;g_host_callbacks.onPause=hc_onPause;g_host_callbacks.onStop=hc_onStop;g_host_callbacks.onDestroy=hc_onDestroy;
-g_host_callbacks.onWindowFocusChanged=hc_onWindowFocusChanged;g_host_callbacks.onNativeWindowCreated=hc_onNativeWindowCreated;g_host_callbacks.onNativeWindowResized=hc_onNativeWindowResized;g_host_callbacks.onNativeWindowRedrawNeeded=hc_onNativeWindowRedrawNeeded;g_host_callbacks.onNativeWindowDestroyed=hc_onNativeWindowDestroyed;
-g_host_callbacks.onInputQueueCreated=hc_onInputQueueCreated;g_host_callbacks.onInputQueueDestroyed=hc_onInputQueueDestroyed;g_host_callbacks.onContentRectChanged=hc_onContentRectChanged;g_host_callbacks.onConfigurationChanged=hc_onConfigurationChanged;g_host_callbacks.onLowMemory=hc_onLowMemory;g_host_callbacks.onSaveInstanceState=hc_onSaveInstanceState;g_cb_init=true;}
-extern "C" JNIEXPORT void ANativeActivity_finish(ANativeActivity*a){(void)a;}
-extern "C" JNIEXPORT void ANativeActivity_setWindowFormat(ANativeActivity*a,int32_t f){(void)a;(void)f;}
-extern "C" JNIEXPORT void ANativeActivity_setWindowFlags(ANativeActivity*a,uint32_t add,uint32_t rem){(void)a;(void)add;(void)rem;}
-extern "C" JNIEXPORT void ANativeActivity_showSoftInput(ANativeActivity*a,uint32_t f){(void)a;(void)f;}
-extern "C" JNIEXPORT void ANativeActivity_hideSoftInput(ANativeActivity*a,uint32_t f){(void)a;(void)f;}
-extern "C" JNIEXPORT void ANativeActivity_onCreate(ANativeActivity* activity, void* savedState, size_t savedStateSize) {
-    LOGI("ANativeActivity_onCreate invoked by framework (%p)", (void*)activity);
+#pragma pack(pop)
+
+static uint32_t g_guest_onStart = 0;
+static uint32_t g_guest_onResume = 0;
+static uint32_t g_guest_onSaveInstanceState = 0;
+static uint32_t g_guest_onPause = 0;
+static uint32_t g_guest_onStop = 0;
+static uint32_t g_guest_onDestroy = 0;
+static uint32_t g_guest_onWindowFocusChanged = 0;
+static uint32_t g_guest_onNativeWindowCreated = 0;
+static uint32_t g_guest_onNativeWindowResized = 0;
+static uint32_t g_guest_onNativeWindowRedrawNeeded = 0;
+static uint32_t g_guest_onNativeWindowDestroyed = 0;
+static uint32_t g_guest_onInputQueueCreated = 0;
+static uint32_t g_guest_onInputQueueDestroyed = 0;
+static uint32_t g_guest_onContentRectChanged = 0;
+static uint32_t g_guest_onConfigurationChanged = 0;
+static uint32_t g_guest_onLowMemory = 0;
+static uint32_t g_shadow_activity_addr = 0;
+static uint32_t g_shadow_callbacks_addr = 0;
+
+static void host_fwd_void(uint32_t cb, const char* name) {
+    if (!cb || !g_emulator) return;
+    uint32_t r = 0;
+    g_emulator->call(cb, {g_shadow_activity_addr}, r, name);
+}
+
+static void hc_onStart(ANativeActivity* activity) {
+    (void)activity;
+    host_fwd_void(g_guest_onStart, "NA onStart");
+}
+
+static void hc_onResume(ANativeActivity* activity) {
+    (void)activity;
+    host_fwd_void(g_guest_onResume, "NA onResume");
+}
+
+static void hc_onPause(ANativeActivity* activity) {
+    (void)activity;
+    host_fwd_void(g_guest_onPause, "NA onPause");
+}
+
+static void hc_onStop(ANativeActivity* activity) {
+    (void)activity;
+    host_fwd_void(g_guest_onStop, "NA onStop");
+}
+
+static void hc_onDestroy(ANativeActivity* activity) {
+    (void)activity;
+    host_fwd_void(g_guest_onDestroy, "NA onDestroy");
+}
+
+static void hc_onWindowFocusChanged(ANativeActivity* activity, int hasFocus) {
+    (void)activity;
+    if (!g_guest_onWindowFocusChanged || !g_emulator) return;
+    uint32_t r = 0;
+    g_emulator->call(g_guest_onWindowFocusChanged,
+                     {g_shadow_activity_addr, static_cast<uint32_t>(hasFocus)},
+                     r, "NA onWindowFocusChanged");
+}
+
+static void* hc_onSaveInstanceState(ANativeActivity* activity, size_t* outLen) {
+    (void)activity;
+    if (outLen) *outLen = 0;
+    if (!g_guest_onSaveInstanceState || !g_emulator) return nullptr;
+
+    uint32_t guest_len_ptr = g_emulator->alloc(4, 4);
+    if (!guest_len_ptr) return nullptr;
+    g_emulator->write_u32(guest_len_ptr, 0);
+
+    uint32_t guest_buf = 0;
+    g_emulator->call(g_guest_onSaveInstanceState,
+                     {g_shadow_activity_addr, guest_len_ptr},
+                     guest_buf, "NA onSaveInstanceState");
+
+    uint32_t len = g_emulator->read_u32(guest_len_ptr);
+    g_emulator->release(guest_len_ptr, 4);
+
+    if (len > 0 && guest_buf != 0) {
+        void* host_buf = malloc(len);
+        if (host_buf) {
+            g_emulator->read(guest_buf, host_buf, len);
+            if (outLen) *outLen = len;
+            return host_buf;
+        }
+    }
+    return nullptr;
+}
+
+static void hc_onConfigurationChanged(ANativeActivity* activity) {
+    (void)activity;
+    host_fwd_void(g_guest_onConfigurationChanged, "NA onConfigurationChanged");
+}
+
+static void hc_onLowMemory(ANativeActivity* activity) {
+    (void)activity;
+    host_fwd_void(g_guest_onLowMemory, "NA onLowMemory");
+}
+
+static void hc_onNativeWindowCreated(ANativeActivity* activity, ANativeWindow* window) {
+    (void)activity;
+    g_host_window.store(window);
+    if (g_bridge) g_bridge->set_host_window(window);
+    if (!g_guest_onNativeWindowCreated || !g_emulator) return;
+    const uint32_t gw = g_bridge ? g_bridge->to_guest_ref(window) : 0u;
+    uint32_t r = 0;
+    g_emulator->call(g_guest_onNativeWindowCreated, {g_shadow_activity_addr, gw}, r, "NA onNativeWindowCreated");
+}
+
+static void hc_onNativeWindowResized(ANativeActivity* activity, ANativeWindow* window) {
+    (void)activity;
+    if (!g_guest_onNativeWindowResized || !g_emulator) return;
+    const uint32_t gw = g_bridge ? g_bridge->to_guest_ref(window) : 0u;
+    uint32_t r = 0;
+    g_emulator->call(g_guest_onNativeWindowResized, {g_shadow_activity_addr, gw}, r, "NA onNativeWindowResized");
+}
+
+static void hc_onNativeWindowRedrawNeeded(ANativeActivity* activity, ANativeWindow* window) {
+    (void)activity;
+    if (!g_guest_onNativeWindowRedrawNeeded || !g_emulator) return;
+    const uint32_t gw = g_bridge ? g_bridge->to_guest_ref(window) : 0u;
+    uint32_t r = 0;
+    g_emulator->call(g_guest_onNativeWindowRedrawNeeded, {g_shadow_activity_addr, gw}, r, "NA onNativeWindowRedrawNeeded");
+}
+
+static void hc_onNativeWindowDestroyed(ANativeActivity* activity, ANativeWindow* window) {
+    (void)activity;
+    if (g_guest_onNativeWindowDestroyed && g_emulator) {
+        const uint32_t gw = g_bridge ? g_bridge->to_guest_ref(window) : 0u;
+        uint32_t r = 0;
+        g_emulator->call(g_guest_onNativeWindowDestroyed, {g_shadow_activity_addr, gw}, r, "NA onNativeWindowDestroyed");
+    }
+    if (g_bridge) g_bridge->set_host_window(nullptr);
+    g_host_window.store(nullptr);
+}
+
+static void hc_onInputQueueCreated(ANativeActivity* activity, AInputQueue* queue) {
+    (void)activity;
+    if (!g_guest_onInputQueueCreated || !g_emulator) return;
+    const uint32_t gq = g_bridge ? g_bridge->to_guest_ref(queue) : 0u;
+    uint32_t r = 0;
+    g_emulator->call(g_guest_onInputQueueCreated, {g_shadow_activity_addr, gq}, r, "NA onInputQueueCreated");
+}
+
+static void hc_onInputQueueDestroyed(ANativeActivity* activity, AInputQueue* queue) {
+    (void)activity;
+    if (!g_guest_onInputQueueDestroyed || !g_emulator) return;
+    const uint32_t gq = g_bridge ? g_bridge->to_guest_ref(queue) : 0u;
+    uint32_t r = 0;
+    g_emulator->call(g_guest_onInputQueueDestroyed, {g_shadow_activity_addr, gq}, r, "NA onInputQueueDestroyed");
+}
+
+static void hc_onContentRectChanged(ANativeActivity* activity, const ARect* rect) {
+    (void)activity;
+    if (!g_guest_onContentRectChanged || !g_emulator) return;
+    uint32_t guest_rect = 0;
+    if (rect) {
+        guest_rect = g_emulator->alloc(sizeof(ARect), 4);
+        if (guest_rect) {
+            g_emulator->write(guest_rect, rect, sizeof(ARect));
+        }
+    }
+    uint32_t r = 0;
+    g_emulator->call(g_guest_onContentRectChanged, {g_shadow_activity_addr, guest_rect}, r, "NA onContentRectChanged");
+    if (guest_rect) {
+        g_emulator->release(guest_rect, sizeof(ARect));
+    }
+}
+
+static ANativeActivityCallbacks g_host_callbacks = {};
+static bool g_callbacks_initialized = false;
+
+static void init_host_callbacks() {
+    if (g_callbacks_initialized) return;
+    g_host_callbacks.onStart                    = hc_onStart;
+    g_host_callbacks.onResume                   = hc_onResume;
+    g_host_callbacks.onSaveInstanceState        = hc_onSaveInstanceState;
+    g_host_callbacks.onPause                    = hc_onPause;
+    g_host_callbacks.onStop                     = hc_onStop;
+    g_host_callbacks.onDestroy                  = hc_onDestroy;
+    g_host_callbacks.onWindowFocusChanged       = hc_onWindowFocusChanged;
+    g_host_callbacks.onNativeWindowCreated      = hc_onNativeWindowCreated;
+    g_host_callbacks.onNativeWindowResized      = hc_onNativeWindowResized;
+    g_host_callbacks.onNativeWindowRedrawNeeded = hc_onNativeWindowRedrawNeeded;
+    g_host_callbacks.onNativeWindowDestroyed    = hc_onNativeWindowDestroyed;
+    g_host_callbacks.onInputQueueCreated        = hc_onInputQueueCreated;
+    g_host_callbacks.onInputQueueDestroyed      = hc_onInputQueueDestroyed;
+    g_host_callbacks.onContentRectChanged       = hc_onContentRectChanged;
+    g_host_callbacks.onConfigurationChanged     = hc_onConfigurationChanged;
+    g_host_callbacks.onLowMemory                = hc_onLowMemory;
+    g_callbacks_initialized = true;
+}
+
+static void ANativeActivity_onCreate_impl(ANativeActivity* activity, void* savedState, size_t savedStateSize) {
+    LOGI("==============================================================");
+    LOGI(" ANativeActivity_onCreate invoked by host framework (%p)", activity);
+    LOGI("==============================================================");
     if (!activity) return;
+
+    g_host_activity = activity;
     init_host_callbacks();
     activity->callbacks = &g_host_callbacks;
-    if (!g_bridge || !g_emulator) { LOGW("bridge not initialised"); return; }
+
+    if (!g_bridge || !g_emulator) {
+        LOGE("ANativeActivity_onCreate: bridge or emulator not initialised");
+        return;
+    }
+
     uint32_t shadow = g_emulator->alloc(sizeof(ANativeActivity32), 8);
-    if (!shadow) { LOGE("shadow alloc failed"); return; }
+    if (!shadow) {
+        LOGE("ANativeActivity_onCreate: failed to allocate ANativeActivity32");
+        return;
+    }
     g_shadow_activity_addr = shadow;
+
     const char* internal = activity->internalDataPath ? activity->internalDataPath : "";
     const char* external = activity->externalDataPath ? activity->externalDataPath : "";
-    const char* obb = activity->obbPath ? activity->obbPath : "";
-    uint32_t si = g_emulator->alloc(strlen(internal)+1,4);
-    uint32_t se = g_emulator->alloc(strlen(external)+1,4);
-    uint32_t so = g_emulator->alloc(strlen(obb)+1,4);
-    if(si) g_emulator->write(si,internal,strlen(internal)+1);
-    if(se) g_emulator->write(se,external,strlen(external)+1);
-    if(so) g_emulator->write(so,obb,strlen(obb)+1);
-    uint32_t ss = 0;
-    if (savedState && savedStateSize>0) { ss = g_emulator->alloc(savedStateSize,8); if(ss) g_emulator->write(ss,savedState,savedStateSize); }
-    uint32_t cb = g_emulator->alloc(sizeof(ANativeActivityCallbacks32),8);
-    std::vector<uint8_t> zero(sizeof(ANativeActivityCallbacks32),0);
-    if(cb) g_emulator->write(cb,zero.data(),zero.size());
+    const char* obb      = activity->obbPath ? activity->obbPath : "";
+
+    uint32_t s_internal = g_emulator->alloc(strlen(internal) + 1, 4);
+    uint32_t s_external = g_emulator->alloc(strlen(external) + 1, 4);
+    uint32_t s_obb      = g_emulator->alloc(strlen(obb) + 1, 4);
+    if (s_internal) g_emulator->write(s_internal, internal, strlen(internal) + 1);
+    if (s_external) g_emulator->write(s_external, external, strlen(external) + 1);
+    if (s_obb)      g_emulator->write(s_obb, obb, strlen(obb) + 1);
+
+    uint32_t s_state = 0;
+    if (savedState && savedStateSize > 0) {
+        s_state = g_emulator->alloc(savedStateSize, 8);
+        if (s_state) g_emulator->write(s_state, savedState, savedStateSize);
+    }
+
+    uint32_t shadow_cb = g_emulator->alloc(sizeof(ANativeActivityCallbacks32), 8);
+    g_shadow_callbacks_addr = shadow_cb;
+    if (shadow_cb) {
+        std::vector<uint8_t> zero(sizeof(ANativeActivityCallbacks32), 0);
+        g_emulator->write(shadow_cb, zero.data(), zero.size());
+    }
+
     ANativeActivity32 sa{};
-    sa.callbacks=cb; sa.vm=g_bridge->vm_shadow(); sa.env=g_bridge->env_shadow();
+    sa.callbacks = shadow_cb;
+    sa.vm = g_bridge->vm_shadow();
+    sa.env = g_bridge->env_shadow();
     sa.clazz = g_bridge->to_guest_ref(activity->clazz);
-    sa.internalDataPath=si; sa.externalDataPath=se; sa.sdkVersion=activity->sdkVersion;
-    sa.instance=0; sa.assetManager=0; sa.obbPath=so;
-    g_emulator->write(shadow,&sa,sizeof(sa));
-    uint32_t guest_onCreate=0;
-    for (const auto* lib : g_bridge->libraries()) { uint32_t fn=JniBridge::export_of(lib,"ANativeActivity_onCreate"); if(fn){guest_onCreate=fn;break;} }
-    if (!guest_onCreate) { LOGW("no guest ANativeActivity_onCreate"); return; }
-    uint32_t ret=0;
-    g_emulator->call(guest_onCreate,{shadow,ss,(uint32_t)savedStateSize},ret,"guest ANativeActivity_onCreate");
+    sa.internalDataPath = s_internal;
+    sa.externalDataPath = s_external;
+    sa.sdkVersion = activity->sdkVersion;
+    sa.instance = 0;
+    sa.assetManager = g_bridge->to_guest_ref(activity->assetManager);
+    sa.obbPath = s_obb;
+    g_emulator->write(shadow, &sa, sizeof(sa));
+
+    // Resolve guest entry point: try custom func_name, ANativeActivity_onCreate, UnityInitApplication, etc.
+    uint32_t guest_entry = 0;
+    std::vector<std::string> candidate_funcs;
+    if (!g_custom_func_name.empty()) {
+        candidate_funcs.push_back(g_custom_func_name);
+    }
+    candidate_funcs.push_back("ANativeActivity_onCreate");
+    candidate_funcs.push_back("UnityInitApplication");
+    candidate_funcs.push_back("UnityLoadApplication");
+    candidate_funcs.push_back("native_activity_create");
+    candidate_funcs.push_back("android_main");
+
+    for (const auto& fn_name : candidate_funcs) {
+        for (const auto* lib : g_bridge->libraries()) {
+            uint32_t fn = JniBridge::export_of(lib, fn_name.c_str());
+            if (fn) {
+                guest_entry = fn;
+                LOGI("Found guest entry point '%s' in %s @ 0x%08x",
+                     fn_name.c_str(), lib->path.c_str(), fn);
+                break;
+            }
+        }
+        if (guest_entry) break;
+    }
+
+    if (!guest_entry) {
+        LOGE("ANativeActivity_onCreate: could not resolve any guest entry point in mapped payloads");
+        return;
+    }
+
+    LOGI("Calling guest entry point @ 0x%08x with shadow_activity=0x%08x", guest_entry, shadow);
+    uint32_t ret = 0;
+    g_emulator->call(guest_entry, {shadow, s_state, static_cast<uint32_t>(savedStateSize)},
+                     ret, "guest ANativeActivity_onCreate");
+    LOGI("guest entry returned %u (0x%08x)", ret, ret);
+
+    // Read back callbacks and instance from guest memory
     ANativeActivityCallbacks32 c32{};
-    if(cb) g_emulator->read(cb,&c32,sizeof(c32));
-    g_guest_onStart=c32.onStart; g_guest_onResume=c32.onResume; g_guest_onSaveInstanceState=c32.onSaveInstanceState;
-    g_guest_onPause=c32.onPause; g_guest_onStop=c32.onStop; g_guest_onDestroy=c32.onDestroy;
-    g_guest_onWindowFocusChanged=c32.onWindowFocusChanged; g_guest_onNativeWindowCreated=c32.onNativeWindowCreated;
-    g_guest_onNativeWindowResized=c32.onNativeWindowResized; g_guest_onNativeWindowRedrawNeeded=c32.onNativeWindowRedrawNeeded;
-    g_guest_onNativeWindowDestroyed=c32.onNativeWindowDestroyed; g_guest_onInputQueueCreated=c32.onInputQueueCreated;
-    g_guest_onInputQueueDestroyed=c32.onInputQueueDestroyed; g_guest_onContentRectChanged=c32.onContentRectChanged;
-    g_guest_onConfigurationChanged=c32.onConfigurationChanged; g_guest_onLowMemory=c32.onLowMemory;
-    LOGI("ANativeActivity_onCreate bridge complete");
+    if (shadow_cb) {
+        g_emulator->read(shadow_cb, &c32, sizeof(c32));
+    }
+    g_guest_onStart                    = c32.onStart;
+    g_guest_onResume                   = c32.onResume;
+    g_guest_onSaveInstanceState        = c32.onSaveInstanceState;
+    g_guest_onPause                    = c32.onPause;
+    g_guest_onStop                     = c32.onStop;
+    g_guest_onDestroy                  = c32.onDestroy;
+    g_guest_onWindowFocusChanged       = c32.onWindowFocusChanged;
+    g_guest_onNativeWindowCreated      = c32.onNativeWindowCreated;
+    g_guest_onNativeWindowResized      = c32.onNativeWindowResized;
+    g_guest_onNativeWindowRedrawNeeded = c32.onNativeWindowRedrawNeeded;
+    g_guest_onNativeWindowDestroyed    = c32.onNativeWindowDestroyed;
+    g_guest_onInputQueueCreated        = c32.onInputQueueCreated;
+    g_guest_onInputQueueDestroyed      = c32.onInputQueueDestroyed;
+    g_guest_onContentRectChanged       = c32.onContentRectChanged;
+    g_guest_onConfigurationChanged     = c32.onConfigurationChanged;
+    g_guest_onLowMemory                = c32.onLowMemory;
+
+    // Read updated instance pointer
+    ANativeActivity32 sa_updated{};
+    g_emulator->read(shadow, &sa_updated, sizeof(sa_updated));
+    activity->instance = g_bridge->from_guest_ref(sa_updated.instance);
+
+    LOGI("ANativeActivity struct bridge installed: onStart=0x%08x onResume=0x%08x onWindowCreated=0x%08x instance=%p",
+         c32.onStart, c32.onResume, c32.onNativeWindowCreated, activity->instance);
 }
-// NATIVE_ACTIVITY_BRIDGE_DONE
-// NATIVE_ACTIVITY_BRIDGE_END
+
+// Exported entry points for NativeActivity and game engines
+extern "C" JNIEXPORT void ANativeActivity_onCreate(
+        ANativeActivity* activity, void* savedState, size_t savedStateSize) {
+    ANativeActivity_onCreate_impl(activity, savedState, savedStateSize);
+}
+
+extern "C" JNIEXPORT void UnityInitApplication(
+        ANativeActivity* activity, void* savedState, size_t savedStateSize) {
+    ANativeActivity_onCreate_impl(activity, savedState, savedStateSize);
+}
+
+extern "C" JNIEXPORT void UnityLoadApplication(
+        ANativeActivity* activity, void* savedState, size_t savedStateSize) {
+    ANativeActivity_onCreate_impl(activity, savedState, savedStateSize);
+}
+
+extern "C" JNIEXPORT void native_activity_create(
+        ANativeActivity* activity, void* savedState, size_t savedStateSize) {
+    ANativeActivity_onCreate_impl(activity, savedState, savedStateSize);
+}
+
+extern "C" JNIEXPORT void android_main(
+        ANativeActivity* activity, void* savedState, size_t savedStateSize) {
+    ANativeActivity_onCreate_impl(activity, savedState, savedStateSize);
+}
 
 extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void* reserved) {
     (void)vm; (void)reserved;

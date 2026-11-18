@@ -21,19 +21,35 @@ reconstruction and multi-frame generation.**
 
 ---
 
-## Architecture & v2.1.0 Full Compatibility Runtime
+## Architecture & v2.1.1 Full Compatibility Runtime
 
 ```mermaid
 flowchart LR
-    A["Legacy 32-bit APK<br/>+ OBB Data"] --> B["CrashGuard & Lazy Runtime<br/>Decoupled Startup Safe"]
-    B --> C["BridgeInstrumentation<br/>Guest Activity Host"]
+    A["Legacy 32-bit APK<br/>NativeActivity / Unity / GL"] --> B["CrashGuard & Lazy Runtime<br/>Decoupled Startup Safe"]
+    B --> C["BridgeInstrumentation<br/>Guest Activity & Struct Bridge"]
     C --> D["Full Multi-ABI Sysroot<br/>ANGLE · SwiftShader · SDL2 · C++"]
-    D --> E["Unicorn ARM32 Core<br/>DT_NEEDED Dependency Resolver"]
+    D --> E["Multi-Threaded Unicorn Core<br/>DT_NEEDED · ARM32 TLS · pthread"]
     E --> F["Zai-Scale Ultra Compositor<br/>TSR · Optical-Flow MFG · EASU/RCAS"]
     F --> G["120 Hz Immersive<br/>SurfaceView"]
 ```
 
 Zai-Bridge is a **self-contained universal compatibility container** (241 MB), not a per-game port. It embeds full native graphics backends, game runtime engines, and legacy framework DEX packages across 4 ABIs (`arm64-v8a`, `armeabi-v7a`, `x86_64`, `x86`), providing 100% offline compatibility for legacy Android games on Android 8 through 16.
+
+### v2.1.1 Key Enhancements: NativeActivity & Unity 32-Bit Engine Support
+
+1. **`ANativeActivity` 64-to-32-Bit Struct Bridge:**
+   - **ABI-Matched Shadow Structures**: Marshals between host 64-bit Android OS `ANativeActivity` / `ANativeActivityCallbacks` and 32-bit AAPCS-compliant `ANativeActivity32` (40 bytes) and `ANativeActivityCallbacks32` (64 bytes) inside Unicorn heap memory (`0x30000000+`).
+   - **Exported Framework Entry Points**: Directly exports `ANativeActivity_onCreate`, `UnityInitApplication`, `UnityLoadApplication`, `native_activity_create`, and `android_main` from `libwrapper.so` (aliased as `libmain.so`), eliminating `UnsatisfiedLinkError: undefined symbol: ANativeActivity_onCreate`.
+   - **Bidirectional Lifecycle & Event Forwarding**: Translates host lifecycle callbacks (`onStart`, `onResume`, `onPause`, `onStop`, `onDestroy`, `onSaveInstanceState`, `onLowMemory`, `onConfigurationChanged`, `onWindowFocusChanged`) into guest Unicorn execution, and bridges `ANativeWindow*` / `AInputQueue*` pointers through 32-bit shadow handles.
+   - **NativeActivity System Glue**: Forwards guest `libandroid.so` calls (`ANativeActivity_finish`, `ANativeActivity_setWindowFormat`, `ANativeActivity_setWindowFlags`, `ANativeActivity_showSoftInput`, `ANativeActivity_hideSoftInput`) to the real host `ANativeActivity*`.
+
+2. **Multi-Library Dynamic Linking (Unity & Complex Engines):**
+   - Seamlessly resolves multi-library dependencies (`libmain.so` → `dlopen("libunity.so")` → `dlopen("libmono.so")`) from `payload/` and `native/` game roots.
+   - Preserves mapped address descriptors in dynamic handles, runs `DT_INIT_ARRAY` constructors in dependency order (STL → Mono GC → Unity Engine → Game payloads), and resolves exports across the entire link set via `guest_dlsym`.
+
+3. **Real Multi-Threaded Guest Execution (`pthread_create` + ARM32 TLS):**
+   - Unity render workers (`UnityGfxDeviceWorker`) and Mono GC threads spawned via `pthread_create` execute on real host `std::thread`s.
+   - Each thread possesses an independent `uc_engine*` CPU instance sharing the host-backed `uc_mem_map_ptr` memory arena, a dedicated 1 MB guest stack, ARM32 TLS register virtualization (`TPIDRURO` / `UC_ARM_REG_C13_C0_3`), and Thumb mode execution (CPSR bit 5 preservation).
 
 ### v2.1.0 Key Enhancements
 
