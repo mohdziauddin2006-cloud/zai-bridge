@@ -51,6 +51,11 @@ Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeSetRuntimeSysroot(
 }
 
 extern "C" JNIEXPORT void JNICALL
+Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeSetGuestLoader(
+        JNIEnv* /*env*/, jclass /*clazz*/, jobject /*loader*/) {
+}
+
+extern "C" JNIEXPORT void JNICALL
 Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeSetNativeActivityInfo(
         JNIEnv* /*env*/, jclass /*clazz*/, jstring /*funcName*/, jstring /*libName*/) {
 }
@@ -89,6 +94,30 @@ extern "C" JNIEXPORT void native_activity_create(
 
 extern "C" JNIEXPORT void android_main(
         void* /*activity*/, void* /*savedState*/, size_t /*savedStateSize*/) {
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_unity3d_player_NativeLoader_load(
+        JNIEnv* /*env*/, jclass /*clazz*/, jstring /*libName*/) {
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_unity3d_player_NativeLoader_unload(
+        JNIEnv* /*env*/, jclass /*clazz*/, jstring /*libName*/) {
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_unity3d_player_NativeLoader_load__Ljava_lang_String_2(
+        JNIEnv* /*env*/, jclass /*clazz*/, jstring /*libName*/) {
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_unity3d_player_NativeLoader_unload__Ljava_lang_String_2(
+        JNIEnv* /*env*/, jclass /*clazz*/, jstring /*libName*/) {
+    return JNI_TRUE;
 }
 
 extern "C" JNIEXPORT jstring JNICALL

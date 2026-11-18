@@ -116,6 +116,12 @@ public final class UnicornBridge {
         nativeSetRuntimeSysroot(path);
     }
 
+    /** Explicitly registers the active guest DexClassLoader with the translation core. */
+    public static void setGuestLoader(ClassLoader loader) {
+        if (!CORE_LOADED || loader == null) return;
+        nativeSetGuestLoader(loader);
+    }
+
     /** Sets NativeActivity metadata (android.app.func_name, android.app.lib_name). */
     public static void setNativeActivityInfo(String funcName, String libName) {
         if (!CORE_LOADED) return;
@@ -175,6 +181,8 @@ public final class UnicornBridge {
     private static native void nativeSetSurface(Surface surface);
 
     private static native void nativeSetRuntimeSysroot(String path);
+
+    private static native void nativeSetGuestLoader(ClassLoader loader);
 
     private static native void nativeSetNativeActivityInfo(String funcName, String libName);
 

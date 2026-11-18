@@ -134,6 +134,7 @@ inline uc_engine* current_uc() {
 
 static std::string g_custom_func_name;
 static std::string g_custom_lib_name;
+static jobject g_guest_loader = nullptr;
 static ANativeActivity* g_host_activity = nullptr;
 
 struct GuestSem {
@@ -1520,6 +1521,9 @@ public:
 
     // guest JNI_OnLoad(vm, reserved)
     bool call_onload(uint32_t fn, uint32_t& ret) {
+        if (!fn) return false;
+        if (called_onloads_.find(fn) != called_onloads_.end()) return true;
+        called_onloads_.insert(fn);
         return emu_.call(fn, {vm_shadow_, 0}, ret, "JNI_OnLoad");
     }
 
@@ -1601,6 +1605,8 @@ public:
     // reference: the Java side holds the loader for the whole session.
     void set_guest_loader(jobject loader) { guest_loader_ = loader; }
     void set_guest_activity(jobject activity) { guest_thiz_ = activity; }
+    jobject guest_loader() const { return guest_loader_; }
+    const std::vector<NativeEntry>& natives() const { return natives_; }
 
     // Per-session filesystem context. Everything the guest believes it can see
     // outside the sandbox is folded back into the game's private directory.
@@ -2132,6 +2138,7 @@ private:
     }
 
     void on_stub(uint32_t pc) {
+        EnvScope env_scope(env_, vm_);
         const size_t slot = (pc - kStubBase) / kStubStride;
         if (slot >= slots_.size()) return;
 
@@ -2633,7 +2640,22 @@ public:
                 // uses the host application's loader, where the game's classes
                 // do not exist.
                 jclass c = find_class_through(env_, guest_loader_, name);
-                if (!c) { env_->ExceptionClear(); LOGE("FindClass(%s) failed", name.c_str()); }
+                if (!c) {
+                    env_->ExceptionClear();
+                    std::string slash_name = name;
+                    std::replace(slash_name.begin(), slash_name.end(), '.', '/');
+                    c = env_->FindClass(slash_name.c_str());
+                }
+                if (!c) {
+                    env_->ExceptionClear();
+                    LOGE("FindClass(%s) failed", name.c_str());
+                } else {
+                    jclass global_c = static_cast<jclass>(env_->NewGlobalRef(c));
+                    if (global_c) {
+                        env_->DeleteLocalRef(c);
+                        c = global_c;
+                    }
+                }
                 return to_guest_ref(c);
             }
 
@@ -7125,6 +7147,7 @@ public:
 
     // Guest -> env->RegisterNatives(env, clazz, methods, n)
     uint32_t register_natives() {
+        EnvScope env_scope(env_, vm_);
         auto* clazz = static_cast<jclass>(from_guest_ref(arg(1)));
         const uint32_t methods = arg(2);
         const uint32_t count = arg(3);
@@ -7140,8 +7163,7 @@ public:
 
         std::vector<JNINativeMethod> host_methods;
         host_methods.reserve(count);
-        // host_methods[] stores c_str() pointers into natives_; reserve now so
-        // the strings never move underneath those pointers.
+        // host_methods[] stores persistent strdup pointers so they never move or expire
         natives_.reserve(natives_.size() + count);
 
         for (uint32_t i = 0; i < count; ++i) {
@@ -7168,8 +7190,9 @@ public:
             e.code = code;
             natives_.push_back(e);
 
-            host_methods.push_back(
-                {natives_.back().name.c_str(), natives_.back().sig.c_str(), code});
+            char* p_name = strdup(name.c_str());
+            char* p_sig  = strdup(sig.c_str());
+            host_methods.push_back({p_name, p_sig, code});
             LOGI("  native %s%s -> guest %08x (trampoline %p)", name.c_str(), sig.c_str(),
                  fn_p, code);
         }
@@ -7177,7 +7200,7 @@ public:
         jint rc = env_->RegisterNatives(clazz, host_methods.data(),
                                         static_cast<jint>(host_methods.size()));
         LOGI("RegisterNatives: %u methods -> rc=%d%s", count, rc,
-             rc == JNI_OK ? "" : " (retry after the class is loaded)");
+             rc == JNI_OK ? "" : " (failed to register with ART)");
         if (rc != JNI_OK) env_->ExceptionClear();
         return static_cast<uint32_t>(rc);
     }
@@ -7654,6 +7677,7 @@ public:
     uint32_t next_tls_key_ = 1;
 
     jobject guest_loader_ = nullptr;    // DexClassLoader over the ingested APK
+    std::unordered_set<uint32_t> called_onloads_;
     std::vector<JavaExport> pending_;   // Java_* exports awaiting their class
     std::unordered_map<uint32_t, int> native_calls_;   // trampoline id -> count
 };
@@ -7838,7 +7862,13 @@ Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeStartSession(
     // that created it and CheckJNI rejects it on any other thread ("invalid
     // JNI transition frame reference").
     if (guest_loader) {
-        g_bridge->set_guest_loader(static_cast<jobject>(env->NewGlobalRef(guest_loader)));
+        if (g_guest_loader && g_guest_loader != guest_loader) {
+            env->DeleteGlobalRef(g_guest_loader);
+        }
+        g_guest_loader = env->NewGlobalRef(guest_loader);
+        g_bridge->set_guest_loader(g_guest_loader);
+    } else if (g_guest_loader) {
+        g_bridge->set_guest_loader(g_guest_loader);
     }
     // The engine's native side calls back into Java through the Activity it was
     // handed, so it needs a real object, not null, as the JNI `this`.
@@ -7973,6 +8003,22 @@ Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeSetRuntimeSysroot(
     LOGI("runtime sysroot: %s", root.empty() ? "<none>" : root.c_str());
 }
 
+extern "C" JNIEXPORT void JNICALL
+Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeSetGuestLoader(
+        JNIEnv* env, jclass /*clazz*/, jobject loader) {
+    if (g_guest_loader) {
+        env->DeleteGlobalRef(g_guest_loader);
+        g_guest_loader = nullptr;
+    }
+    if (loader) {
+        g_guest_loader = env->NewGlobalRef(loader);
+        if (g_bridge) {
+            g_bridge->set_guest_loader(g_guest_loader);
+        }
+    }
+    LOGI("guest DexClassLoader registered with the core (loader=%p)", g_guest_loader);
+}
+
 // The guest Activity only exists after newActivity(); the core is opened before
 // it, because a legacy static initialiser calls System.loadLibrary as soon as
 // the class is touched.
@@ -8008,9 +8054,13 @@ Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeIsSessionActive(
 // second game can be launched in the same process with a fresh address space.
 extern "C" JNIEXPORT void JNICALL
 Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeEndSession(
-        JNIEnv* /*env*/, jclass /*clazz*/) {
+        JNIEnv* env, jclass /*clazz*/) {
     if (!g_session_active && g_bridge == nullptr && g_emulator == nullptr) return;
     LOGI("Zai-Bridge: closing guest session");
+    if (g_guest_loader && env) {
+        env->DeleteGlobalRef(g_guest_loader);
+        g_guest_loader = nullptr;
+    }
     zai::GpuCompositor::instance().teardown();
     delete g_bridge;
     g_bridge = nullptr;
@@ -8308,6 +8358,15 @@ static void ANativeActivity_onCreate_impl(ANativeActivity* activity, void* saved
     g_emulator->write(shadow, &sa, sizeof(sa));
 
     // Resolve guest entry point: try custom func_name, ANativeActivity_onCreate, UnityInitApplication, etc.
+    if (g_bridge) {
+        for (const auto* lib : g_bridge->libraries()) {
+            const uint32_t onload = JniBridge::export_of(lib, "JNI_OnLoad");
+            if (onload) {
+                uint32_t ret = 0;
+                g_bridge->call_onload(onload, ret);
+            }
+        }
+    }
     uint32_t guest_entry = 0;
     std::vector<std::string> candidate_funcs;
     if (!g_custom_func_name.empty()) {
@@ -8398,6 +8457,64 @@ extern "C" JNIEXPORT void native_activity_create(
 extern "C" JNIEXPORT void android_main(
         ANativeActivity* activity, void* savedState, size_t savedStateSize) {
     ANativeActivity_onCreate_impl(activity, savedState, savedStateSize);
+}
+
+// ---------------------------------------------------------------------------
+// Unity NativeLoader exports
+// ---------------------------------------------------------------------------
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_unity3d_player_NativeLoader_load(JNIEnv* env, jclass /*clazz*/, jstring libName) {
+    std::string name;
+    if (libName && env) {
+        const char* str = env->GetStringUTFChars(libName, nullptr);
+        if (str) {
+            name = str;
+            env->ReleaseStringUTFChars(libName, str);
+        }
+    }
+    LOGI("Java_com_unity3d_player_NativeLoader_load('%s')", name.c_str());
+
+    if (g_bridge && !name.empty()) {
+        std::string filename = name;
+        if (filename.find(".so") == std::string::npos) {
+            if (filename.rfind("lib", 0) != 0) {
+                filename = "lib" + filename + ".so";
+            } else {
+                filename = filename + ".so";
+            }
+        }
+        uint32_t handle = g_bridge->guest_dlopen(filename);
+        if (handle) {
+            LOGI("NativeLoader: loaded '%s' -> 0x%08x", filename.c_str(), handle);
+        } else {
+            g_bridge->guest_dlopen(name);
+        }
+    }
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_unity3d_player_NativeLoader_unload(JNIEnv* env, jclass /*clazz*/, jstring libName) {
+    std::string name;
+    if (libName && env) {
+        const char* str = env->GetStringUTFChars(libName, nullptr);
+        if (str) {
+            name = str;
+            env->ReleaseStringUTFChars(libName, str);
+        }
+    }
+    LOGI("Java_com_unity3d_player_NativeLoader_unload('%s')", name.c_str());
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_unity3d_player_NativeLoader_load__Ljava_lang_String_2(JNIEnv* env, jclass clazz, jstring libName) {
+    return Java_com_unity3d_player_NativeLoader_load(env, clazz, libName);
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_unity3d_player_NativeLoader_unload__Ljava_lang_String_2(JNIEnv* env, jclass clazz, jstring libName) {
+    return Java_com_unity3d_player_NativeLoader_unload(env, clazz, libName);
 }
 
 extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void* reserved) {

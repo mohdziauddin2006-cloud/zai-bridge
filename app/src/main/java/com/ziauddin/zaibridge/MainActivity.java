@@ -29,6 +29,12 @@ import android.widget.Button;
 import android.widget.EditText;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.opengl.EGL14;
+import android.opengl.EGLConfig;
+import android.opengl.EGLContext;
+import android.opengl.EGLDisplay;
+import android.opengl.EGLSurface;
+import android.opengl.GLES20;
 
 import com.ziauddin.zaibridge.GameHostActivity;
 import com.ziauddin.zaibridge.R;
@@ -48,6 +54,8 @@ import com.ziauddin.zaibridge.ui.ImportSheet;
 import java.io.File;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * The launcher: an obsidian glass header, the animated library grid, the
@@ -70,6 +78,10 @@ public class MainActivity extends AppCompatActivity implements GameAdapter.Liste
 
     private ImportSheet importSheet;
 
+    private final ExecutorService bgExecutor = Executors.newSingleThreadExecutor();
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private View loadingOverlay;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -79,6 +91,8 @@ public class MainActivity extends AppCompatActivity implements GameAdapter.Liste
         window.addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS);
         window.setStatusBarColor(android.graphics.Color.TRANSPARENT);
         window.setNavigationBarColor(android.graphics.Color.TRANSPARENT);
+
+        loadingOverlay = findViewById(R.id.loading_overlay);
 
         recycler = findViewById(R.id.recycler_games);
         recycler.setLayoutManager(new GridLayoutManager(this, spanCount()));
@@ -109,9 +123,8 @@ public class MainActivity extends AppCompatActivity implements GameAdapter.Liste
                 .setOnClickListener(v -> showEngineSettings());
 
         TextView hardware = findViewById(R.id.tv_hardware);
-        hardware.setText(getString(
-                EglSwapHook.isInstalled() ? R.string.hardware_active : R.string.hardware_software,
-                abiLabel()));
+        hardware.setText(getString(R.string.hardware_active, abiLabel()));
+        probeHardwareGpu(hardware);
     }
 
     @Override
@@ -127,6 +140,7 @@ public class MainActivity extends AppCompatActivity implements GameAdapter.Liste
         // destroyed Activity is the classic leaked-window crash on relaunch.
         if (importSheet != null) importSheet.dismiss();
         importSheet = null;
+        bgExecutor.shutdown();
         super.onDestroy();
     }
 
@@ -146,11 +160,22 @@ public class MainActivity extends AppCompatActivity implements GameAdapter.Liste
         return abi.toUpperCase(Locale.ROOT).replace('_', '-');
     }
 
+    private void showLoading(boolean show) {
+        if (loadingOverlay != null) {
+            loadingOverlay.setVisibility(show ? View.VISIBLE : View.GONE);
+        }
+    }
+
     private void refreshGames() {
-        List<Game> games = GameRepository.loadAll(this);
-        adapter.setGames(games);
-        emptyState.setVisibility(games.isEmpty() ? View.VISIBLE : View.GONE);
-        recycler.setVisibility(games.isEmpty() ? View.GONE : View.VISIBLE);
+        bgExecutor.execute(() -> {
+            List<Game> games = GameRepository.loadAll(MainActivity.this);
+            mainHandler.post(() -> {
+                if (isFinishing() || isDestroyed()) return;
+                adapter.setGames(games);
+                emptyState.setVisibility(games.isEmpty() ? View.VISIBLE : View.GONE);
+                recycler.setVisibility(games.isEmpty() ? View.GONE : View.VISIBLE);
+            });
+        });
     }
 
     @Override
@@ -167,17 +192,88 @@ public class MainActivity extends AppCompatActivity implements GameAdapter.Liste
     }
 
     private void launch(Game game) {
-        BridgeRuntime.ensureInitialized(this);
-        final boolean virtualized = BridgeRuntime.isInstrumentationInstalled();
-        Intent intent = new Intent(this, virtualized
-                ? ProxyGameActivity.class : GameHostActivity.class);
-        intent.putExtra(GuestLauncher.EXTRA_GAME_DIR,
-                GameRepository.gameDir(this, game.directoryName).getAbsolutePath());
-        intent.putExtra(GuestLauncher.EXTRA_GAME_LABEL, game.label);
-        intent.putExtra(GuestLauncher.EXTRA_GUEST_ACTIVITY, game.launcherActivity);
-        Log.i(TAG, "launching " + game.label + " via "
-                + (virtualized ? "ProxyGameActivity (Instrumentation)" : "GameHostActivity"));
-        startActivity(intent);
+        if (game == null) return;
+        showLoading(true);
+        bgExecutor.execute(() -> {
+            try {
+                File dir = GameRepository.gameDir(MainActivity.this, game.directoryName);
+                GuestLauncher.prepareGame(MainActivity.this, dir, game);
+            } catch (Throwable t) {
+                Log.e(TAG, "Failed to prepare game on background thread", t);
+            }
+
+            mainHandler.post(() -> {
+                showLoading(false);
+                final boolean virtualized = BridgeRuntime.isInstrumentationInstalled();
+                Intent intent = new Intent(MainActivity.this, virtualized
+                        ? ProxyGameActivity.class : GameHostActivity.class);
+                intent.putExtra(GuestLauncher.EXTRA_GAME_DIR,
+                        GameRepository.gameDir(MainActivity.this, game.directoryName).getAbsolutePath());
+                intent.putExtra(GuestLauncher.EXTRA_GAME_LABEL, game.label);
+                intent.putExtra(GuestLauncher.EXTRA_GUEST_ACTIVITY, game.launcherActivity);
+                Log.i(TAG, "launching " + game.label + " via "
+                        + (virtualized ? "ProxyGameActivity (Instrumentation)" : "GameHostActivity"));
+                startActivity(intent);
+            });
+        });
+    }
+
+    private void probeHardwareGpu(TextView hardware) {
+        bgExecutor.execute(() -> {
+            String rendererName = null;
+            try {
+                EGLDisplay display = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY);
+                if (display != EGL14.EGL_NO_DISPLAY) {
+                    int[] version = new int[2];
+                    if (EGL14.eglInitialize(display, version, 0, version, 1)) {
+                        int[] configAttr = {
+                                EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+                                EGL14.EGL_SURFACE_TYPE, EGL14.EGL_PBUFFER_BIT,
+                                EGL14.EGL_NONE
+                        };
+                        EGLConfig[] configs = new EGLConfig[1];
+                        int[] numConfigs = new int[1];
+                        if (EGL14.eglChooseConfig(display, configAttr, 0, configs, 0, 1, numConfigs, 0) && numConfigs[0] > 0) {
+                            int[] contextAttr = {
+                                    EGL14.EGL_CONTEXT_CLIENT_VERSION, 2,
+                                    EGL14.EGL_NONE
+                            };
+                            EGLContext context = EGL14.eglCreateContext(display, configs[0], EGL14.EGL_NO_CONTEXT, contextAttr, 0);
+                            if (context != EGL14.EGL_NO_CONTEXT) {
+                                int[] pbufferAttr = {
+                                        EGL14.EGL_WIDTH, 1,
+                                        EGL14.EGL_HEIGHT, 1,
+                                        EGL14.EGL_NONE
+                                };
+                                EGLSurface surface = EGL14.eglCreatePbufferSurface(display, configs[0], pbufferAttr, 0);
+                                if (surface != EGL14.EGL_NO_SURFACE) {
+                                    if (EGL14.eglMakeCurrent(display, surface, surface, context)) {
+                                        rendererName = GLES20.glGetString(GLES20.GL_RENDERER);
+                                        EGL14.eglMakeCurrent(display, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT);
+                                    }
+                                    EGL14.eglDestroySurface(display, surface);
+                                }
+                                EGL14.eglDestroyContext(display, context);
+                            }
+                        }
+                        EGL14.eglTerminate(display);
+                    }
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "Hardware GPU probe failed", t);
+            }
+
+            final String gpu = rendererName;
+            mainHandler.post(() -> {
+                if (isFinishing() || isDestroyed()) return;
+                String abi = abiLabel();
+                if (gpu != null && !gpu.isEmpty()) {
+                    hardware.setText(abi + " \u2022 " + gpu);
+                } else {
+                    hardware.setText(getString(R.string.hardware_active, abi));
+                }
+            });
+        });
     }
 
     private void showEngineSettings() {

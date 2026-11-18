@@ -4,10 +4,35 @@
   <desc id="desc">Obsidian banner with an electric cyan and warm amber infinity-bridge emblem, the Zai-Bridge wordmark, subtitle and architecture badges.</desc>
 
   <defs>
+    <style>
+      @keyframes emblemGlow {
+        0%, 100% {
+          filter: drop-shadow(0 0 10px rgba(0, 229, 255, 0.45)) drop-shadow(0 0 20px rgba(0, 229, 255, 0.25));
+        }
+        50% {
+          filter: drop-shadow(0 0 22px rgba(0, 229, 255, 0.85)) drop-shadow(0 0 35px rgba(255, 179, 0, 0.45));
+        }
+      }
+      @keyframes dashMove {
+        to { stroke-dashoffset: -60; }
+      }
+      @keyframes pulseGlow {
+        0%, 100% { opacity: 0.18; transform: scale(0.98); }
+        50% { opacity: 0.32; transform: scale(1.02); }
+      }
+      .glow-emblem {
+        animation: emblemGlow 3.5s ease-in-out infinite;
+      }
+      .anim-cable {
+        stroke-dasharray: 6 4;
+        animation: dashMove 2s linear infinite;
+      }
+    </style>
+
     <linearGradient id="canvas" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#0B0E14"/>
-      <stop offset="0.55" stop-color="#0C111B"/>
-      <stop offset="1" stop-color="#0B0E14"/>
+      <stop offset="0" stop-color="#080B10"/>
+      <stop offset="0.55" stop-color="#0D121B"/>
+      <stop offset="1" stop-color="#080B10"/>
     </linearGradient>
     <linearGradient id="infinity" x1="0" y1="0" x2="1" y2="0.2">
       <stop offset="0" stop-color="#00E5FF"/>
@@ -23,11 +48,11 @@
       <stop offset="1" stop-color="#FFB300" stop-opacity="0"/>
     </linearGradient>
     <radialGradient id="cyanGlow" cx="0.5" cy="0.5" r="0.5">
-      <stop offset="0" stop-color="#00E5FF" stop-opacity="0.22"/>
+      <stop offset="0" stop-color="#00E5FF" stop-opacity="0.28"/>
       <stop offset="1" stop-color="#00E5FF" stop-opacity="0"/>
     </radialGradient>
     <radialGradient id="amberGlow" cx="0.5" cy="0.5" r="0.5">
-      <stop offset="0" stop-color="#FFB300" stop-opacity="0.16"/>
+      <stop offset="0" stop-color="#FFB300" stop-opacity="0.22"/>
       <stop offset="1" stop-color="#FFB300" stop-opacity="0"/>
     </radialGradient>
     <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
@@ -48,18 +73,20 @@
     <circle cx="1030" cy="250" r="240" fill="url(#amberGlow)"/>
     <rect x="0.5" y="0.5" width="1279" height="359" rx="22" fill="none" stroke="#263042"/>
 
-    <!-- Emblem: two interlocking loops forming an infinity bridge -->
-    <g filter="url(#soft)" opacity="0.55">
+    <!-- Emblem: two interlocking loops forming an infinity bridge with CSS glow animation -->
+    <g class="glow-emblem">
+      <g filter="url(#soft)" opacity="0.6">
+        <path d="M150 176C150 122 214 118 252 158c34 36 58 44 76 44 34 0 58-26 58-58s-24-58-58-58c-18 0-42 8-76 44-38 40-102 36-102-18"
+              fill="none" stroke="url(#infinity)" stroke-width="14" stroke-linecap="round"/>
+      </g>
       <path d="M150 176C150 122 214 118 252 158c34 36 58 44 76 44 34 0 58-26 58-58s-24-58-58-58c-18 0-42 8-76 44-38 40-102 36-102-18"
-            fill="none" stroke="url(#infinity)" stroke-width="12" stroke-linecap="round"/>
+            fill="none" stroke="url(#infinity)" stroke-width="7" stroke-linecap="round"/>
     </g>
-    <path d="M150 176C150 122 214 118 252 158c34 36 58 44 76 44 34 0 58-26 58-58s-24-58-58-58c-18 0-42 8-76 44-38 40-102 36-102-18"
-          fill="none" stroke="url(#infinity)" stroke-width="7" stroke-linecap="round"/>
 
     <!-- Bridge deck and pylons -->
     <path d="M132 214H496" stroke="#263042" stroke-width="2"/>
     <path d="M214 214V190M290 214V178M366 214V190" stroke="#FFB300" stroke-opacity="0.85" stroke-width="2.5" stroke-linecap="round"/>
-    <path d="M214 190L252 158M290 178L316 160M366 190L332 162" stroke="#00E5FF" stroke-opacity="0.5" stroke-width="1.5"/>
+    <path d="M214 190L252 158M290 178L316 160M366 190L332 162" stroke="#00E5FF" stroke-opacity="0.65" stroke-width="1.8" class="anim-cable"/>
 
     <!-- Wordmark -->
     <text x="556" y="146" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="66" font-weight="700" letter-spacing="1.5" fill="url(#wordmark)">ZAI-BRIDGE</text>
@@ -94,8 +121,8 @@
 
     <!-- Version chip -->
     <g font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif">
-      <rect x="1124" y="42" width="104" height="30" rx="15" fill="#0E1420" stroke="#00E5FF" stroke-opacity="0.35"/>
-      <text x="1176" y="62" font-size="12" font-weight="700" fill="#00E5FF" text-anchor="middle" letter-spacing="1">v2.0.0</text>
+      <rect x="1124" y="42" width="104" height="30" rx="15" fill="#0E1420" stroke="#00E5FF" stroke-opacity="0.5"/>
+      <text x="1176" y="62" font-size="12" font-weight="700" fill="#00E5FF" text-anchor="middle" letter-spacing="1">v2.2.0</text>
     </g>
   </g>
 </svg>

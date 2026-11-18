@@ -229,4 +229,41 @@
         app:iconTint="@color/zb_on_accent"
         app:rippleColor="#3304121A" />
 
+    <!-- Loading Overlay for background game staging -->
+    <LinearLayout
+        android:id="@+id/loading_overlay"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#D00A0F14"
+        android:clickable="true"
+        android:focusable="true"
+        android:gravity="center"
+        android:orientation="vertical"
+        android:visibility="gone">
+
+        <ProgressBar
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:indeterminateTint="@color/zb_accent" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:letterSpacing="0.04"
+            android:text="Preparing Game Engine..."
+            android:textColor="@color/zb_text"
+            android:textSize="15sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:letterSpacing="0.02"
+            android:text="Staging 32-bit runtime arena and assets"
+            android:textColor="@color/zb_text_dim"
+            android:textSize="12sp" />
+    </LinearLayout>
+
 </FrameLayout>

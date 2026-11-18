@@ -147,25 +147,29 @@ public final class GuestLauncher {
                 Log.w(TAG, "game.apk could not be made read-only; ART may refuse it");
             }
 
-            // On a 32-bit host the payload is a real loadable .so, so the class
-            // loader must answer System.loadLibrary normally. Only the 64-bit
-            // translation builds redirect it to the bridge runtime.
-            final String hostLibrary = UnicornBridge.isPassthrough()
-                    ? null : GuestDexLoader.hostBridgeLibrary(ctx);
-            // The alias directory is also the loader's native library search
-            // path: Android resolves a library's DT_NEEDED entries inside the
-            // class loader's namespace, so libc++_shared.so has to live there.
-            final File nativeDir = new File(gameDir, "native");
-            // Real legacy support classes (android.support.v4 and the APK
-            // Expansion downloader/zip_file libraries) are parent-first: the
-            // guest dex never has to define them, so an old APK that assumes
-            // they are on the boot class path gets a normal resolution.
-            final ClassLoader support = GuestDexLoader.legacyParent(
-                    ctx, GuestLauncher.class.getClassLoader());
-            ClassLoader loader = new GuestDexLoader(apk.getAbsolutePath(),
-                    optimized.getAbsolutePath(), nativeDir.getAbsolutePath(),
-                    support, hostLibrary, nativeDir);
-            guestLoader = loader;
+            ClassLoader loader = guestLoader;
+            if (loader == null || !gameDir.equals(guestGameDir)) {
+                // On a 32-bit host the payload is a real loadable .so, so the class
+                // loader must answer System.loadLibrary normally. Only the 64-bit
+                // translation builds redirect it to the bridge runtime.
+                final String hostLibrary = UnicornBridge.isPassthrough()
+                        ? null : GuestDexLoader.hostBridgeLibrary(ctx);
+                // The alias directory is also the loader's native library search
+                // path: Android resolves a library's DT_NEEDED entries inside the
+                // class loader's namespace, so libc++_shared.so has to live there.
+                final File nativeDir = new File(gameDir, "native");
+                // Real legacy support classes (android.support.v4 and the APK
+                // Expansion downloader/zip_file libraries) are parent-first: the
+                // guest dex never has to define them, so an old APK that assumes
+                // they are on the boot class path gets a normal resolution.
+                final ClassLoader support = GuestDexLoader.legacyParent(
+                        ctx, GuestLauncher.class.getClassLoader());
+                loader = new GuestDexLoader(apk.getAbsolutePath(),
+                        optimized.getAbsolutePath(), nativeDir.getAbsolutePath(),
+                        support, hostLibrary, nativeDir);
+                guestLoader = loader;
+                UnicornBridge.setGuestLoader(loader);
+            }
             Thread.currentThread().setContextClassLoader(loader);
 
             final boolean hasPayload = hasNativePayload(new File(gameDir, "payload"));
@@ -187,6 +191,43 @@ public final class GuestLauncher {
         } catch (Throwable t) {
             Log.e(TAG, "guest Activity could not be created", t);
             return null;
+        }
+    }
+
+    /**
+     * Prepares runtime extraction, guest dex loading, and initializes the native session
+     * in the background before launching the Activity, avoiding UI thread ANRs.
+     */
+    public static void prepareGame(Context ctx, File gameDir, Game game) {
+        BridgeRuntime.ensureInitialized(ctx);
+        if (gameDir == null || !gameDir.isDirectory()) return;
+
+        guestGameDir = gameDir;
+        String pkg = game != null && game.packageName != null ? game.packageName : gameDir.getName();
+        guestPackage = pkg;
+
+        File apk = new File(gameDir, "game.apk");
+        if (!apk.isFile()) return;
+
+        File optimized = new File(gameDir, "odex");
+        optimized.mkdirs();
+        if (apk.canWrite() && !apk.setReadOnly()) {
+            Log.w(TAG, "game.apk could not be made read-only");
+        }
+
+        final String hostLibrary = UnicornBridge.isPassthrough() ? null : GuestDexLoader.hostBridgeLibrary(ctx);
+        final File nativeDir = new File(gameDir, "native");
+        final ClassLoader support = GuestDexLoader.legacyParent(ctx, GuestLauncher.class.getClassLoader());
+
+        ClassLoader loader = new GuestDexLoader(apk.getAbsolutePath(),
+                optimized.getAbsolutePath(), nativeDir.getAbsolutePath(),
+                support, hostLibrary, nativeDir);
+        guestLoader = loader;
+        UnicornBridge.setGuestLoader(loader);
+
+        final boolean hasPayload = hasNativePayload(new File(gameDir, "payload"));
+        if (hasPayload) {
+            openNativeSession(ctx, gameDir, game, pkg, loader);
         }
     }
 
