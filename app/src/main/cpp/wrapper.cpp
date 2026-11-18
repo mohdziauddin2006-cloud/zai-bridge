@@ -55,6 +55,11 @@
 #include <SLES/OpenSLES.h>
 #include <SLES/OpenSLES_Android.h>
 
+#include "cpu_compat.h"
+#include "egl_config_fallback.h"
+#include "gl_shader_patcher.h"
+#include "gpu_compositor.h"
+
 #include <dirent.h>
 #include <dlfcn.h>
 #include <elf.h>
@@ -1452,6 +1457,8 @@ public:
         payload_dir_ = root + "/payload";
         obb_dir_ = root + "/obb";
         data_dir_ = root + "/data";
+        // Synthetic /proc/cpuinfo: every SoC's guest sees ARMv7-A + NEON.
+        virtual_cpuinfo_ = zai::cpu::virtual_cpuinfo_path(data_dir_);
         ::mkdir(game_root_.c_str(), 0700);
         ::mkdir(obb_dir_.c_str(), 0700);
         ::mkdir(data_dir_.c_str(), 0700);
@@ -2723,8 +2730,11 @@ private:
     }
 
     uint32_t imp_open() {
-        const std::string path = translate_path(guest_string(arg(0)), "open");
-        const int fd = ::open(path.c_str(), static_cast<int>(arg(1)),
+        std::string path = translate_path(guest_string(arg(0)), "open");
+        const bool cpuinfo = is_proc_cpuinfo(path) && !virtual_cpuinfo_.empty();
+        if (cpuinfo) path = virtual_cpuinfo_;
+        const int fd = ::open(path.c_str(),
+                              cpuinfo ? O_RDONLY : static_cast<int>(arg(1)),
                               static_cast<int>(arg(2)));
         if (fd < 0) {
             LOGW("open(%s) -> %s", path.c_str(), strerror(errno));
@@ -2826,8 +2836,16 @@ private:
     }
 
     uint32_t imp_fopen() {
-        const std::string path = translate_path(guest_string(arg(0)), "fopen");
+        std::string path = translate_path(guest_string(arg(0)), "fopen");
         const std::string mode = guest_string(arg(1));
+        // A read-only probe of /proc/cpuinfo is served from the synthetic
+        // file; a write attempt still opens the real (host) path so nothing
+        // silently succeeds where the kernel would refuse.
+        const bool cpuinfo = is_proc_cpuinfo(path) && !virtual_cpuinfo_.empty() &&
+                             mode.find('w') == std::string::npos &&
+                             mode.find('a') == std::string::npos &&
+                             mode.find('+') == std::string::npos;
+        if (cpuinfo) path = virtual_cpuinfo_;
         FILE* f = ::fopen(path.c_str(), mode.c_str());
         if (!f) {
             LOGW("fopen(%s, %s) -> %s", path.c_str(), mode.c_str(), strerror(errno));
@@ -2915,13 +2933,20 @@ private:
     }
 
     uint32_t imp_sysconf() {
+        // The guest is told about the host's real cores. A legacy engine sizes
+        // its job/batching pools from these values, so a hard-coded 4 was both
+        // wrong on an 8-core Dimensity and a bottleneck on a 4-core part.
         switch (static_cast<int>(arg(0))) {
             case 39: return 4096;    // _SC_PAGESIZE
             case 30: return 4096;    // _SC_PAGE_SIZE
-            case 96:                 // _SC_NPROCESSORS_CONF
-            case 97: return 4;       // _SC_NPROCESSORS_ONLN
+            case 96: return static_cast<uint32_t>(zai::cpu::topology().cores_conf);
+            case 97: return static_cast<uint32_t>(zai::cpu::topology().cores_online);
             default: return 1;       // a plausible "supported" answer
         }
+    }
+
+    bool is_proc_cpuinfo(const std::string& path) const {
+        return path == "/proc/cpuinfo" || path == "/proc/self/cpuinfo";
     }
 
     // bionic ARM32 struct statfs, filled from the host's statvfs.
@@ -3084,6 +3109,58 @@ private:
         }
     }
 
+    int host_gles_major() {
+        if (gles_major_ != 0) return gles_major_;
+        gles_major_ = 2;
+        auto fn = gl_proc<const GLubyte* (*)(GLenum)>("glGetString");
+        if (fn) {
+            const char* version = reinterpret_cast<const char*>(fn(GL_VERSION));
+            if (version && version[0] >= '1' && version[0] <= '3') {
+                gles_major_ = version[0] - '0';
+            }
+        }
+        LOGI("host GLES major: %d", gles_major_);
+        return gles_major_;
+    }
+
+    // Binds the compositor's offscreen target when internal resolution scaling
+    // is active, so the guest renders at 50-75% and eglSwapBuffers resolves it
+    // to the physical display. When scaling is off the guest keeps drawing
+    // straight into the window and the compositor only post-processes.
+    void attach_compositor_target(EGLDisplay display, EGLSurface surface) {
+        zai::GpuCompositor& compositor = zai::GpuCompositor::instance();
+        compositor_bound_ = false;
+        compositor_fbo_ = 0;
+        compositor_scale_ = 1.0f;
+        current_fbo_ = 0;
+        if (!compositor.active() || !compositor.internal_scaling() ||
+            surface == EGL_NO_SURFACE) {
+            compositor.release_internal_target();
+            return;
+        }
+
+        auto query = gl_proc<EGLBoolean (*)(EGLDisplay, EGLSurface, EGLint, EGLint*)>(
+                "eglQuerySurface");
+        EGLint width = 0, height = 0;
+        if (!query || query(display, surface, EGL_WIDTH, &width) != EGL_TRUE ||
+            query(display, surface, EGL_HEIGHT, &height) != EGL_TRUE ||
+            width <= 0 || height <= 0) {
+            return;
+        }
+
+        int internal_w = 0, internal_h = 0;
+        const GLuint fbo = compositor.bind_internal_target(width, height,
+                                                          &internal_w, &internal_h);
+        if (fbo == 0) return;
+
+        compositor_bound_ = true;
+        compositor_fbo_ = fbo;
+        current_fbo_ = fbo;
+        compositor_scale_ = static_cast<float>(internal_w) / static_cast<float>(width);
+        LOGI("compositor: guest renders into FBO %u at %dx%d (display %dx%d, %.0f%%)",
+             fbo, internal_w, internal_h, width, height, compositor_scale_ * 100.0f);
+    }
+
     void install_graphics_handlers() {
         if (!egl_lib_) {
             LOGW("graphics: host libEGL.so unavailable; EGL imports stay stubbed");
@@ -3147,8 +3224,18 @@ private:
             const EGLint want = static_cast<EGLint>(arg(3));
             std::vector<EGLConfig> configs(want > 0 ? static_cast<size_t>(want) : 1);
             EGLint num = 0;
-            const EGLBoolean ok = fn(guest_display(arg(0)), attribs.data(),
-                                     configs.data(), want, &num);
+            int strategy = 0;
+            // A guest asking for RGB565 + legacy attributes can match nothing
+            // on a modern driver. choose_config() retries with RGBA8888 and a
+            // real depth buffer before giving up, so the guest never sees
+            // "IllegalArgumentException: No config chosen".
+            const EGLBoolean ok = zai::eglc::choose_config(
+                    fn, guest_display(arg(0)), attribs, configs.data(), want, &num,
+                    &strategy);
+            if (strategy != 0) {
+                LOGI("eglChooseConfig: %s (%d configs)",
+                     zai::eglc::strategy_name(strategy), num);
+            }
             if (arg(4)) emu_.write_u32(arg(4), static_cast<uint32_t>(num));
             if (arg(2) && want > 0) {
                 for (EGLint i = 0; i < std::min(num, want); ++i) {
@@ -3231,16 +3318,59 @@ private:
                                      static_cast<EGLSurface>(from_guest_ref(arg(2))),
                                      static_cast<EGLContext>(from_guest_ref(arg(3))));
             LOGI("eglMakeCurrent -> %d", ok);
+            if (ok) {
+                attach_compositor_target(guest_display(arg(0)),
+                                         static_cast<EGLSurface>(from_guest_ref(arg(1))));
+            }
             return static_cast<uint32_t>(ok);
         };
 
         import_handlers_["eglSwapBuffers"] = [this] {
             auto fn = gl_proc<EGLBoolean (*)(EGLDisplay, EGLSurface)>("eglSwapBuffers");
             if (!fn) return 0u;
-            const EGLBoolean ok = fn(guest_display(arg(0)),
-                                     static_cast<EGLSurface>(from_guest_ref(arg(1))));
+            const EGLDisplay dpy = guest_display(arg(0));
+            const EGLSurface surf = static_cast<EGLSurface>(from_guest_ref(arg(1)));
+
+            // A settings change from the in-game quick menu is applied here:
+            // the internal target is re-created at the newly requested scale.
+            {
+                zai::GpuCompositor& comp = zai::GpuCompositor::instance();
+                const bool want_internal = comp.active() && comp.internal_scaling();
+                const float wanted =
+                        want_internal ? comp.config().scale_percent / 100.0f : 1.0f;
+                if (want_internal &&
+                    (!compositor_bound_ ||
+                     std::fabs(wanted - compositor_scale_) > 0.01f)) {
+                    attach_compositor_target(dpy, surf);
+                } else if (!want_internal && compositor_bound_) {
+                    comp.release_internal_target();
+                    compositor_bound_ = false;
+                    compositor_fbo_ = 0;
+                    compositor_scale_ = 1.0f;
+                    current_fbo_ = 0;
+                }
+            }
+
+            // The compositor resolves the guest frame to the physical surface
+            // and, when frame generation is on, presents F_{t-0.5} first.
+            zai::GpuCompositor& compositor = zai::GpuCompositor::instance();
+            const bool composited = compositor.begin(dpy, surf, compositor_bound_);
+            if (composited) {
+                ++swap_count_;
+                if (compositor.frame_generation() && compositor.present_intermediate()) {
+                    fn(dpy, surf);                  // intermediate frame
+                    compositor.wait_half_frame();
+                    compositor.present_current();   // real frame
+                } else {
+                    compositor.present_current();
+                }
+                compositor.end_frame();
+            }
+
+            const EGLBoolean ok = fn(dpy, surf);
             if (swap_count_ <= 10 || swap_count_ % 30 == 0) {
-                LOGI("eglSwapBuffers #%u -> %d", swap_count_, ok);
+                LOGI("eglSwapBuffers #%u -> %d%s", swap_count_, ok,
+                     composited ? " (composited)" : "");
             }
             return static_cast<uint32_t>(ok);
         };
@@ -3350,12 +3480,6 @@ private:
         ZB_GL_V("glClearColor", (GLfloat, GLfloat, GLfloat, GLfloat),
                 (f_arg(0), f_arg(1), f_arg(2), f_arg(3)));
         ZB_GL_V("glClear", (GLbitfield), (static_cast<GLbitfield>(arg(0))));
-        ZB_GL_V("glViewport", (GLint, GLint, GLint, GLint),
-                (static_cast<GLint>(arg(0)), static_cast<GLint>(arg(1)),
-                 static_cast<GLint>(arg(2)), static_cast<GLint>(arg(3))));
-        ZB_GL_V("glScissor", (GLint, GLint, GLint, GLint),
-                (static_cast<GLint>(arg(0)), static_cast<GLint>(arg(1)),
-                 static_cast<GLint>(arg(2)), static_cast<GLint>(arg(3))));
         ZB_GL_V("glEnable", (GLenum), (static_cast<GLenum>(arg(0))));
         ZB_GL_V("glDisable", (GLenum), (static_cast<GLenum>(arg(0))));
         ZB_GL_V("glBlendFunc", (GLenum, GLenum),
@@ -3381,8 +3505,6 @@ private:
         ZB_GL_V("glBindBuffer", (GLenum, GLuint),
                 (static_cast<GLenum>(arg(0)), static_cast<GLuint>(arg(1))));
         ZB_GL_V("glBindTexture", (GLenum, GLuint),
-                (static_cast<GLenum>(arg(0)), static_cast<GLuint>(arg(1))));
-        ZB_GL_V("glBindFramebuffer", (GLenum, GLuint),
                 (static_cast<GLenum>(arg(0)), static_cast<GLuint>(arg(1))));
         ZB_GL_V("glBindRenderbuffer", (GLenum, GLuint),
                 (static_cast<GLenum>(arg(0)), static_cast<GLuint>(arg(1))));
@@ -3436,13 +3558,70 @@ private:
 #undef ZB_GL_V
 #undef ZB_GL_R
 
+        // ---- compositor-aware framebuffer / viewport redirection ---------
+        // While internal scaling is active the guest's "default framebuffer"
+        // is the compositor's offscreen target, and every viewport/scissor it
+        // sets in display coordinates is scaled into that target. Guest-owned
+        // FBOs (shadow maps, render-to-texture) are left completely alone.
+        import_handlers_["glBindFramebuffer"] = [this] {
+            auto fn = gl_proc<void (*)(GLenum, GLuint)>("glBindFramebuffer");
+            const GLenum target = static_cast<GLenum>(arg(0));
+            GLuint id = static_cast<GLuint>(arg(1));
+            if (compositor_bound_ && id == 0 && target == GL_FRAMEBUFFER) {
+                id = compositor_fbo_;
+            }
+            current_fbo_ = id;
+            if (fn) fn(target, id);
+            return 0u;
+        };
+
+        import_handlers_["glViewport"] = [this] {
+            auto fn = gl_proc<void (*)(GLint, GLint, GLint, GLint)>("glViewport");
+            GLint x = static_cast<GLint>(arg(0));
+            GLint y = static_cast<GLint>(arg(1));
+            GLint w = static_cast<GLint>(arg(2));
+            GLint h = static_cast<GLint>(arg(3));
+            if (compositor_bound_ && current_fbo_ == compositor_fbo_) {
+                x = static_cast<GLint>(x * compositor_scale_);
+                y = static_cast<GLint>(y * compositor_scale_);
+                w = static_cast<GLint>(w * compositor_scale_);
+                h = static_cast<GLint>(h * compositor_scale_);
+            }
+            if (fn) fn(x, y, w, h);
+            return 0u;
+        };
+
+        import_handlers_["glScissor"] = [this] {
+            auto fn = gl_proc<void (*)(GLint, GLint, GLint, GLint)>("glScissor");
+            GLint x = static_cast<GLint>(arg(0));
+            GLint y = static_cast<GLint>(arg(1));
+            GLint w = static_cast<GLint>(arg(2));
+            GLint h = static_cast<GLint>(arg(3));
+            if (compositor_bound_ && current_fbo_ == compositor_fbo_) {
+                x = static_cast<GLint>(x * compositor_scale_);
+                y = static_cast<GLint>(y * compositor_scale_);
+                w = static_cast<GLint>(w * compositor_scale_);
+                h = static_cast<GLint>(h * compositor_scale_);
+            }
+            if (fn) fn(x, y, w, h);
+            return 0u;
+        };
+
         // Strings come from the host driver as 64-bit pointers; copy them into
         // guest memory instead of truncating them into R0.
         import_handlers_["glGetString"] = [this] {
             auto fn = gl_proc<const GLubyte* (*)(GLenum)>("glGetString");
             if (!fn) return 0u;
-            const char* s = reinterpret_cast<const char*>(fn(static_cast<GLenum>(arg(0))));
-            return s ? guest_str(s) : 0u;
+            const GLenum name = static_cast<GLenum>(arg(0));
+            const char* s = reinterpret_cast<const char*>(fn(name));
+            if (!s) return 0u;
+            // Expose the standard OES/EXT set a legacy title probes for, even
+            // when a vendor driver leaves it out of the ES2 extension string.
+            if (name == GL_EXTENSIONS) {
+                const std::string merged = zai::glsl::merge_extensions(s);
+                return guest_str(merged);
+            }
+            return guest_str(s);
         };
         import_handlers_["glGetStringi"] = [this] {
             auto fn = gl_proc<const GLubyte* (*)(GLenum, GLuint)>("glGetStringi");
@@ -3580,7 +3759,24 @@ private:
                 }
                 strings[slot] = storage[slot].data();
             }
-            fn(static_cast<GLuint>(arg(0)), count, strings.data(), nullptr);
+            // Normalise before the driver sees it: missing precision header,
+            // desktop #version, legacy syntax on a strict ES3 context.
+            std::string combined;
+            for (GLsizei i = 0; i < count; ++i) {
+                combined.append(storage[static_cast<size_t>(i)].data(),
+                                storage[static_cast<size_t>(i)].size());
+            }
+            zai::glsl::Stage stage = zai::glsl::Stage::Fragment;
+            auto type_fn = gl_proc<void (*)(GLuint, GLenum, GLint*)>("glGetShaderiv");
+            if (type_fn) {
+                GLint shader_type = 0x8B30;   // GL_FRAGMENT_SHADER
+                type_fn(static_cast<GLuint>(arg(0)), 0x8B4F, &shader_type);  // GL_SHADER_TYPE
+                if (shader_type == 0x8B31) stage = zai::glsl::Stage::Vertex;
+            }
+            const zai::glsl::Patch patch = zai::glsl::patch_shader_source(
+                    combined, stage, host_gles_major());
+            const GLchar* text = patch.source.c_str();
+            fn(static_cast<GLuint>(arg(0)), 1, &text, nullptr);
             return 0u;
         };
 
@@ -5378,9 +5574,13 @@ private:
         import_handlers_["open64"]  = [this] { return imp_open(); };
         import_handlers_["__open_2"] = [this] { return imp_open(); };
         import_handlers_["openat"] = [this] {
-            const std::string p = translate_path(guest_string(arg(1)), "openat");
-            const int fd = ::openat(static_cast<int>(arg(0)), p.c_str(),
-                                    static_cast<int>(arg(2)), static_cast<int>(arg(3)));
+            std::string p = translate_path(guest_string(arg(1)), "openat");
+            const bool cpuinfo = is_proc_cpuinfo(p) && !virtual_cpuinfo_.empty();
+            if (cpuinfo) p = virtual_cpuinfo_;
+            const int fd = ::openat(cpuinfo ? AT_FDCWD : static_cast<int>(arg(0)),
+                                    p.c_str(),
+                                    cpuinfo ? O_RDONLY : static_cast<int>(arg(2)),
+                                    static_cast<int>(arg(3)));
             if (fd < 0) return static_cast<uint32_t>(-1);
             const uint32_t g = next_handle_++;
             fd_map_[g] = fd;
@@ -5749,6 +5949,16 @@ private:
         import_handlers_["__assert2"] = [this] { return imp_assert2(); };
         import_handlers_["__assert"] = [this] { return imp_assert2(); };
         import_handlers_["sysconf"] = [this] { return imp_sysconf(); };
+        // ARMv7 capability words. A guest that probes AT_HWCAP instead of
+        // parsing cpuinfo must reach the same NEON-capable conclusion on
+        // Snapdragon, Dimensity, Exynos, Tensor, Kirin and Unisoc parts.
+        import_handlers_["getauxval"] = [this] {
+            switch (static_cast<int>(arg(0))) {
+                case 16: return zai::cpu::guest_hwcap();    // AT_HWCAP
+                case 26: return zai::cpu::guest_hwcap2();   // AT_HWCAP2
+                default: return 0u;                          // AT_PAGESZ etc.
+            }
+        };
         import_handlers_["getenv"] = [this] {
             LOGI("getenv(%s) -> (unset)", safe_guest_string(arg(0), "getenv").c_str());
             return 0u;
@@ -6823,6 +7033,13 @@ private:
 
     uint32_t swap_count_ = 0;
     uint32_t egl_window_surfaces_ = 0;
+    // GPU compositor / universal-compatibility state
+    bool     compositor_bound_ = false;
+    GLuint   compositor_fbo_ = 0;
+    float    compositor_scale_ = 1.0f;
+    GLuint   current_fbo_ = 0;
+    int      gles_major_ = 0;
+    std::string virtual_cpuinfo_;
     std::map<std::string, uint32_t> entry_points_;
     jobject guest_thiz_ = nullptr;
 
@@ -7008,6 +7225,15 @@ Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeStartSession(
     // already produced. Both are consumed by the EGL window-surface handler.
     g_bridge->set_game_context(dir, pkg);
     g_bridge->set_host_window(g_host_window.load());
+
+    // ---- Universal CPU compatibility -------------------------------------
+    // Detect the big.LITTLE layout once, pin this thread to the performance
+    // cluster, and publish the synthetic /proc/cpuinfo the guest reads. This
+    // runs before any payload constructor, so an engine that decides its code
+    // path from CPU features sees ARMv7-A + VFPv3-D32 + NEON on every SoC.
+    zai::cpu::topology();
+    zai::cpu::pin_current_thread_to_performance();
+    LOGI("cpu compatibility: %s", zai::cpu::summary().c_str());
 
     // ---- Phase 1: map every ingested ARM32 payload -------------------------
     const std::string payload_dir = dir + "/payload";

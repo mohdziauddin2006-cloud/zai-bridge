@@ -64,11 +64,17 @@ public class GameAdapter extends BaseAdapter {
         Holder holder = (Holder) view.getTag();
         holder.name.setText(game.label);
 
+        File dir = GameRepository.gameDir(context, game.directoryName);
         StringBuilder meta = new StringBuilder("32-bit");
         if (game.hasObb()) meta.append(" · OBB");
+        // Only a per-game override is shown here; the global default stays
+        // implicit so the cards do not all repeat the same label.
+        GraphicsSettings graphics = GraphicsSettings.loadGame(dir);
+        if (graphics != null && graphics.active()) {
+            meta.append(" · ").append(graphics.shortLabel());
+        }
         holder.meta.setText(meta);
 
-        File dir = GameRepository.gameDir(context, game.directoryName);
         File icon = game.iconFile.isEmpty() ? null : new File(dir, game.iconFile);
         if (icon != null && icon.isFile()) {
             holder.icon.setImageBitmap(BitmapFactory.decodeFile(icon.getAbsolutePath()));

@@ -16,6 +16,7 @@ import android.view.Window;
 
 import com.ziauddin.zaibridge.data.Game;
 import com.ziauddin.zaibridge.data.GameRepository;
+import com.ziauddin.zaibridge.data.GraphicsSettings;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -119,6 +120,13 @@ public final class GuestLauncher {
             guestPackage = pkg;
             guestGameDir = gameDir;
             guestClass = name;
+
+            // Apply the imported game's upscaler / frame-generation settings
+            // before its renderer is created. The native compositor reads them
+            // on the guest's GL thread at the first swap.
+            GraphicsSettings graphics = GraphicsSettings.forGame(ctx, gameDir);
+            EglSwapHook.configure(graphics.upscaler, graphics.scalePercent,
+                    graphics.sharpnessPercent, graphics.frameGen);
 
             // Legacy ports ship their data as assets/files.zip and unpack it to
             // external storage from a splash Activity. The guest's external

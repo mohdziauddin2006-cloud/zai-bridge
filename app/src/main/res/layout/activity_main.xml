@@ -31,6 +31,22 @@
             android:textColor="@color/zb_text_dim"
             android:textSize="13sp" />
 
+        <!-- Global default for the upscaler / frame-generation pipeline. -->
+        <TextView
+            android:id="@+id/btn_graphics_defaults"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:background="@drawable/bg_status_pill"
+            android:paddingStart="14dp"
+            android:paddingTop="7dp"
+            android:paddingEnd="14dp"
+            android:paddingBottom="7dp"
+            android:text="@string/graphics_defaults"
+            android:textAllCaps="false"
+            android:textColor="@color/zb_accent"
+            android:textSize="11sp" />
+
         <LinearLayout
             android:id="@+id/banner_permission"
             android:layout_width="match_parent"

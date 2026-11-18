@@ -26,4 +26,26 @@
     <string name="bridge_ready">Bridge online — legacy runtime mapped</string>
     <string name="bridge_failed">Bridge error (%1$d). See logcat tag ARM64_WRAPPER.</string>
     <string name="bridge_unavailable">Native core unavailable on this device</string>
+
+    <!-- Graphics pipeline (upscaling + frame generation) -->
+    <string name="graphics_defaults">Graphics defaults</string>
+    <string name="graphics_title">Graphics</string>
+    <string name="graphics_upscaler">Upscaler</string>
+    <string name="graphics_scale">Render resolution</string>
+    <string name="graphics_sharpness">Sharpness</string>
+    <string name="graphics_frame_gen">Frame generation</string>
+    <string name="graphics_off">Off</string>
+    <string name="graphics_sgsr">SGSR (Mobile Edge-Aware)</string>
+    <string name="graphics_fsr">FSR 1.0 (EASU + RCAS)</string>
+    <string name="graphics_scale_50">50% — Performance</string>
+    <string name="graphics_scale_67">67% — Balanced</string>
+    <string name="graphics_scale_75">75% — Quality</string>
+    <string name="graphics_scale_100">100% — Native</string>
+    <string name="graphics_frame_gen_2x">2x Fluid Motion</string>
+    <string name="graphics_save">Save</string>
+    <string name="graphics_use_global">Use global defaults</string>
+    <string name="graphics_saved">Graphics updated</string>
+    <string name="graphics_all">All settings…</string>
+    <string name="graphics_close">Close</string>
+    <string name="graphics_quick">Quick graphics</string>
 </resources>

@@ -14,10 +14,26 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 #                          payload is already the process architecture
 #
 # Both variants export the same JNI surface, so UnicornBridge never branches.
+#
+# Shared by both backends:
+#   egl_swap_hook.cpp     Java EGL/GLES boundary: compositor, config fallback,
+#                         GLSL patcher, extension negotiation
+#   gpu_compositor.cpp    SGSR/FSR upscaling + 2x optical-flow frame generation
+#   cpu_compat.cpp        universal ARMv7/NEON reporting, big.LITTLE pinning
+#   gl_shader_patcher.cpp legacy GLSL normalisation
+#   egl_config_fallback.cpp  driver-agnostic eglChooseConfig negotiation
 # =============================================================================
 if(NOT ANDROID_ABI)
     set(ANDROID_ABI "arm64-v8a")
 endif()
+
+set(ZAI_COMMON_SOURCES
+    egl_swap_hook.cpp
+    gpu_compositor.cpp
+    cpu_compat.cpp
+    gl_shader_patcher.cpp
+    egl_config_fallback.cpp
+)
 
 set(ZAI_TRANSLATING_ABI FALSE)
 if(ANDROID_ABI STREQUAL "arm64-v8a" OR ANDROID_ABI STREQUAL "x86_64")
@@ -45,7 +61,7 @@ if(ZAI_TRANSLATING_ABI)
     # payloads it maps are read per session, never compiled in.
     add_library(wrapper SHARED
         wrapper.cpp
-        egl_swap_hook.cpp
+        ${ZAI_COMMON_SOURCES}
     )
 
     target_link_libraries(wrapper PRIVATE
@@ -54,6 +70,9 @@ if(ZAI_TRANSLATING_ABI)
         log
         dl
         m
+        EGL
+        GLESv2
+        GLESv3
         OpenSLES
     )
 
@@ -61,15 +80,20 @@ if(ZAI_TRANSLATING_ABI)
     # dynamic symbol table: only JNI_OnLoad and the JNI thunks should be exported.
     target_link_options(wrapper PRIVATE "-Wl,--exclude-libs,ALL")
 else()
-    # The Java EGL boundary hook is backend-independent: a 32-bit phone counts
-    # frames exactly the way the 64-bit translation core does.
+    # The same EGL/GLES compatibility and compositor code runs on a 32-bit
+    # host, where the guest payload is the process architecture.
     add_library(wrapper SHARED
         wrapper_passthrough.cpp
-        egl_swap_hook.cpp
+        ${ZAI_COMMON_SOURCES}
     )
     target_link_libraries(wrapper PRIVATE
         android
         log
+        dl
+        m
+        EGL
+        GLESv2
+        GLESv3
     )
     message(STATUS "zai-bridge: ${ANDROID_ABI} uses the native passthrough backend")
 endif()

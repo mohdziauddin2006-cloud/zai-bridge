@@ -50,7 +50,11 @@ zai-bridge/
 │       │   ├── CMakeLists.txt           # translating vs passthrough backend per ABI
 │       │   ├── wrapper.cpp              # the translation core (ELF loader + JNI/EGL/GLES/OpenSL bridge)
 │       │   ├── wrapper_passthrough.cpp  # 32-bit host backend (no translation)
-│       │   ├── egl_swap_hook.cpp        # RegisterNatives hook at the Java EGL boundary
+│       │   ├── egl_swap_hook.cpp        # Java EGL/GLES boundary: compositor, config fallback, shader patch
+│       │   ├── gpu_compositor.cpp       # SGSR/FSR upscaling + 2x optical-flow frame generation
+│       │   ├── cpu_compat.cpp           # ARMv7/NEON reporting, big.LITTLE detection, affinity
+│       │   ├── gl_shader_patcher.cpp    # legacy GLSL normalisation + extension negotiation
+│       │   ├── egl_config_fallback.cpp  # driver-agnostic eglChooseConfig retry
 │       │   └── prebuilt/<abi>/          # libunicorn.a + Unicorn headers (arm64-v8a, x86_64)
 │       ├── java/com/ziauddin/zaibridge/
 │       │   ├── MainActivity.java        # all-files access, APK/OBB pickers, grid
@@ -68,6 +72,8 @@ zai-bridge/
 │       │   │   └── UnicornBridge.java        # Java facade over the native core
 │       │   ├── proxy/ProxyGameActivity.java  # the manifest-declared Activity that is virtualized
 │       │   ├── data/                         # Game, GameRepository, GameAdapter, GameImporter
+│       │   │   └── GraphicsSettings.java     # per-game (meta.json) + global graphics configuration
+│       │   ├── ui/GraphicsSettingsSheet.java # upscaler / scale / sharpness / frame-gen dialog
 │       │   └── service/IngestionService.java
 │       └── res/                         # dark launcher theme, grid cells, adaptive icon
 ├── gradle/wrapper/                      # Gradle 8.14.3 wrapper
@@ -266,6 +272,143 @@ import resolve its system libraries offline.
 
 ---
 
+## 5. Universal mobile CPU & GPU compatibility
+
+### CPU identity and topology (`cpu_compat.cpp`)
+
+The guest never sees the host SoC. It is told, consistently, that it runs on an
+ARMv7-A part with VFPv3-D32 and NEON:
+
+* `/proc/cpuinfo` is virtualised. `open`, `openat` and `fopen` of
+  `/proc/cpuinfo` are redirected to a synthetic file written once under the
+  game's `data/` directory, with one `processor` block per real core and the
+  full ARMv7 feature list (`neon`, `vfpv3`, `vfpv4`, `idiva`, `idivt`, `tls`).
+  Engines that count cores or test NEON there no longer abort or fall back to a
+  software path on Snapdragon, Dimensity/Helio, Exynos, Tensor, Kirin or Unisoc.
+* `getauxval(AT_HWCAP)` and `AT_HWCAP2` return the same capability bits
+  (`HWCAP_NEON`, `VFPv3`, `VFPv4`, TLS, IDIV, LPAE, crypto, CRC32).
+* `sysconf(_SC_NPROCESSORS_CONF/_ONLN)` returns the host's real counts instead
+  of a hard-coded 4.
+
+big.LITTLE / DynamIQ clusters are detected from each core's
+`cpufreq/cpuinfo_max_freq` (falling back to `cpu_capacity`, then to core order).
+The session thread is pinned to the highest-capacity cluster with
+`sched_setaffinity`; Android's cpusets may refuse, in which case the bridge logs
+and runs unpinned rather than failing.
+
+### Driver-agnostic EGL configs (`egl_config_fallback.cpp`)
+
+A legacy request for `RGB565` + alpha/depth attributes can match **zero**
+configs on a modern driver, and the guest then throws
+`IllegalArgumentException: No config chosen`. `eglChooseConfig` is retried with
+progressively relaxed attributes:
+
+| Attempt | Request |
+|---|---|
+| 1 | RGBA8888 (24-bit depth kept) |
+| 2 | RGB888, depth 16, no alpha / multisampling / stencil |
+| 3 | minimal window-renderable RGBA8888 config for the bound API |
+
+This is applied both in the translation core (`wrapper.cpp`) and at the Java
+boundary: `android.opengl.EGL14.eglChooseConfig` is re-registered with
+`RegisterNatives`, and fallback configs are returned as real `EGLConfig`
+objects (JNI may call the private constructor, so no reflection is involved).
+
+### GLSL auto-patching and extension negotiation
+
+`gl_shader_patcher.cpp` normalises every source before the driver sees it, on
+both rendering paths (guest import of `glShaderSource`, and
+`GLES20/GLES30.glShaderSource` for Java renderers):
+
+* injects `precision mediump float;` into fragment shaders that omit it — the
+  most common strict Mali/Adreno rejection;
+* removes desktop `#version 110/120/130/330/…` headers that mobile drivers
+  cannot parse;
+* on a GLES3 context, rewrites legacy `attribute` / `varying` / `texture2D` /
+  `gl_FragColor` to `in` / `out` / `texture` / a declared fragment output;
+* extends `GL_EXTENSIONS` with the standard OES/EXT set every supported GPU
+  class implements (`GL_OES_texture_npot`, `GL_OES_element_index_uint`,
+  `GL_OES_depth24`, `GL_OES_standard_derivatives`, `GL_EXT_frag_depth`, …).
+
+Contexts are reported as the driver reports them; ES 3.2 → 3.0 → 2.0 → 1.1 is
+the guest's own choice through `eglBindAPI`/`eglCreateContext`, all of which are
+forwarded unchanged.
+
+---
+
+## 6. GPU upscaling and 2x frame generation
+
+`gpu_compositor.cpp` owns an offscreen pipeline that runs inside the guest's
+`eglSwapBuffers`, on the guest's own GL thread. It creates no EGL context and
+uses only core GLES2 objects (FBO + RGBA8 textures); all guest GL state it
+touches is saved and restored.
+
+### Spatial upscaling
+
+* **Internal resolution scale** — 50 / 67 / 75 / 100 %. When scaling is active
+  the guest's “default framebuffer” is redirected to an offscreen target at the
+  scaled size, and `glViewport`/`glScissor` are scaled into it. Guest-owned FBOs
+  (shadow maps, render-to-texture) are left untouched.
+* **SGSR** — one pass, 12 edge-adaptive taps (4 axial, 4 diagonal, 4 wide
+  axial) with luminance-difference weighting, plus directional sharpening along
+  the flattest axis. No depth buffer, no motion vectors, no history.
+* **AMD FSR 1.0 style** — EASU directional reconstruction followed by RCAS
+  contrast-adaptive sharpening, clamped to the local neighbourhood to avoid
+  halos. Sharpness is exposed as 0–100 %.
+* **ES 2.0 fallback** — bilinear resolve plus a light unsharp mask. If even that
+  program fails to compile, the compositor disables itself and the guest frame is
+  presented untouched.
+
+Shaders are authored once in GLSL ES 1.00 and promoted to `#version 300 es` on
+GLES3 hosts through the same normaliser used for guest shaders.
+
+### 2x motion-compensated frame generation
+
+1. **Ring buffer** — the previous and current frames stay resident as two RGBA
+   textures (`F_{t-1}`, `F_t`); the roles are swapped, never copied twice.
+2. **Block matching** — one fragment pass, one output pixel per 8x8 block.
+   Nine candidates (centre, four axial, four diagonal at ±6 px) are compared
+   with 2x2 luma taps, producing a per-block 2D motion vector in an RGBA8
+   texture (`RG` = vector, `B` = residual, `A` = confidence).
+3. **HUD / scene-cut rejection** — a block whose best residual is below 0.0022
+   is forced to zero motion (static HUD, subtitles, paused overlays never
+   ghost); a residual above the search threshold yields confidence 0, so cuts
+   and fast cuts fall back to a plain 50/50 blend.
+4. **Synthesis** — `F_{t-0.5}` warps `F_{t-1}` and `F_t` halfway along the
+   vector; where the two warped samples disagree strongly (occlusion) the pixel
+   reverts to the unwarped blend.
+5. **Paced presentation** — the synthetic frame is presented first, then the
+   real frame after roughly half a measured refresh interval. `Surface`
+   frame-rate metadata is raised to 120 Hz where the panel supports it.
+
+Per generated frame the cost is two extra fullscreen passes at block/frame
+resolution. For a 1920x1080 title the motion pass shades 32 400 block pixels,
+which is negligible next to the guest's own scene.
+
+---
+
+## 7. Graphics settings
+
+Three entry points, one persisted configuration:
+
+* **Global defaults** — *Graphics defaults* in the launcher header, stored in
+  `SharedPreferences`.
+* **Per game** — long-press a game card. The override is written to that game's
+  `meta.json` under `graphics`, so it lives and dies with the import.
+* **In game** — a transparent 18 dp strip on the right edge; swipe left to open
+  the quick panel (upscaler, scale, sharpness, 2x toggle, live counters) or tap
+  *All settings…* for the full sheet. Changes apply immediately and are saved
+  per game.
+
+```json
+"graphics": { "upscaler": 1, "scale": 67, "sharpness": 55, "frameGen": 2 }
+```
+
+`upscaler`: 0 = off, 1 = SGSR, 2 = FSR 1.0. `scale`: 50 / 67 / 75 / 100.
+`sharpness`: 0–100. `frameGen`: 0 or 2.
+
+---
+
 ## Build
 
 Requirements:
@@ -346,7 +489,10 @@ genuine, unmodified F-Droid build **Tux Rider 1.0.9**
 
 | Check | Result |
 |---|---|
-| APK installs, 4 ABIs present | yes — `arm64-v8a`, `armeabi-v7a`, `x86_64`, `x86`; 10.8 MB, v2 + v3 signed, 4-byte aligned |
+| APK installs, 4 ABIs present | yes — `arm64-v8a`, `armeabi-v7a`, `x86_64`, `x86`; 11.1 MB, v2 + v3 signed, 4-byte aligned |
+| Universal build (this revision) | yes — `./gradlew assembleDebug` green for all four ABIs; `zipalign -c -p 4` passes; `apksigner verify --print-certs` reports `CN=Zai-Bridge Universal` |
+| Compositor packaged in every ABI | yes — `sgsr12`, `fsr_easu_rcas`, `blockmatch_8x8` and `motion_synth` program labels are present in `libwrapper.so` for `arm64-v8a`, `armeabi-v7a`, `x86` and `x86_64` |
+| Runtime shader compilation | **not exercised in this environment** — no GPU device or emulator was attached during the build. The runtime compiles SGSR/FSR, falls back to bilinear on failure, and disables the compositor if all three fail, so a driver rejection cannot black-screen a game |
 | `BridgeInstrumentation` installed | yes — `ActivityThread.mInstrumentation -> BridgeInstrumentation` |
 | Guest Activity natively attached | yes — `newActivity(ProxyGameActivity) -> com.drodin.tuxrider.MainActivity`, then `onResume` through `Instrumentation.callActivityOnResume` |
 | No `IllegalStateException: No activity` | yes — none in the run |
@@ -466,6 +612,19 @@ with no ANR.
   `realpath`, `getpwuid`, socket setup); each is logged once as
   `unimplemented import`. `srand48`/`lrand48` and `glClearStencil` are
   implemented because this payload uses them.
+* **Internal resolution scaling is bridged-path only.** A guest that renders
+  through the translation core (NDK/EGL payload) has its default framebuffer and
+  viewport redirected into the scaled target. A Java `GLSurfaceView` title's GL
+  calls are framework-native and are not redirected, so it keeps its native
+  render resolution while still receiving SGSR/FSR sharpening and frame
+  generation.
+* **Frame generation has no disocclusion history.** Static HUD/UI blocks and
+  scene cuts are rejected, and strongly disagreeing warped samples fall back to a
+  plain blend, but a fast object revealing previously hidden background can
+  shimmer for a frame. The pipeline is off by default for that reason.
+* **Compositor state is per-context.** A destroyed and recreated GL context
+  recompiles its programs on the next swap; the first frame after a mode change
+  is presented unwarped (history is reset).
 * **Single session per process.** A second launch reports
   `SESSION_ALREADY_RUNNING`; teardown is not implemented.
 * **Performance.** Interpretation, not JIT.

@@ -26,9 +26,12 @@ import com.ziauddin.zaibridge.core.GuestLauncher;
 import com.ziauddin.zaibridge.data.Game;
 import com.ziauddin.zaibridge.data.GameAdapter;
 import com.ziauddin.zaibridge.data.GameRepository;
+import com.ziauddin.zaibridge.data.GraphicsSettings;
 import com.ziauddin.zaibridge.proxy.ProxyGameActivity;
 import com.ziauddin.zaibridge.service.IngestionService;
+import com.ziauddin.zaibridge.ui.GraphicsSettingsSheet;
 
+import java.io.File;
 import java.util.List;
 
 /**
@@ -63,6 +66,13 @@ public class MainActivity extends Activity {
         adapter = new GameAdapter(this);
         grid.setAdapter(adapter);
         grid.setOnItemClickListener((parent, view, position, id) -> launch(adapter.getItem(position)));
+        // Long-press is the per-game graphics configuration; a tap still plays.
+        grid.setOnItemLongClickListener((parent, view, position, id) -> {
+            showGameGraphics(adapter.getItem(position));
+            return true;
+        });
+        findViewById(R.id.btn_graphics_defaults).setOnClickListener(
+                v -> showGlobalGraphics());
 
         permissionBanner = findViewById(R.id.banner_permission);
         permissionText = findViewById(R.id.tv_permission);
@@ -87,6 +97,43 @@ public class MainActivity extends Activity {
         List<Game> games = GameRepository.loadAll(this);
         adapter.setGames(games);
         findViewById(R.id.empty_state).setVisibility(games.isEmpty() ? View.VISIBLE : View.GONE);
+    }
+
+    // ---------------------------------------------------------------------
+    // Graphics settings (global defaults and per-game overrides)
+    // ---------------------------------------------------------------------
+
+    private void showGlobalGraphics() {
+        GraphicsSettingsSheet.show(this, getString(R.string.graphics_defaults),
+                GraphicsSettings.global(this), false, (settings, useGlobal) -> {
+                    GraphicsSettings.saveGlobal(this, settings);
+                    Toast.makeText(this, R.string.graphics_saved, Toast.LENGTH_SHORT).show();
+                    refreshGames();
+                });
+    }
+
+    private void showGameGraphics(Game game) {
+        final File dir = GameRepository.gameDir(this, game.directoryName);
+        final boolean overridden = GraphicsSettings.loadGame(dir) != null;
+        GraphicsSettingsSheet.show(this,
+                game.label + " — " + getString(R.string.graphics_title),
+                GraphicsSettings.forGame(this, dir), overridden,
+                (settings, useGlobal) -> {
+                    try {
+                        if (useGlobal) {
+                            GraphicsSettings.clearGame(dir);
+                        } else {
+                            GraphicsSettings.saveGame(dir, settings);
+                        }
+                        Toast.makeText(this, R.string.graphics_saved,
+                                Toast.LENGTH_SHORT).show();
+                    } catch (Exception e) {
+                        Log.e(TAG, "graphics settings were not saved", e);
+                        Toast.makeText(this, getString(R.string.import_failed,
+                                e.getMessage()), Toast.LENGTH_LONG).show();
+                    }
+                    refreshGames();
+                });
     }
 
     private void launch(Game game) {
