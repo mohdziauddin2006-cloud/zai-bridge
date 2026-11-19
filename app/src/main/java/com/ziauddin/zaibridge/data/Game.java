@@ -12,13 +12,15 @@ import java.io.IOException;
 import java.io.InputStream;
 
 /**
- * One imported game. Everything here comes from the guest APK's manifest plus
- * the bookkeeping Zai-Bridge wrote during ingestion; the OBB is tracked by name
- * only and is never surfaced by the launcher.
+ * One imported game. Supports both legacy 32-bit ARM games ("unicorn32") and
+ * modern 64-bit / Split-APK installed games ("native64").
  */
 public final class Game {
 
     private static final String TAG = "ZaiBridge";
+
+    public static final String MODE_NATIVE64 = "native64";
+    public static final String MODE_UNICORN32 = "unicorn32";
 
     public final String directoryName;
     public final String packageName;
@@ -35,10 +37,25 @@ public final class Game {
     public final String funcName;
     /** NativeActivity metadata: android.app.lib_name (native library name, e.g. "unity") */
     public final String libName;
+    /** Execution mode: "native64" (direct 64-bit host execution) or "unicorn32" (ARM32 translation) */
+    public final String runtimeMode;
+    /** Number of split APKs bundled alongside base.apk (0 for standalone APK). */
+    public final int splitCount;
 
     public Game(String directoryName, String packageName, String label, String launcherActivity,
                 String orientation, String iconFile, String obbFile, String abi,
                 long importedAt, long sizeBytes, String funcName, String libName) {
+        this(directoryName, packageName, label, launcherActivity, orientation, iconFile,
+                obbFile, abi, importedAt, sizeBytes, funcName, libName,
+                (abi != null && (abi.contains("arm64") || abi.contains("x86_64")))
+                        ? MODE_NATIVE64 : MODE_UNICORN32,
+                0);
+    }
+
+    public Game(String directoryName, String packageName, String label, String launcherActivity,
+                String orientation, String iconFile, String obbFile, String abi,
+                long importedAt, long sizeBytes, String funcName, String libName,
+                String runtimeMode, int splitCount) {
         this.directoryName = directoryName;
         this.packageName = packageName;
         this.label = label;
@@ -52,10 +69,18 @@ public final class Game {
         this.sizeBytes = sizeBytes;
         this.funcName = funcName;
         this.libName = libName;
+        this.runtimeMode = (runtimeMode == null || runtimeMode.isEmpty())
+                ? MODE_UNICORN32 : runtimeMode;
+        this.splitCount = Math.max(0, splitCount);
     }
 
     public boolean hasObb() {
         return obbFile != null && !obbFile.isEmpty();
+    }
+
+    public boolean isNative64() {
+        return MODE_NATIVE64.equalsIgnoreCase(runtimeMode)
+                || (abi != null && (abi.contains("arm64") || abi.contains("x86_64")));
     }
 
     public JSONObject toJson(String directoryName) throws JSONException {
@@ -72,6 +97,8 @@ public final class Game {
         o.put("sizeBytes", sizeBytes);
         o.put("funcName", funcName == null ? "" : funcName);
         o.put("libName", libName == null ? "" : libName);
+        o.put("runtimeMode", runtimeMode);
+        o.put("splitCount", splitCount);
         return o;
     }
 
@@ -84,21 +111,25 @@ public final class Game {
         if (!meta.isFile()) return null;
         try {
             JSONObject o = new JSONObject(readText(meta));
+            String abi = o.optString("abi", "armeabi-v7a");
+            String defaultMode = (abi.contains("arm64") || abi.contains("x86_64")
+                    || new File(dir, "native64").isDirectory())
+                    ? MODE_NATIVE64 : MODE_UNICORN32;
             return new Game(
                     dir.getName(),
                     o.optString("package"),
                     o.optString("label", o.optString("package")),
                     o.optString("launcher"),
-                    // Imports made before orientation was recorded have no key;
-                    // the guest keeps the device's orientation, as they did then.
                     o.optString("orientation", "unspecified"),
                     o.optString("icon"),
                     o.optString("obb"),
-                    o.optString("abi", "armeabi-v7a"),
+                    abi,
                     o.optLong("importedAt", 0L),
                     o.optLong("sizeBytes", 0L),
                     o.optString("funcName", ""),
-                    o.optString("libName", ""));
+                    o.optString("libName", ""),
+                    o.optString("runtimeMode", defaultMode),
+                    o.optInt("splitCount", 0));
         } catch (Exception e) {
             Log.w(TAG, "unreadable game metadata in " + dir.getName(), e);
             return null;

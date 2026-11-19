@@ -64,120 +64,232 @@
                 android:src="@drawable/ic_close" />
         </LinearLayout>
 
-        <!-- APK row -->
+        <!-- Segmented Tab Toggle: From Storage (APK / OBB) | Installed Games (Device) -->
         <LinearLayout
-            android:id="@+id/row_apk"
             android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="20dp"
-            android:background="@drawable/bg_file_row"
-            android:clickable="true"
-            android:focusable="true"
-            android:foreground="?android:attr/selectableItemBackground"
+            android:layout_height="42dp"
+            android:layout_marginTop="16dp"
+            android:background="@drawable/bg_search"
             android:gravity="center_vertical"
             android:orientation="horizontal"
-            android:padding="15dp">
+            android:padding="4dp">
 
-            <ImageView
-                android:layout_width="24dp"
-                android:layout_height="24dp"
-                android:contentDescription="@null"
-                android:src="@drawable/ic_import" />
-
-            <LinearLayout
+            <TextView
+                android:id="@+id/tab_from_storage"
                 android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_marginStart="13dp"
+                android:layout_height="match_parent"
                 android:layout_weight="1"
-                android:orientation="vertical">
+                android:background="@drawable/bg_badge_accent"
+                android:clickable="true"
+                android:focusable="true"
+                android:gravity="center"
+                android:maxLines="1"
+                android:text="@string/import_tab_storage"
+                android:textColor="@color/zb_accent"
+                android:textSize="11.5sp"
+                android:textStyle="bold" />
 
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="@string/select_apk"
-                    android:textColor="@color/zb_text"
-                    android:textSize="13sp"
-                    android:textStyle="bold" />
-
-                <TextView
-                    android:id="@+id/tv_apk_name"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="2dp"
-                    android:ellipsize="middle"
-                    android:maxLines="1"
-                    android:text="@string/select_apk_hint"
-                    android:textColor="@color/zb_text_dim"
-                    android:textSize="11sp" />
-            </LinearLayout>
-
-            <ImageView
-                android:id="@+id/iv_apk_clear"
-                android:layout_width="30dp"
-                android:layout_height="30dp"
-                android:background="?android:attr/selectableItemBackgroundBorderless"
-                android:contentDescription="@string/close"
-                android:padding="7dp"
-                android:src="@drawable/ic_close"
-                android:visibility="gone" />
+            <TextView
+                android:id="@+id/tab_installed_games"
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_marginStart="4dp"
+                android:layout_weight="1"
+                android:clickable="true"
+                android:focusable="true"
+                android:gravity="center"
+                android:maxLines="1"
+                android:text="@string/import_tab_installed"
+                android:textColor="@color/zb_text_dim"
+                android:textSize="11.5sp"
+                android:textStyle="bold" />
         </LinearLayout>
 
-        <!-- OBB row -->
+        <!-- Tab 1: Storage APK + OBB Picker -->
         <LinearLayout
-            android:id="@+id/row_obb"
+            android:id="@+id/container_storage_import"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="10dp"
-            android:background="@drawable/bg_file_row"
-            android:clickable="true"
-            android:focusable="true"
-            android:foreground="?android:attr/selectableItemBackground"
-            android:gravity="center_vertical"
-            android:orientation="horizontal"
-            android:padding="15dp">
+            android:orientation="vertical"
+            android:visibility="visible">
 
-            <ImageView
-                android:layout_width="24dp"
-                android:layout_height="24dp"
-                android:contentDescription="@null"
-                android:src="@drawable/ic_shield" />
-
+            <!-- APK row -->
             <LinearLayout
-                android:layout_width="0dp"
+                android:id="@+id/row_apk"
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginStart="13dp"
-                android:layout_weight="1"
-                android:orientation="vertical">
+                android:layout_marginTop="16dp"
+                android:background="@drawable/bg_file_row"
+                android:clickable="true"
+                android:focusable="true"
+                android:foreground="?android:attr/selectableItemBackground"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:padding="15dp">
 
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="@string/select_obb"
-                    android:textColor="@color/zb_text"
-                    android:textSize="13sp"
-                    android:textStyle="bold" />
+                <ImageView
+                    android:layout_width="24dp"
+                    android:layout_height="24dp"
+                    android:contentDescription="@null"
+                    android:src="@drawable/ic_import" />
 
-                <TextView
-                    android:id="@+id/tv_obb_name"
-                    android:layout_width="match_parent"
+                <LinearLayout
+                    android:layout_width="0dp"
                     android:layout_height="wrap_content"
-                    android:layout_marginTop="2dp"
-                    android:ellipsize="middle"
-                    android:maxLines="1"
-                    android:text="@string/select_obb_hint"
-                    android:textColor="@color/zb_text_dim"
-                    android:textSize="11sp" />
+                    android:layout_marginStart="13dp"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="@string/select_apk"
+                        android:textColor="@color/zb_text"
+                        android:textSize="13sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/tv_apk_name"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="2dp"
+                        android:ellipsize="middle"
+                        android:maxLines="1"
+                        android:text="@string/select_apk_hint"
+                        android:textColor="@color/zb_text_dim"
+                        android:textSize="11sp" />
+                </LinearLayout>
+
+                <ImageView
+                    android:id="@+id/iv_apk_clear"
+                    android:layout_width="30dp"
+                    android:layout_height="30dp"
+                    android:background="?android:attr/selectableItemBackgroundBorderless"
+                    android:contentDescription="@string/close"
+                    android:padding="7dp"
+                    android:src="@drawable/ic_close"
+                    android:visibility="gone" />
             </LinearLayout>
 
-            <ImageView
-                android:id="@+id/iv_obb_clear"
-                android:layout_width="30dp"
-                android:layout_height="30dp"
-                android:background="?android:attr/selectableItemBackgroundBorderless"
-                android:contentDescription="@string/close"
-                android:padding="7dp"
-                android:src="@drawable/ic_close"
+            <!-- OBB row -->
+            <LinearLayout
+                android:id="@+id/row_obb"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/bg_file_row"
+                android:clickable="true"
+                android:focusable="true"
+                android:foreground="?android:attr/selectableItemBackground"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:padding="15dp">
+
+                <ImageView
+                    android:layout_width="24dp"
+                    android:layout_height="24dp"
+                    android:contentDescription="@null"
+                    android:src="@drawable/ic_shield" />
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="13dp"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="@string/select_obb"
+                        android:textColor="@color/zb_text"
+                        android:textSize="13sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/tv_obb_name"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="2dp"
+                        android:ellipsize="middle"
+                        android:maxLines="1"
+                        android:text="@string/select_obb_hint"
+                        android:textColor="@color/zb_text_dim"
+                        android:textSize="11sp" />
+                </LinearLayout>
+
+                <ImageView
+                    android:id="@+id/iv_obb_clear"
+                    android:layout_width="30dp"
+                    android:layout_height="30dp"
+                    android:background="?android:attr/selectableItemBackgroundBorderless"
+                    android:contentDescription="@string/close"
+                    android:padding="7dp"
+                    android:src="@drawable/ic_close"
+                    android:visibility="gone" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <!-- Tab 2: Installed Games (Device) Picker -->
+        <LinearLayout
+            android:id="@+id/container_installed_import"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="14dp"
+            android:orientation="vertical"
+            android:visibility="gone">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="42dp"
+                android:background="@drawable/bg_search"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingStart="12dp"
+                android:paddingEnd="12dp">
+
+                <ImageView
+                    android:layout_width="16dp"
+                    android:layout_height="16dp"
+                    android:contentDescription="@null"
+                    android:src="@drawable/ic_search" />
+
+                <EditText
+                    android:id="@+id/et_search_installed"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_marginStart="10dp"
+                    android:layout_weight="1"
+                    android:background="@null"
+                    android:hint="@string/search_installed_hint"
+                    android:imeOptions="actionSearch"
+                    android:inputType="text"
+                    android:maxLines="1"
+                    android:textColor="@color/zb_text"
+                    android:textColorHint="@color/zb_text_faint"
+                    android:textSize="12.5sp" />
+            </LinearLayout>
+
+            <TextView
+                android:id="@+id/tv_installed_status"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:gravity="center"
+                android:padding="12dp"
+                android:text="@string/scanning_installed"
+                android:textColor="@color/zb_text_dim"
+                android:textSize="11.5sp"
                 android:visibility="gone" />
+
+            <androidx.recyclerview.widget.RecyclerView
+                android:id="@+id/recycler_installed_apps"
+                android:layout_width="match_parent"
+                android:layout_height="270dp"
+                android:layout_marginTop="10dp"
+                android:clipToPadding="false"
+                android:nestedScrollingEnabled="true"
+                android:overScrollMode="never" />
         </LinearLayout>
 
         <!-- Live extraction progress -->
@@ -196,7 +308,7 @@
                 android:fontFeatureSettings="tnum"
                 android:textColor="@color/zb_accent"
                 android:textSize="11sp"
-                tools:text="Extracting 32-bit libraries" />
+                tools:text="Extracting 64-bit / 32-bit libraries" />
 
             <com.google.android.material.progressindicator.LinearProgressIndicator
                 android:id="@+id/progress_import"

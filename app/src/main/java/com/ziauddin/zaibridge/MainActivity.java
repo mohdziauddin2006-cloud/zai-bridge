@@ -314,18 +314,34 @@ public class MainActivity extends AppCompatActivity implements GameAdapter.Liste
     // ---------------------------------------------------------------------
 
     private void showImportSheet() {
-        if (!hasStorageAccess()) {
-            requestStorageAccess(false);
-            return;
-        }
         if (importSheet == null) {
             importSheet = new ImportSheet(this, new ImportSheet.Listener() {
-                @Override public void onPickApk() { pick(REQ_APK); }
+                @Override
+                public void onPickApk() {
+                    if (!hasStorageAccess()) {
+                        requestStorageAccess(false);
+                        return;
+                    }
+                    pick(REQ_APK);
+                }
 
-                @Override public void onPickObb() { pick(REQ_OBB); }
+                @Override
+                public void onPickObb() {
+                    if (!hasStorageAccess()) {
+                        requestStorageAccess(false);
+                        return;
+                    }
+                    pick(REQ_OBB);
+                }
 
-                @Override public void onStart(Uri apk, Uri obb) {
+                @Override
+                public void onStart(Uri apk, Uri obb) {
                     startIngestion(apk, obb);
+                }
+
+                @Override
+                public void onStartInstalled(String packageName) {
+                    startInstalledIngestion(packageName);
                 }
             });
         } else {
@@ -376,11 +392,8 @@ public class MainActivity extends AppCompatActivity implements GameAdapter.Liste
         }
     }
 
-    private void startIngestion(Uri apk, Uri obb) {
-        if (apk == null) return;
-        if (importSheet != null) importSheet.showProgress(getString(R.string.importing_body));
-
-        ResultReceiver receiver = new ResultReceiver(new Handler(Looper.getMainLooper())) {
+    private ResultReceiver buildIngestionReceiver() {
+        return new ResultReceiver(new Handler(Looper.getMainLooper())) {
             @Override
             protected void onReceiveResult(int resultCode, Bundle data) {
                 if (importSheet == null) return;
@@ -406,7 +419,18 @@ public class MainActivity extends AppCompatActivity implements GameAdapter.Liste
                 refreshGames();
             }
         };
-        IngestionService.start(this, apk, obb, receiver);
+    }
+
+    private void startIngestion(Uri apk, Uri obb) {
+        if (apk == null) return;
+        if (importSheet != null) importSheet.showProgress(getString(R.string.importing_body));
+        IngestionService.start(this, apk, obb, buildIngestionReceiver());
+    }
+
+    private void startInstalledIngestion(String packageName) {
+        if (packageName == null || packageName.isEmpty()) return;
+        if (importSheet != null) importSheet.showProgress(getString(R.string.importing_body));
+        IngestionService.startInstalled(this, packageName, buildIngestionReceiver());
     }
 
     private void takePersistable(Uri uri) {

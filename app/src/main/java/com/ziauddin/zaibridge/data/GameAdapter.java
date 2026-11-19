@@ -144,7 +144,20 @@ public class GameAdapter extends RecyclerView.Adapter<GameAdapter.Holder> {
         GraphicsSettings graphics = GraphicsSettings.forGame(context, dir);
 
         long size = game.sizeBytes;
-        holder.meta.setText(shortSize(size) + " · " + game.abi);
+        String splitSuffix = game.splitCount > 0 ? " · SPLIT" : "";
+        holder.meta.setText(shortSize(size) + " · " + game.abi + splitSuffix);
+
+        if (holder.abiBadge != null) {
+            if (game.isNative64()) {
+                holder.abiBadge.setText("64-BIT");
+                holder.abiBadge.setBackgroundResource(R.drawable.bg_badge_accent);
+                holder.abiBadge.setTextColor(context.getColor(R.color.zb_accent));
+            } else {
+                holder.abiBadge.setText("32-BIT");
+                holder.abiBadge.setBackgroundResource(R.drawable.bg_badge_amber);
+                holder.abiBadge.setTextColor(context.getColor(R.color.zb_amber));
+            }
+        }
 
         String engine = graphics.badge();
         holder.engine.setVisibility(engine.isEmpty() ? View.GONE : View.VISIBLE);
@@ -185,10 +198,6 @@ public class GameAdapter extends RecyclerView.Adapter<GameAdapter.Holder> {
     // Art helpers
     // ------------------------------------------------------------------
 
-    /**
-     * The icon's most saturated average colour, lifted in brightness so it
-     * still reads against the obsidian canvas.
-     */
     private static int dominantColor(Bitmap bitmap) {
         final int w = bitmap.getWidth();
         final int h = bitmap.getHeight();
@@ -207,7 +216,7 @@ public class GameAdapter extends RecyclerView.Adapter<GameAdapter.Holder> {
                 int bb = Color.blue(pixel);
                 int max = Math.max(rr, Math.max(gg, bb));
                 int min = Math.min(rr, Math.min(gg, bb));
-                if (max - min < 26) continue;   // ignore white, grey and black
+                if (max - min < 26) continue;
                 r += rr;
                 g += gg;
                 b += bb;
@@ -256,6 +265,7 @@ public class GameAdapter extends RecyclerView.Adapter<GameAdapter.Holder> {
         final TextView name;
         final TextView meta;
         final TextView engine;
+        final TextView abiBadge;
         final TextView obb;
 
         Holder(View view) {
@@ -266,6 +276,7 @@ public class GameAdapter extends RecyclerView.Adapter<GameAdapter.Holder> {
             name = view.findViewById(R.id.tv_name);
             meta = view.findViewById(R.id.tv_meta);
             engine = view.findViewById(R.id.tv_badge_engine);
+            abiBadge = view.findViewById(R.id.tv_badge_abi);
             obb = view.findViewById(R.id.tv_badge_obb);
         }
     }

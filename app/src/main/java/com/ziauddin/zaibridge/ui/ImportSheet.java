@@ -2,22 +2,35 @@ package com.ziauddin.zaibridge.ui;
 
 import android.app.Activity;
 import android.net.Uri;
+import android.os.Handler;
+import android.os.Looper;
+import android.text.Editable;
+import android.text.TextWatcher;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.ImageView;
-import android.widget.LinearLayout;
 import android.widget.TextView;
+
+import androidx.recyclerview.widget.LinearLayoutManager;
+import androidx.recyclerview.widget.RecyclerView;
 
 import com.google.android.material.bottomsheet.BottomSheetBehavior;
 import com.google.android.material.bottomsheet.BottomSheetDialog;
 import com.google.android.material.progressindicator.LinearProgressIndicator;
 import com.ziauddin.zaibridge.R;
 
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
 /**
- * The guided import experience: pick an APK, optionally its OBB, press start,
- * and watch the extraction stages stream in. It replaces the old chain of raw
- * file-picker prompts and fixed toasts.
+ * The guided import experience: supports both
+ * 1) "From Storage (APK / OBB)" for standalone APK + OBB files, and
+ * 2) "Installed Games (Device)" for importing already-installed 64-bit & 32-bit
+ *    games (including Split APKs / App Bundles) directly into Zai-Bridge's
+ *    Zai-Scale Ultra container.
  */
 public final class ImportSheet {
 
@@ -27,8 +40,11 @@ public final class ImportSheet {
         void onPickObb();
 
         void onStart(Uri apk, Uri obb);
+
+        void onStartInstalled(String packageName);
     }
 
+    private final Activity activity;
     private final BottomSheetDialog dialog;
     private final TextView apkName;
     private final TextView obbName;
@@ -38,10 +54,26 @@ public final class ImportSheet {
     private final Button start;
     private final View progressWrap;
 
+    private final TextView tabStorage;
+    private final TextView tabInstalled;
+    private final View containerStorage;
+    private final View containerInstalled;
+    private final EditText searchInstalled;
+    private final TextView installedStatus;
+    private final RecyclerView recyclerInstalled;
+    private final InstalledAppsAdapter installedAdapter;
+
+    private final ExecutorService scanExecutor = Executors.newSingleThreadExecutor();
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+    private boolean installedTabActive = false;
+    private boolean installedScanned = false;
     private Uri apk;
     private Uri obb;
+    private InstalledAppsAdapter.InstalledApp selectedInstalledApp;
 
     public ImportSheet(Activity activity, Listener listener) {
+        this.activity = activity;
         dialog = new BottomSheetDialog(activity, R.style.Theme_ZaiBridge);
         View content = LayoutInflater.from(activity).inflate(R.layout.sheet_import, null);
         dialog.setContentView(content);
@@ -56,6 +88,41 @@ public final class ImportSheet {
         start = content.findViewById(R.id.btn_start_import);
         progressWrap = content.findViewById(R.id.progress_wrap);
 
+        tabStorage = content.findViewById(R.id.tab_from_storage);
+        tabInstalled = content.findViewById(R.id.tab_installed_games);
+        containerStorage = content.findViewById(R.id.container_storage_import);
+        containerInstalled = content.findViewById(R.id.container_installed_import);
+        searchInstalled = content.findViewById(R.id.et_search_installed);
+        installedStatus = content.findViewById(R.id.tv_installed_status);
+        recyclerInstalled = content.findViewById(R.id.recycler_installed_apps);
+
+        recyclerInstalled.setLayoutManager(new LinearLayoutManager(activity));
+        installedAdapter = new InstalledAppsAdapter(activity, app -> {
+            selectedInstalledApp = app;
+            error.setVisibility(View.GONE);
+            updateStartButtonState();
+        });
+        recyclerInstalled.setAdapter(installedAdapter);
+
+        searchInstalled.addTextChangedListener(new TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence s, int start, int count, int after) {
+            }
+
+            @Override
+            public void onTextChanged(CharSequence s, int start, int before, int count) {
+                installedAdapter.setQuery(s == null ? "" : s.toString());
+                updateInstalledEmptyState();
+            }
+
+            @Override
+            public void afterTextChanged(Editable s) {
+            }
+        });
+
+        tabStorage.setOnClickListener(v -> switchTab(false));
+        tabInstalled.setOnClickListener(v -> switchTab(true));
+
         View rowApk = content.findViewById(R.id.row_apk);
         View rowObb = content.findViewById(R.id.row_obb);
         ImageView clearApk = content.findViewById(R.id.iv_apk_clear);
@@ -67,7 +134,7 @@ public final class ImportSheet {
             apk = null;
             apkName.setText(R.string.select_apk_hint);
             clearApk.setVisibility(View.GONE);
-            start.setEnabled(false);
+            updateStartButtonState();
         });
         clearObb.setOnClickListener(v -> {
             obb = null;
@@ -77,8 +144,13 @@ public final class ImportSheet {
 
         content.findViewById(R.id.btn_close_import).setOnClickListener(v -> dialog.dismiss());
         start.setOnClickListener(v -> {
-            if (apk == null) return;
-            listener.onStart(apk, obb);
+            if (installedTabActive) {
+                if (selectedInstalledApp == null) return;
+                listener.onStartInstalled(selectedInstalledApp.packageName);
+            } else {
+                if (apk == null) return;
+                listener.onStart(apk, obb);
+            }
         });
 
         dialog.setOnShowListener(d -> {
@@ -86,6 +158,71 @@ public final class ImportSheet {
                 dialog.getWindow().setDimAmount(0.72f);
             }
         });
+    }
+
+    private void switchTab(boolean installed) {
+        installedTabActive = installed;
+        if (installed) {
+            tabInstalled.setBackgroundResource(R.drawable.bg_badge_accent);
+            tabInstalled.setTextColor(activity.getColor(R.color.zb_accent));
+            tabStorage.setBackground(null);
+            tabStorage.setTextColor(activity.getColor(R.color.zb_text_dim));
+            containerStorage.setVisibility(View.GONE);
+            containerInstalled.setVisibility(View.VISIBLE);
+            if (!installedScanned) {
+                loadInstalledAppsAsync();
+            }
+        } else {
+            tabStorage.setBackgroundResource(R.drawable.bg_badge_accent);
+            tabStorage.setTextColor(activity.getColor(R.color.zb_accent));
+            tabInstalled.setBackground(null);
+            tabInstalled.setTextColor(activity.getColor(R.color.zb_text_dim));
+            containerInstalled.setVisibility(View.GONE);
+            containerStorage.setVisibility(View.VISIBLE);
+        }
+        updateStartButtonState();
+    }
+
+    private void loadInstalledAppsAsync() {
+        installedStatus.setText(R.string.scanning_installed);
+        installedStatus.setVisibility(View.VISIBLE);
+        recyclerInstalled.setVisibility(View.GONE);
+        scanExecutor.execute(() -> {
+            final List<InstalledAppsAdapter.InstalledApp> apps =
+                    InstalledAppsAdapter.scanInstalledApps(activity.getApplicationContext());
+            mainHandler.post(() -> {
+                if (activity.isFinishing() || activity.isDestroyed()) return;
+                installedScanned = true;
+                installedAdapter.setApps(apps);
+                updateInstalledEmptyState();
+            });
+        });
+    }
+
+    private void updateInstalledEmptyState() {
+        if (!installedScanned) return;
+        if (installedAdapter.getItemCount() == 0) {
+            installedStatus.setText(R.string.no_installed_found);
+            installedStatus.setVisibility(View.VISIBLE);
+            recyclerInstalled.setVisibility(View.GONE);
+        } else {
+            installedStatus.setVisibility(View.GONE);
+            recyclerInstalled.setVisibility(View.VISIBLE);
+        }
+    }
+
+    private void updateStartButtonState() {
+        if (installedTabActive) {
+            start.setEnabled(selectedInstalledApp != null);
+            if (selectedInstalledApp != null) {
+                start.setText("Import " + selectedInstalledApp.label);
+            } else {
+                start.setText(R.string.start_import);
+            }
+        } else {
+            start.setEnabled(apk != null);
+            start.setText(R.string.start_import);
+        }
     }
 
     public void show() {
@@ -101,8 +238,8 @@ public final class ImportSheet {
         apkName.setText(displayName);
         View clear = dialog.findViewById(R.id.iv_apk_clear);
         if (clear != null) clear.setVisibility(View.VISIBLE);
-        start.setEnabled(true);
         error.setVisibility(View.GONE);
+        updateStartButtonState();
     }
 
     public void setObb(Uri uri, String displayName) {
@@ -126,7 +263,7 @@ public final class ImportSheet {
         progress.setProgressCompat(100, true);
         stage.setText(success ? label : failure);
         progressWrap.setVisibility(success ? View.VISIBLE : View.GONE);
-        start.setEnabled(apk != null);
+        updateStartButtonState();
         if (!success && failure != null) {
             error.setText(failure);
             error.setVisibility(View.VISIBLE);
@@ -138,11 +275,13 @@ public final class ImportSheet {
     public void reset() {
         apk = null;
         obb = null;
+        selectedInstalledApp = null;
+        installedAdapter.clearSelection();
         apkName.setText(R.string.select_apk_hint);
         obbName.setText(R.string.select_obb_hint);
         progressWrap.setVisibility(View.GONE);
         error.setVisibility(View.GONE);
-        start.setEnabled(false);
+        updateStartButtonState();
     }
 
     /** True when the sheet is visible; the caller owns activity results. */

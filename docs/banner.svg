@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="360" viewBox="0 0 1280 360" role="img" aria-labelledby="title desc">
-  <title id="title">Zai-Bridge — Universal 32-to-64-Bit Android Translation Container</title>
-  <desc id="desc">Obsidian banner with an electric cyan and warm amber infinity-bridge emblem, the Zai-Bridge wordmark, subtitle and architecture badges.</desc>
+  <title id="title">Zai-Bridge v3.0.0 — Universal 32-to-64-Bit Android Translation Container</title>
+  <desc id="desc">Dark obsidian (#07090E) banner with an electric cyan (#00E5FF) and warm amber (#FFB300) infinity-bridge emblem, the ZAI-BRIDGE wordmark, subtitle, and architecture badges.</desc>
 
   <defs>
     <style>
@@ -16,10 +16,6 @@
       @keyframes dashMove {
         to { stroke-dashoffset: -60; }
       }
-      @keyframes pulseGlow {
-        0%, 100% { opacity: 0.18; transform: scale(0.98); }
-        50% { opacity: 0.32; transform: scale(1.02); }
-      }
       .glow-emblem {
         animation: emblemGlow 3.5s ease-in-out infinite;
       }
@@ -30,9 +26,9 @@
     </style>
 
     <linearGradient id="canvas" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#080B10"/>
-      <stop offset="0.55" stop-color="#0D121B"/>
-      <stop offset="1" stop-color="#080B10"/>
+      <stop offset="0" stop-color="#07090E"/>
+      <stop offset="0.55" stop-color="#0C111C"/>
+      <stop offset="1" stop-color="#07090E"/>
     </linearGradient>
     <linearGradient id="infinity" x1="0" y1="0" x2="1" y2="0.2">
       <stop offset="0" stop-color="#00E5FF"/>
@@ -56,7 +52,7 @@
       <stop offset="1" stop-color="#FFB300" stop-opacity="0"/>
     </radialGradient>
     <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
-      <path d="M40 0H0V40" fill="none" stroke="#263042" stroke-width="1" stroke-opacity="0.22"/>
+      <path d="M40 0H0V40" fill="none" stroke="#1F293D" stroke-width="1" stroke-opacity="0.26"/>
     </pattern>
     <filter id="soft" x="-40%" y="-40%" width="180%" height="180%">
       <feGaussianBlur stdDeviation="10"/>
@@ -71,7 +67,7 @@
     <rect width="1280" height="360" fill="url(#grid)"/>
     <circle cx="250" cy="150" r="230" fill="url(#cyanGlow)"/>
     <circle cx="1030" cy="250" r="240" fill="url(#amberGlow)"/>
-    <rect x="0.5" y="0.5" width="1279" height="359" rx="22" fill="none" stroke="#263042"/>
+    <rect x="0.5" y="0.5" width="1279" height="359" rx="22" fill="none" stroke="#1F293D"/>
 
     <!-- Emblem: two interlocking loops forming an infinity bridge with CSS glow animation -->
     <g class="glow-emblem">
@@ -84,7 +80,7 @@
     </g>
 
     <!-- Bridge deck and pylons -->
-    <path d="M132 214H496" stroke="#263042" stroke-width="2"/>
+    <path d="M132 214H496" stroke="#1F293D" stroke-width="2"/>
     <path d="M214 214V190M290 214V178M366 214V190" stroke="#FFB300" stroke-opacity="0.85" stroke-width="2.5" stroke-linecap="round"/>
     <path d="M214 190L252 158M290 178L316 160M366 190L332 162" stroke="#00E5FF" stroke-opacity="0.65" stroke-width="1.8" class="anim-cable"/>
 
@@ -93,27 +89,27 @@
     <rect x="558" y="164" width="360" height="3" rx="1.5" fill="url(#rule)"/>
 
     <text x="558" y="206" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="18" fill="#C7D4E6">Universal 32-to-64-Bit Android Translation Container</text>
-    <text x="558" y="234" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="18" fill="#8A99AD">&amp; Zai-Scale Ultra Graphics Engine</text>
+    <text x="558" y="234" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="18" fill="#8A99AD">&amp; Zai-Scale Ultra™ Neural Graphics Engine (DLSS-5 + 120 Hz MFG)</text>
 
     <!-- Architecture badges -->
     <g font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="600" letter-spacing="0.6">
       <g>
-        <rect x="558" y="266" width="152" height="30" rx="15" fill="#141923" stroke="#263042"/>
+        <rect x="558" y="266" width="152" height="30" rx="15" fill="#111622" stroke="#1F293D"/>
         <circle cx="576" cy="281" r="3.5" fill="#00E5FF"/>
         <text x="588" y="286" fill="#C7D4E6">UNICORN ARM32</text>
       </g>
       <g>
-        <rect x="720" y="266" width="140" height="30" rx="15" fill="#141923" stroke="#263042"/>
+        <rect x="720" y="266" width="140" height="30" rx="15" fill="#111622" stroke="#1F293D"/>
         <circle cx="738" cy="281" r="3.5" fill="#FFB300"/>
         <text x="750" y="286" fill="#C7D4E6">DLSS-5 / FSR</text>
       </g>
       <g>
-        <rect x="870" y="266" width="112" height="30" rx="15" fill="#141923" stroke="#263042"/>
+        <rect x="870" y="266" width="112" height="30" rx="15" fill="#111622" stroke="#1F293D"/>
         <circle cx="888" cy="281" r="3.5" fill="#00E5FF"/>
         <text x="900" y="286" fill="#C7D4E6">4 ABIs</text>
       </g>
       <g>
-        <rect x="992" y="266" width="130" height="30" rx="15" fill="#141923" stroke="#263042"/>
+        <rect x="992" y="266" width="130" height="30" rx="15" fill="#111622" stroke="#1F293D"/>
         <circle cx="1010" cy="281" r="3.5" fill="#FFB300"/>
         <text x="1022" y="286" fill="#C7D4E6">120 Hz MFG</text>
       </g>
@@ -121,8 +117,8 @@
 
     <!-- Version chip -->
     <g font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif">
-      <rect x="1124" y="42" width="104" height="30" rx="15" fill="#0E1420" stroke="#00E5FF" stroke-opacity="0.5"/>
-      <text x="1176" y="62" font-size="12" font-weight="700" fill="#00E5FF" text-anchor="middle" letter-spacing="1">v2.2.0</text>
+      <rect x="1124" y="42" width="104" height="30" rx="15" fill="#111622" stroke="#00E5FF" stroke-opacity="0.5"/>
+      <text x="1176" y="62" font-size="12" font-weight="700" fill="#00E5FF" text-anchor="middle" letter-spacing="1">v3.0.0</text>
     </g>
   </g>
 </svg>

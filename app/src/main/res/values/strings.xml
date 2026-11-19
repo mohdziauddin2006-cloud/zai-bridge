@@ -24,20 +24,25 @@
     <string name="close">Close</string>
 
     <string name="import_sheet_title">Import a game</string>
-    <string name="import_sheet_sub">Pick the APK, then optionally its expansion file. Everything stays in private storage.</string>
+    <string name="import_sheet_sub">Import an installed 64-bit / 32-bit game from this device, or pick an APK and optional OBB from storage.</string>
+    <string name="import_tab_storage">From Storage (APK / OBB)</string>
+    <string name="import_tab_installed">Installed Games (Device)</string>
+    <string name="search_installed_hint">Search installed games &amp; apps…</string>
+    <string name="scanning_installed">Scanning installed apps &amp; split bundles…</string>
+    <string name="no_installed_found">No matching installed apps found on this device.</string>
     <string name="select_apk">Game APK</string>
     <string name="select_obb">Expansion file (optional)</string>
     <string name="select_apk_hint">Tap to choose a .apk</string>
     <string name="select_obb_hint">Tap to attach an .obb</string>
     <string name="no_file">No file selected</string>
     <string name="start_import">Start import</string>
-    <string name="import_ready_hint">Import begins as soon as an APK is selected.</string>
+    <string name="import_ready_hint">Select an APK from storage or tap an installed game above to import.</string>
 
     <string name="importing_title">Importing</string>
     <string name="importing_body">Copying into private storage…</string>
     <string name="import_done">%1$s imported</string>
     <string name="import_failed">Import failed: %1$s</string>
-    <string name="import_no_32bit">No armeabi-v7a libraries inside that APK</string>
+    <string name="import_no_32bit">No compatible native libraries or DEX found inside that package</string>
 
     <string name="bridge_starting">Starting translation layer…</string>
     <string name="bridge_ready">Bridge online — legacy runtime mapped</string>

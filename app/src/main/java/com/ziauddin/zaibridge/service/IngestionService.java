@@ -21,8 +21,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Runs ingestion in the foreground: a single OBB can be several gigabytes, so
- * the copy has to keep going while the user leaves the app.
+ * Runs ingestion in the foreground: a single OBB or Split-APK bundle can be
+ * several gigabytes, so the copy has to keep going while the user leaves the app.
  */
 public class IngestionService extends Service {
 
@@ -32,6 +32,7 @@ public class IngestionService extends Service {
 
     public static final String EXTRA_APK = "com.ziauddin.zaibridge.extra.APK";
     public static final String EXTRA_OBB = "com.ziauddin.zaibridge.extra.OBB";
+    public static final String EXTRA_INSTALLED_PKG = "com.ziauddin.zaibridge.extra.INSTALLED_PKG";
     public static final String EXTRA_RECEIVER = "com.ziauddin.zaibridge.extra.RECEIVER";
     public static final String EXTRA_LABEL = "com.ziauddin.zaibridge.extra.LABEL";
     public static final String EXTRA_ERROR = "com.ziauddin.zaibridge.extra.ERROR";
@@ -53,7 +54,6 @@ public class IngestionService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        // Must happen before any blocking work, or API 26+ kills the service.
         startInForeground();
 
         if (intent == null) {
@@ -61,16 +61,17 @@ public class IngestionService extends Service {
             return START_NOT_STICKY;
         }
 
-        String apk = intent.getStringExtra(EXTRA_APK);
-        String obb = intent.getStringExtra(EXTRA_OBB);
+        final String installedPkg = intent.getStringExtra(EXTRA_INSTALLED_PKG);
+        final String apk = intent.getStringExtra(EXTRA_APK);
+        final String obb = intent.getStringExtra(EXTRA_OBB);
         final ResultReceiver receiver = extractReceiver(intent);
 
-        if (apk == null) {
-            finish(receiver, RESULT_ERROR, null, "No APK supplied");
+        if ((installedPkg == null || installedPkg.isEmpty()) && apk == null) {
+            finish(receiver, RESULT_ERROR, null, "No APK or installed package supplied");
             return START_NOT_STICKY;
         }
 
-        final Uri apkUri = Uri.parse(apk);
+        final Uri apkUri = apk == null ? null : Uri.parse(apk);
         final Uri obbUri = obb == null ? null : Uri.parse(obb);
 
         executor.execute(() -> {
@@ -82,8 +83,14 @@ public class IngestionService extends Service {
                     stage.putString(EXTRA_STAGE, message);
                     receiver.send(RESULT_PROGRESS, stage);
                 };
-                Game game = GameImporter.importGame(getApplicationContext(), apkUri, obbUri,
-                        progress);
+                Game game;
+                if (installedPkg != null && !installedPkg.isEmpty()) {
+                    game = GameImporter.importInstalledPackage(
+                            getApplicationContext(), installedPkg, progress);
+                } else {
+                    game = GameImporter.importGame(
+                            getApplicationContext(), apkUri, obbUri, progress);
+                }
                 finish(receiver, RESULT_OK, game.label, null);
             } catch (Exception e) {
                 Log.e(TAG, "ingestion failed", e);
@@ -153,11 +160,23 @@ public class IngestionService extends Service {
         return null;
     }
 
-    /** Convenience for callers that only have a Context. */
+    /** Starts ingestion for a picked storage APK and optional OBB. */
     public static void start(Context context, Uri apk, Uri obb, ResultReceiver receiver) {
         Intent intent = new Intent(context, IngestionService.class);
         intent.putExtra(EXTRA_APK, apk.toString());
         if (obb != null) intent.putExtra(EXTRA_OBB, obb.toString());
+        intent.putExtra(EXTRA_RECEIVER, receiver);
+        if (Build.VERSION.SDK_INT >= 26) {
+            context.startForegroundService(intent);
+        } else {
+            context.startService(intent);
+        }
+    }
+
+    /** Starts ingestion for an already-installed device package (Base + Split APKs + OBB). */
+    public static void startInstalled(Context context, String packageName, ResultReceiver receiver) {
+        Intent intent = new Intent(context, IngestionService.class);
+        intent.putExtra(EXTRA_INSTALLED_PKG, packageName);
         intent.putExtra(EXTRA_RECEIVER, receiver);
         if (Build.VERSION.SDK_INT >= 26) {
             context.startForegroundService(intent);
