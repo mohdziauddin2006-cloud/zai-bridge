@@ -19,6 +19,8 @@ import com.ziauddin.zaibridge.R;
 import com.ziauddin.zaibridge.core.EglSwapHook;
 import com.ziauddin.zaibridge.data.Game;
 import com.ziauddin.zaibridge.data.GraphicsSettings;
+import com.ziauddin.zaibridge.data.SaveStateManager;
+import com.ziauddin.zaibridge.data.SoCProfiler;
 
 import org.json.JSONObject;
 
@@ -53,6 +55,7 @@ public final class GameDetailsSheet {
     private final boolean global;
     private final BottomSheetDialog dialog;
     private final GraphicsSettings draft;
+    private final Listener onPlay;
 
     private final ChipGroup presetChips;
     private final ChipGroup frameGenChips;
@@ -64,7 +67,11 @@ public final class GameDetailsSheet {
     private final TextView sharpValue;
     private final TextView neuralValue;
     private final SwitchCompat autoMfg;
+    private final SwitchCompat berserk;
+    private final TextView socProfile;
+    private final TextView saveStatus;
 
+    private int saveSlot = SaveStateManager.SLOT_QUICK;
     private boolean syncing;
     private boolean cleared;
 
@@ -83,6 +90,7 @@ public final class GameDetailsSheet {
         this.game = game;
         this.gameDir = gameDir;
         this.global = global;
+        this.onPlay = onPlay;
         this.draft = global ? GraphicsSettings.global(activity)
                 : GraphicsSettings.forGame(activity, gameDir);
 
@@ -103,12 +111,16 @@ public final class GameDetailsSheet {
         sharpValue = content.findViewById(R.id.tv_sharp_value);
         neuralValue = content.findViewById(R.id.tv_neural_value);
         autoMfg = content.findViewById(R.id.switch_auto_mfg);
+        berserk = content.findViewById(R.id.switch_berserk);
+        socProfile = content.findViewById(R.id.tv_soc_profile);
+        saveStatus = content.findViewById(R.id.tv_save_status);
 
         ImageView icon = content.findViewById(R.id.iv_details_icon);
         TextView name = content.findViewById(R.id.tv_details_name);
         TextView pkg = content.findViewById(R.id.tv_details_package);
         TextView obb = content.findViewById(R.id.tv_details_obb);
         View orientationWrap = content.findViewById(R.id.wrap_orientation);
+        View savestatesWrap = content.findViewById(R.id.wrap_savestates);
         Button play = content.findViewById(R.id.btn_play);
         View useGlobal = content.findViewById(R.id.btn_use_global);
         ImageButton close = content.findViewById(R.id.btn_close_details);
@@ -119,6 +131,7 @@ public final class GameDetailsSheet {
             pkg.setText(R.string.engine_defaults_sub);
             obb.setVisibility(View.GONE);
             orientationWrap.setVisibility(View.GONE);
+            savestatesWrap.setVisibility(View.GONE);
             play.setVisibility(View.GONE);
             useGlobal.setVisibility(View.GONE);
         } else {
@@ -141,7 +154,11 @@ public final class GameDetailsSheet {
                 dialog.dismiss();
             });
             bindOrientation();
+            bindSaveStates(content);
         }
+
+        bindSocProfile(content);
+        bindBerserk();
 
         close.setOnClickListener(v -> dialog.dismiss());
         dialog.setOnDismissListener(d -> {
@@ -235,7 +252,7 @@ public final class GameDetailsSheet {
     private void syncUi() {
         syncing = true;
         try {
-            scaleSlider.setValue(clamp(draft.scalePercent, 50, 100));
+            scaleSlider.setValue(clamp(draft.scalePercent, 50, 125));
             sharpnessSlider.setValue(clamp(draft.sharpnessPercent, 0, 100));
             neuralSlider.setValue(clamp(draft.neuralPercent, 0, 100));
             scaleValue.setText(get(activity.getString(R.string.value_percent),
@@ -253,6 +270,7 @@ public final class GameDetailsSheet {
                 presetChips.clearCheck();
             }
             frameGenChips.check(chipOfFrameGen(draft.frameGen));
+            berserk.setChecked(draft.isBerserk());
         } finally {
             syncing = false;
         }
@@ -377,6 +395,9 @@ public final class GameDetailsSheet {
         if (chipId == R.id.chip_fg_2x) return GraphicsSettings.FRAME_GEN_2X;
         if (chipId == R.id.chip_fg_3x) return GraphicsSettings.FRAME_GEN_3X;
         if (chipId == R.id.chip_fg_4x) return GraphicsSettings.FRAME_GEN_4X;
+        if (chipId == R.id.chip_fg_5x) return GraphicsSettings.FRAME_GEN_5X;
+        if (chipId == R.id.chip_fg_8x) return GraphicsSettings.FRAME_GEN_8X;
+        if (chipId == R.id.chip_fg_unlimited) return GraphicsSettings.FRAME_GEN_UNLIMITED;
         return GraphicsSettings.FRAME_GEN_OFF;
     }
 
@@ -385,8 +406,105 @@ public final class GameDetailsSheet {
             case GraphicsSettings.FRAME_GEN_2X: return R.id.chip_fg_2x;
             case GraphicsSettings.FRAME_GEN_3X: return R.id.chip_fg_3x;
             case GraphicsSettings.FRAME_GEN_4X: return R.id.chip_fg_4x;
+            case GraphicsSettings.FRAME_GEN_5X: return R.id.chip_fg_5x;
+            case GraphicsSettings.FRAME_GEN_8X: return R.id.chip_fg_8x;
+            case GraphicsSettings.FRAME_GEN_UNLIMITED: return R.id.chip_fg_unlimited;
             default: return R.id.chip_fg_off;
         }
+    }
+
+    // ------------------------------------------------------------------
+    // SoC auto-recommender, Berserk Mode and Force Save / Load
+    // ------------------------------------------------------------------
+
+    private void bindSocProfile(View content) {
+        final SoCProfiler.Profile profile = SoCProfiler.probe(activity);
+        // The tier names the device, the action rewrites the controls.
+        socProfile.setText(profile.detail());
+        View apply = content.findViewById(R.id.btn_apply_recommended);
+        apply.setOnClickListener(v -> {
+            copyInto(SoCProfiler.recommend(activity, profile));
+            draft.berserk = 0;
+            syncUi();
+            applyLive();
+            Toast.makeText(activity, R.string.recommended_applied, Toast.LENGTH_SHORT).show();
+        });
+    }
+
+    private void bindBerserk() {
+        berserk.setOnCheckedChangeListener((button, checked) -> {
+            if (syncing) return;
+            draft.setBerserk(checked);
+            syncUi();
+            applyLive();
+            Toast.makeText(activity, checked ? R.string.berserk_on : R.string.berserk_off,
+                    Toast.LENGTH_SHORT).show();
+        });
+    }
+
+    private void bindSaveStates(View content) {
+        ChipGroup slots = content.findViewById(R.id.chips_save_slot);
+        slots.setOnCheckedStateChangeListener((group, checkedIds) -> {
+            if (checkedIds.isEmpty()) return;
+            saveSlot = slotOf(checkedIds.get(0));
+            refreshSaveStatus();
+        });
+
+        View save = content.findViewById(R.id.btn_force_save);
+        View load = content.findViewById(R.id.btn_force_load);
+        save.setOnClickListener(v -> {
+            File written = SaveStateManager.save(activity, gameDir, saveSlot);
+            Toast.makeText(activity,
+                    written != null
+                            ? get(activity.getString(R.string.save_written),
+                                    SaveStateManager.labelOf(saveSlot))
+                            : get(activity.getString(R.string.save_failed),
+                                    SaveStateManager.labelOf(saveSlot)),
+                    Toast.LENGTH_SHORT).show();
+            refreshSaveStatus();
+        });
+        load.setOnClickListener(v -> {
+            int restored = SaveStateManager.restore(activity, gameDir, saveSlot);
+            if (restored < 0) {
+                Toast.makeText(activity,
+                        get(activity.getString(R.string.save_missing),
+                                SaveStateManager.labelOf(saveSlot)),
+                        Toast.LENGTH_SHORT).show();
+                return;
+            }
+            Toast.makeText(activity,
+                    get(activity.getString(R.string.save_restored),
+                            SaveStateManager.labelOf(saveSlot)),
+                    Toast.LENGTH_LONG).show();
+            // A running guest cannot have its database swapped underneath it:
+            // resume means relaunch from the restored state.
+            persist();
+            if (onPlay != null) {
+                dialog.dismiss();
+                onPlay.onPlay(game, draft);
+            }
+        });
+        refreshSaveStatus();
+    }
+
+    private void refreshSaveStatus() {
+        if (saveStatus == null || gameDir == null) return;
+        long stamp = SaveStateManager.timestamp(gameDir, saveSlot);
+        String label = SaveStateManager.labelOf(saveSlot);
+        if (stamp <= 0) {
+            saveStatus.setText(label + " · " + activity.getString(R.string.save_state_empty));
+            return;
+        }
+        String when = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US)
+                .format(new java.util.Date(stamp));
+        saveStatus.setText(label + " · " + when);
+    }
+
+    private static int slotOf(int chipId) {
+        if (chipId == R.id.chip_slot_1) return SaveStateManager.SLOT_1;
+        if (chipId == R.id.chip_slot_2) return SaveStateManager.SLOT_2;
+        if (chipId == R.id.chip_slot_3) return SaveStateManager.SLOT_3;
+        return SaveStateManager.SLOT_QUICK;
     }
 
     private static int clamp(int value, int lo, int hi) {
@@ -394,6 +512,10 @@ public final class GameDetailsSheet {
     }
 
     private static String get(String format, int value) {
+        return String.format(Locale.US, format, value);
+    }
+
+    private static String get(String format, String value) {
         return String.format(Locale.US, format, value);
     }
 }

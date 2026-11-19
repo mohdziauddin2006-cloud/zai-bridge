@@ -33,6 +33,10 @@ public final class EglSwapHook {
     private static volatile boolean sLoaded = false;
     /** The Java EGL hooks were installed by the core. */
     private static volatile boolean sInstalled = false;
+    /** At least one 64-bit module had its EGL/GLES GOT slots rewritten. */
+    private static volatile boolean sPltInstalled = false;
+    /** The Vulkan queue-present passthrough is live. */
+    private static volatile boolean sVulkanInstalled = false;
 
     private EglSwapHook() {
     }
@@ -48,6 +52,15 @@ public final class EglSwapHook {
                 sLoaded = true;
             }
             sInstalled = nativeInstall();
+            // The Java boundary covers GLSurfaceView games; a 64-bit renderer
+            // that links libEGL/libGLESv2/vulkan directly is reached through
+            // its PLT/GOT slots. Both are best effort and independent.
+            try {
+                sPltInstalled = nativeInstallPltHooks();
+                sVulkanInstalled = nativeInstallVulkanHooks();
+            } catch (Throwable t) {
+                Log.w(TAG, "native PLT/Vulkan hooks unavailable: " + t);
+            }
         } catch (Throwable t) {
             // A missing or older core must never stop a game from starting.
             Log.w(TAG, "EGL swap hook unavailable or blocked by OEM: " + t);
@@ -59,6 +72,52 @@ public final class EglSwapHook {
 
     public static boolean isInstalled() {
         return sInstalled;
+    }
+
+    public static boolean isPltInstalled() {
+        return sPltInstalled;
+    }
+
+    public static boolean isVulkanInstalled() {
+        return sVulkanInstalled;
+    }
+
+    /**
+     * Re-patches the modules mapped since {@link #install()}.
+     * A game loads its renderer (libunity.so, libmain.so, ...) after the
+     * Activity starts, so the launcher calls this once the session is up and
+     * the host calls it when the surface is recreated.
+     */
+    public static synchronized int refreshHooks() {
+        if (!sLoaded) return 0;
+        try {
+            int patched = nativeRefreshPltHooks();
+            if (patched > 0) sPltInstalled = true;
+            return patched;
+        } catch (Throwable t) {
+            Log.w(TAG, "PLT refresh rejected: " + t);
+            return 0;
+        }
+    }
+
+    /** GOT counter line: modules, slots patched, redirects, swaps, fps. */
+    public static String pltStats() {
+        if (!sLoaded) return "unavailable";
+        try {
+            return nativePltStats();
+        } catch (Throwable t) {
+            return "unavailable";
+        }
+    }
+
+    /** Vulkan present counter line: presents, images, fps. */
+    public static String vulkanStats() {
+        if (!sLoaded) return "unavailable";
+        try {
+            return nativeVulkanStats();
+        } catch (Throwable t) {
+            return "unavailable";
+        }
     }
 
     /** Applies a full configuration, including the one-tap preset id. */
@@ -73,10 +132,11 @@ public final class EglSwapHook {
      * Applies the effective graphics configuration to the compositor.
      *
      * @param upscaler         0 off, 1 mobile SGSR, 2 FSR temporal, 3 DLSS-5
-     * @param scalePercent     50 / 67 / 75 / 85 / 100
+     * @param scalePercent     50 / 67 / 75 / 85 / 100 native, 125 DLAA super-sampling
      * @param sharpnessPercent 0-100 RCAS strength
      * @param neuralPercent    0-100 local contrast / specular / micro-detail
-     * @param frameGen         0 off, 2 / 3 / 4 synthetic frames per real frame
+     * @param frameGen         0 off, 2/3/4/5/8 synthetic frames per real frame,
+     *                         or -1 for uncapped (bounded by the frame budget)
      * @param temporal         0 or 1, temporal history accumulation
      * @param autoMfg          0 or 1, dynamic multiplier from measured headroom
      * @param preset           preset id recorded for telemetry / restore
@@ -152,4 +212,14 @@ public final class EglSwapHook {
     private static native String nativeCompositorStats();
 
     private static native String nativeGraphicsInfo();
+
+    private static native boolean nativeInstallPltHooks();
+
+    private static native int nativeRefreshPltHooks();
+
+    private static native String nativePltStats();
+
+    private static native boolean nativeInstallVulkanHooks();
+
+    private static native String nativeVulkanStats();
 }

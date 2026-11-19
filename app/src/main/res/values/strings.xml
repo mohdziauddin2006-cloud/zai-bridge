@@ -71,6 +71,9 @@
     <string name="graphics_frame_gen_2x">2x MFG</string>
     <string name="graphics_frame_gen_3x">3x MFG</string>
     <string name="graphics_frame_gen_4x">4x MFG</string>
+    <string name="graphics_frame_gen_5x">5x MFG</string>
+    <string name="graphics_frame_gen_8x">8x MFG</string>
+    <string name="graphics_frame_gen_unlimited">UNLIMITED</string>
     <string name="graphics_save">Save</string>
     <string name="graphics_use_global">Use global defaults</string>
     <string name="graphics_saved">Graphics updated</string>
@@ -84,7 +87,32 @@
     <string name="preset_fsr_quality">FSR Quality</string>
     <string name="preset_dlss_ultra">DLSS-5 Ultra</string>
     <string name="preset_dlss_overdrive">4x Overdrive</string>
+    <string name="preset_berserk">Berserk</string>
     <string name="preset_custom">Custom</string>
+
+    <!-- Hardware tier, auto-recommender and Berserk Mode -->
+    <string name="soc_profile">Detected hardware</string>
+    <string name="soc_unknown">Detecting SoC…</string>
+    <string name="apply_recommended">Apply recommended</string>
+    <string name="recommended_applied">Tier recommendation applied</string>
+    <string name="berserk_mode">BERSERK MODE (Bypass Limits)</string>
+    <string name="berserk_desc">Ignores the SoC tier and forces God-Level Graphics: 125%% DLAA super-sampling, maximum Neural Lighting and RCAS, uncapped frame generation.</string>
+    <string name="berserk_on">Berserk Mode engaged — hardware limits bypassed</string>
+    <string name="berserk_off">Berserk Mode off — tier recommendation restored</string>
+
+    <!-- Force save / checkpoint manager -->
+    <string name="save_state">Force save &amp; checkpoints</string>
+    <string name="save_slot_quick">Quick</string>
+    <string name="save_slot_1">Slot 1</string>
+    <string name="save_slot_2">Slot 2</string>
+    <string name="save_slot_3">Slot 3</string>
+    <string name="force_save">Force Save</string>
+    <string name="force_load">Force Load / Resume</string>
+    <string name="save_state_empty">Empty</string>
+    <string name="save_written">%1$s saved</string>
+    <string name="save_restored">%1$s restored — restarting game</string>
+    <string name="save_missing">%1$s is empty</string>
+    <string name="save_failed">Could not write %1$s</string>
 
     <string name="orientation">Orientation lock</string>
     <string name="orientation_auto">Auto</string>

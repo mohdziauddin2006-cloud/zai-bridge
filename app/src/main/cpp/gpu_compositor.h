@@ -39,16 +39,19 @@ enum GraphicsPreset : int {
 };
 
 enum GraphicsFrameGen : int {
+    kFrameGenUnlimited = -1,  // uncapped: as many synthetic frames as the frame budget allows
     kFrameGenOff = 0,
     kFrameGen2x = 2,
     kFrameGen3x = 3,
     kFrameGen4x = 4,
+    kFrameGen5x = 5,
+    kFrameGen8x = 8,
 };
 
 struct GraphicsConfig {
     int preset = kPresetOff;
     int upscaler = kUpscalerOff;
-    int scale_percent = 100;       // 50 | 67 | 75 | 85 | 100
+    int scale_percent = 100;       // 40-125: <100 upscales, >100 supersamples (DLAA)
     int sharpness_percent = 50;    // RCAS / directional sharpen
     int neural_percent = 0;        // lighting + micro-detail reconstruction
     int frame_gen = kFrameGenOff;  // 0 | 2 | 3 | 4
@@ -73,6 +76,8 @@ public:
 
     bool active() const;
     bool internal_scaling() const;
+    int scale_percent() const;              // render target size relative to the panel
+    bool guest_drew_internal() const;       // guest bound the scaled target, not the window
     int synthetic_count() const;            // frames to emit before the real one
 
     // Translation-core path: guest renders into this FBO at the scaled size.

@@ -9,7 +9,7 @@
 [![Release](https://img.shields.io/badge/Release-v3.0.0-FFB300?style=for-the-badge&logo=github&logoColor=white&labelColor=07090E)](https://github.com/mohdziauddin2006-cloud/zai-bridge/releases/latest)
 [![ABIs](https://img.shields.io/badge/ABIs-arm64--v8a%20%7C%20armeabi--v7a%20%7C%20x86__64%20%7C%20x86-00E5FF?style=for-the-badge&labelColor=07090E)](#compatibility)
 [![Core](https://img.shields.io/badge/Core-Unicorn%20ARM32-FFB300?style=for-the-badge&labelColor=07090E)](https://github.com/unicorn-engine/unicorn)
-[![Graphics](https://img.shields.io/badge/Graphics-Zai--Scale%20Ultra%20120Hz%20MFG-00E5FF?style=for-the-badge&labelColor=07090E)](#zai-scale-ultra-preset-comparison)
+[![Graphics](https://img.shields.io/badge/Graphics-Zai--Scale%20Ultra%20Uncapped%20MFG-00E5FF?style=for-the-badge&labelColor=07090E)](#zai-scale-ultra-preset-comparison)
 [![License](https://img.shields.io/badge/License-MIT-FFB300?style=for-the-badge&labelColor=07090E)](LICENSE)
 
 <p align="center">
@@ -93,15 +93,20 @@ flowchart TD
 ## Features
 
 - **100% Stock Android 8.0–16 Compatibility**: Zero risky reflection or `System.loadLibrary` in `Application.attachBaseContext()`, ensuring instant startup on stock OEM ROMs (OneUI, HyperOS, XOS, ColorOS, Pixel AOSP) with strict SELinux Enforcing and Android 14+ read-only DEX enforcement (`setReadOnly()`).
-- **100% Offline Universal Container**: Self-contained APK bundling ANGLE GLES, SwiftShader Vulkan, SDL2, OpenAL, OpenSSL, SQLite3, and legacy Android DEX support libraries across all 4 ABIs (`arm64-v8a`, `armeabi-v7a`, `x86_64`, `x86`).
+- **Universal 64/32-Bit Container**: Self-contained APK bundling ANGLE GLES, SwiftShader Vulkan, SDL2, OpenAL, OpenSSL, SQLite3, and legacy Android DEX support libraries across all 4 ABIs (`arm64-v8a`, `armeabi-v7a`, `x86_64`, `x86`).
 - **Complete Unity 4.x / 5.x / 2017+ & `ANativeActivity` Support**:
   - Method-by-method isolated `RegisterNatives` binding with `ExceptionClear()` and persistent `strdup` method signatures.
   - Handle-scoped `guest_dlsym` resolution so `libmain.so` ➔ `libmono.so` ➔ `libunity.so` chains execute each library's own `JNI_OnLoad`.
   - Full 64-to-32 `ANativeActivity`, `ANativeWindow`, `AInputQueue`, `AAssetManager`, and `ASensorManager` struct marshalling.
+- **Installed 64-Bit & Split-APK Capture**: `native_egl_hook.cpp` walks every mapped module with `dl_iterate_phdr()` and rewrites the PLT/GOT slots for `eglSwapBuffers`, `glBindFramebuffer` and `glViewport` (AArch64, ARM32, x86_64, i386 relocations), so a 64-bit game that links libEGL directly renders into the Zai-Scale target. `vulkan_hook.cpp` interposes `vkGetInstanceProcAddr` / `vkGetDeviceProcAddr` to keep `vkQueuePresentKHR` passthrough-and-instrumented.
 - **Zai-Scale Ultra™ Post-Processing**:
   - **DLSS-5 12-Tap Anisotropic Lanczos-2 & TSR**: 3x3 YCoCg neighborhood clamp with history rejection.
-  - **Optical-Flow Multi-Frame Generation (MFG)**: Synthesizes up to 120 FPS (`2x`, `3x`, `4x`, `Auto`) with sub-8.4ms frame pacing.
+  - **Frame Generation without a refresh-rate ceiling**: `Off`, `2x`, `3x`, `4x`, `5x`, `8x` and `UNLIMITED (Uncapped)`, budgeted from the guest's own frame time instead of the panel's Hz.
+  - **DLAA Super-Sampling**: render scale up to 125% for downsampled anti-aliasing on top of RCAS and Neural Lighting.
   - **Interactive Split-Screen Wipe**: Live in-game Before/After comparison divider and slide-out frosted quick-settings drawer.
+- **Universal SoC Database & Auto-Recommender**: `assets/soc_database.json` classifies 180+ smartphone SoCs — Snapdragon 200 through 8 Elite Gen 5/6, MediaTek MT65xx/Helio/Dimensity 700–9600 Pro, Exynos, Tensor G1–G5, Kirin, Xiaomi XRING O1, Unisoc/Spreadtrum and Tegra/Atom — combined with live `GL_RENDERER`, RAM and core probes into five tiers (Entry → Ultra-Flagship).
+- **BERSERK MODE (Bypass Limits)**: ignores the tier entirely and forces God-Level Graphics on any device: 125% DLAA, maximum Neural Lighting + RCAS, uncapped frame generation.
+- **Force Save & Checkpoints**: one-tap `Quick Save` / `Slot 1-3` zips `shared_prefs/`, `files/`, `databases/` and the redirected `Android/data/<pkg>/files/`; one-tap **Force Load / Resume** restores and relaunches.
 
 ---
 
@@ -148,6 +153,8 @@ pwsh ./scripts/build_and_push.ps1
 | **Unity NativeLoader JNI** | `RESOLVED` | Handle-scoped `dlsym`, per-method `RegisterNatives` isolation |
 | **UI MainThread ANR** | `RESOLVED` | Background executor staging + Material 3 loading state |
 | **Hardware GPU Detection** | `RESOLVED` | EGL14 1x1 pbuffer background renderer probe |
+| **64-Bit PLT/GOT Hooks** | `LINKED` | `native_egl_hook.cpp` + `vulkan_hook.cpp` in `CMakeLists.txt` for all 4 ABIs |
+| **SoC Tiers** | `184 ENTRIES` | 5 tiers, GPU-string fallback, RAM/core heuristic |
 
 ---
 

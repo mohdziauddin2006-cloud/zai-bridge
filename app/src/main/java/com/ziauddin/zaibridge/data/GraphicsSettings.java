@@ -24,10 +24,11 @@ import java.io.InputStream;
  *
  * <p>Every value maps onto the native Zai-Scale Ultra compositor:
  * {@code upscaler} 0 off / 1 mobile SGSR / 2 FSR temporal / 3 DLSS-5 neural,
- * {@code scalePercent} 50/67/75/85/100, {@code sharpnessPercent} 0-100,
- * {@code neuralPercent} 0-100 (local contrast, specular and micro-detail
- * reconstruction), {@code frameGen} 0/2/3/4, {@code temporal} 0/1 and
- * {@code autoMfg} 0/1 (dynamic multiplier).
+ * {@code scalePercent} 50/67/75/85/100, plus 125 for DLAA super-sampling,
+ * {@code sharpnessPercent} 0-100, {@code neuralPercent} 0-100 (local contrast,
+ * specular and micro-detail reconstruction), {@code frameGen} 0/2/3/4/5/8 or
+ * -1 for uncapped, {@code temporal} 0/1, {@code autoMfg} 0/1 (dynamic
+ * multiplier) and {@code berserk} 0/1 (hardware limits bypassed).
  */
 public final class GraphicsSettings {
 
@@ -45,11 +46,16 @@ public final class GraphicsSettings {
     public static final int SCALE_QUALITY = 75;
     public static final int SCALE_ULTRA_QUALITY = 85;
     public static final int SCALE_NATIVE = 100;
+    /** DLAA-style super-sampling: render above panel resolution, then downsample. */
+    public static final int SCALE_DLAA_125 = 125;
 
+    public static final int FRAME_GEN_UNLIMITED = -1;
     public static final int FRAME_GEN_OFF = 0;
     public static final int FRAME_GEN_2X = 2;
     public static final int FRAME_GEN_3X = 3;
     public static final int FRAME_GEN_4X = 4;
+    public static final int FRAME_GEN_5X = 5;
+    public static final int FRAME_GEN_8X = 8;
 
     public static final int PRESET_CUSTOM = -1;
     public static final int PRESET_OFF = 0;
@@ -57,6 +63,8 @@ public final class GraphicsSettings {
     public static final int PRESET_FSR_QUALITY = 2;
     public static final int PRESET_DLSS_ULTRA = 3;
     public static final int PRESET_DLSS_OVERDRIVE = 4;
+    /** Bypasses the SoC recommendation: maximum quality on any hardware. */
+    public static final int PRESET_BERSERK = 5;
 
     public int preset = PRESET_OFF;
     public int upscaler;
@@ -66,6 +74,8 @@ public final class GraphicsSettings {
     public int frameGen;
     public int temporal;
     public int autoMfg;
+    /** 1 while Berserk Mode forces God-Level Graphics regardless of tier. */
+    public int berserk;
 
     public GraphicsSettings() {
         this.preset = PRESET_OFF;
@@ -76,6 +86,7 @@ public final class GraphicsSettings {
         this.frameGen = FRAME_GEN_OFF;
         this.temporal = 0;
         this.autoMfg = 0;
+        this.berserk = 0;
     }
 
     public GraphicsSettings(int upscaler, int scalePercent, int sharpnessPercent,
@@ -88,6 +99,7 @@ public final class GraphicsSettings {
         this.frameGen = validFrameGen(frameGen);
         this.temporal = upscaler == UPSCALER_FSR || upscaler == UPSCALER_DLSS ? 1 : 0;
         this.autoMfg = 0;
+        this.berserk = 0;
     }
 
     public GraphicsSettings(GraphicsSettings other) {
@@ -100,6 +112,7 @@ public final class GraphicsSettings {
         frameGen = other.frameGen;
         temporal = other.temporal;
         autoMfg = other.autoMfg;
+        berserk = other.berserk;
     }
 
     public static GraphicsSettings defaults() {
@@ -147,6 +160,18 @@ public final class GraphicsSettings {
                 s.temporal = 1;
                 s.autoMfg = 1;
                 break;
+            case PRESET_BERSERK:
+                // God-Level Graphics: 125% DLAA super-sampling, maximum neural
+                // lighting and RCAS, uncapped frame generation. No tier check.
+                s.upscaler = UPSCALER_DLSS;
+                s.scalePercent = SCALE_DLAA_125;
+                s.sharpnessPercent = 100;
+                s.neuralPercent = 100;
+                s.frameGen = FRAME_GEN_UNLIMITED;
+                s.temporal = 1;
+                s.autoMfg = 0;
+                s.berserk = 1;
+                break;
             case PRESET_OFF:
             default:
                 s.preset = PRESET_OFF;
@@ -162,7 +187,31 @@ public final class GraphicsSettings {
     /** True when the compositor has any work to do for this configuration. */
     public boolean active() {
         return upscaler != UPSCALER_OFF || frameGen != FRAME_GEN_OFF
-                || neuralPercent > 0 || temporal != 0;
+                || neuralPercent > 0 || temporal != 0
+                || scalePercent != SCALE_NATIVE;
+    }
+
+    /** True when the configuration bypasses the SoC recommendation. */
+    public boolean isBerserk() {
+        return berserk != 0;
+    }
+
+    /**
+     * Turns Berserk on or off in place. Enabling rewrites every parameter to
+     * the God-Level profile; disabling steps back to the DLSS-5 Ultra preset
+     * so the device is not left with an uncapped multiplier by accident.
+     */
+    public void setBerserk(boolean enabled) {
+        GraphicsSettings next = ofPreset(enabled ? PRESET_BERSERK : PRESET_DLSS_ULTRA);
+        preset = next.preset;
+        upscaler = next.upscaler;
+        scalePercent = next.scalePercent;
+        sharpnessPercent = next.sharpnessPercent;
+        neuralPercent = next.neuralPercent;
+        frameGen = next.frameGen;
+        temporal = next.temporal;
+        autoMfg = next.autoMfg;
+        berserk = enabled ? 1 : 0;
     }
 
     public boolean isDlss() {
@@ -183,6 +232,9 @@ public final class GraphicsSettings {
             case FRAME_GEN_2X: return "2x";
             case FRAME_GEN_3X: return "3x";
             case FRAME_GEN_4X: return "4x";
+            case FRAME_GEN_5X: return "5x";
+            case FRAME_GEN_8X: return "8x";
+            case FRAME_GEN_UNLIMITED: return "UNLIMITED";
             default: return "Off";
         }
     }
@@ -196,6 +248,7 @@ public final class GraphicsSettings {
         }
         if (frameGen != FRAME_GEN_OFF) out.append(" · ").append(frameGenName());
         if (autoMfg != 0) out.append(" auto");
+        if (berserk != 0) out.append(" · BERSERK");
         return out.toString();
     }
 
@@ -234,6 +287,7 @@ public final class GraphicsSettings {
             o.put("frameGen", frameGen);
             o.put("temporal", temporal);
             o.put("autoMfg", autoMfg);
+            o.put("berserk", berserk);
         } catch (Exception ignored) {
             // JSONObject.put only throws for non-finite numbers; these are ints.
         }
@@ -251,6 +305,7 @@ public final class GraphicsSettings {
         out.frameGen = validFrameGen(o.optInt("frameGen", base.frameGen));
         out.temporal = o.optInt("temporal", base.temporal) != 0 ? 1 : 0;
         out.autoMfg = o.optInt("autoMfg", base.autoMfg) != 0 ? 1 : 0;
+        out.berserk = o.optInt("berserk", base.berserk) != 0 ? 1 : 0;
         out.preset = o.optInt("preset", base.preset);
         return out;
     }
@@ -330,6 +385,7 @@ public final class GraphicsSettings {
         s.frameGen = validFrameGen(prefs.getInt("frameGen", FRAME_GEN_OFF));
         s.temporal = prefs.getInt("temporal", 0) != 0 ? 1 : 0;
         s.autoMfg = prefs.getInt("autoMfg", 0) != 0 ? 1 : 0;
+        s.berserk = prefs.getInt("berserk", 0) != 0 ? 1 : 0;
         return s;
     }
 
@@ -345,6 +401,7 @@ public final class GraphicsSettings {
                 .putInt("frameGen", settings.frameGen)
                 .putInt("temporal", settings.temporal)
                 .putInt("autoMfg", settings.autoMfg)
+                .putInt("berserk", settings.berserk)
                 .apply();
     }
 
@@ -375,16 +432,19 @@ public final class GraphicsSettings {
     }
 
     private static int validScale(int value) {
-        // The sliders expose the full 50-100% range; the compositor clamps its
-        // own render target dimensions from this percentage.
-        return clamp(value, SCALE_PERFORMANCE, SCALE_NATIVE);
+        // The sliders expose 50-125%: below 100 is upscaling, 125 is DLAA
+        // super-sampling. The compositor clamps the target dimensions itself.
+        return clamp(value, SCALE_PERFORMANCE, SCALE_DLAA_125);
     }
 
     private static int validFrameGen(int value) {
         switch (value) {
+            case FRAME_GEN_UNLIMITED:
             case FRAME_GEN_2X:
             case FRAME_GEN_3X:
             case FRAME_GEN_4X:
+            case FRAME_GEN_5X:
+            case FRAME_GEN_8X:
                 return value;
             default:
                 return FRAME_GEN_OFF;

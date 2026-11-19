@@ -21,7 +21,11 @@ add_link_options("-Wl,-z,max-page-size=16384")
 # Shared by both backends:
 #   egl_swap_hook.cpp     Java EGL/GLES boundary: compositor, config fallback,
 #                         GLSL patcher, extension negotiation
-#   gpu_compositor.cpp    SGSR/FSR upscaling + 2x optical-flow frame generation
+#   native_egl_hook.cpp   in-process PLT/GOT interposition of eglSwapBuffers,
+#                         glBindFramebuffer and glViewport for 64-bit games
+#                         that link libEGL/libGLESv2 directly
+#   vulkan_hook.cpp       vkQueuePresentKHR passthrough + live telemetry
+#   gpu_compositor.cpp    SGSR/FSR upscaling + 2-8x optical-flow frame generation
 #   cpu_compat.cpp        universal ARMv7/NEON reporting, big.LITTLE pinning
 #   gl_shader_patcher.cpp legacy GLSL normalisation
 #   egl_config_fallback.cpp  driver-agnostic eglChooseConfig negotiation
@@ -32,6 +36,8 @@ endif()
 
 set(ZAI_COMMON_SOURCES
     egl_swap_hook.cpp
+    native_egl_hook.cpp
+    vulkan_hook.cpp
     gpu_compositor.cpp
     cpu_compat.cpp
     gl_shader_patcher.cpp

@@ -1087,21 +1087,36 @@ struct GpuCompositor::Impl {
         interval_ms = interval_sum / static_cast<double>(interval_count);
     }
 
+    // No refresh-rate ceiling: the multiplier is bounded only by the frame
+    // budget the guest itself provides. One synthetic slot is budgeted at
+    // 2 ms, so a 16.7 ms guest frame affords 7 extra frames (8x) and a 33 ms
+    // frame affords 15 (16x) regardless of the panel's Hz.
+    static constexpr int kMaxGeneratedFrames = 15;
+    static constexpr double kSyntheticSlotMs = 2.0;
+
+    int budget_extras() const {
+        if (interval_ms <= 0.0) return 0;
+        const int affordable =
+                static_cast<int>(interval_ms / kSyntheticSlotMs + 0.0001) - 1;
+        return clamp_int(affordable, 0, kMaxGeneratedFrames);
+    }
+
     // Multiplier the rolling average asks for, before hysteresis.
     int target_extras() const {
-        const int extras = std::max(0, frame_gen.load() - 1);
+        const int requested = frame_gen.load();
+        if (requested == kFrameGenUnlimited) return budget_extras();
+        const int extras = std::max(0, requested - 1);
         if (auto_mfg.load() == 0) return extras;
-        // Already above ~87 fps: the panel cannot show more. Between ~51 and
-        // ~87 fps a single synthetic frame is enough for a 100-120 Hz panel.
-        if (interval_ms < 11.5) return 0;
-        if (interval_ms < 19.5) return std::min(extras, 1);
-        return extras;
+        // Dynamic MFG trims the multiplier to what the frame budget affords.
+        return std::min(extras, budget_extras());
     }
 
     // Called once per real frame, after the rolling average is updated.
     void update_auto_mfg() {
         const int gen = frame_gen.load();
-        const int wanted = gen < 2 ? 0 : gen - 1;
+        const int wanted = gen == kFrameGenUnlimited
+                                   ? kMaxGeneratedFrames
+                                   : (gen < 2 ? 0 : gen - 1);
         if (auto_mfg.load() == 0) {
             extras_latched = wanted;
             frames_fast = 0;
@@ -1132,11 +1147,14 @@ struct GpuCompositor::Impl {
     }
 
     int effective_extras() const {
-        if (frame_gen.load() < 2) return 0;
-        if (auto_mfg.load() == 0) {
-            return std::max(0, std::min(frame_gen.load() - 1, 3));
-        }
-        return std::max(0, std::min(extras_latched, 3));
+        const int requested = frame_gen.load();
+        // UNLIMITED: fill the guest frame's own time budget, capped only by the
+        // safety ceiling. No display-refresh assumption is involved.
+        if (requested == kFrameGenUnlimited) return budget_extras();
+        if (requested < 2) return 0;
+        const int extras = std::min(requested - 1, kMaxGeneratedFrames);
+        if (auto_mfg.load() == 0) return extras;
+        return clamp_int(extras_latched, 0, extras);
     }
 };
 
@@ -1157,11 +1175,15 @@ void GpuCompositor::configure(const GraphicsConfig& config) {
     d.upscaler.store(config.upscaler == kUpscalerSgsr || config.upscaler == kUpscalerFsr ||
                              config.upscaler == kUpscalerDlss
                      ? config.upscaler : kUpscalerOff);
-    d.scale.store(clamp_int(config.scale_percent, 40, 100));
+    // 125% is DLAA-style super-sampling: the guest renders above panel
+    // resolution and the resolve pass downsamples with RCAS.
+    d.scale.store(clamp_int(config.scale_percent, 40, 125));
     d.sharpness.store(clamp_int(config.sharpness_percent, 0, 100));
     d.neural.store(clamp_int(config.neural_percent, 0, 100));
-    d.frame_gen.store(config.frame_gen == 2 || config.frame_gen == 3 ||
-                              config.frame_gen == 4 ? config.frame_gen : 0);
+    const int gen = config.frame_gen;
+    const bool gen_valid = gen == kFrameGenUnlimited || gen == 2 || gen == 3 ||
+                           gen == 4 || gen == 5 || gen == 8;
+    d.frame_gen.store(gen_valid ? gen : 0);
     d.temporal.store(config.temporal != 0 ? 1 : 0);
     d.auto_mfg.store(config.auto_mfg != 0 ? 1 : 0);
 
@@ -1178,7 +1200,9 @@ void GpuCompositor::configure(const GraphicsConfig& config) {
     }
     // Start a new configuration at its full multiplier and let the rolling
     // window ease it down; never inherit a stale latch from another preset.
-    d.extras_latched = d.frame_gen.load() >= 2 ? d.frame_gen.load() - 1 : 0;
+    d.extras_latched = d.frame_gen.load() == kFrameGenUnlimited
+                               ? Impl::kMaxGeneratedFrames
+                               : (d.frame_gen.load() >= 2 ? d.frame_gen.load() - 1 : 0);
     d.frames_fast = 0;
     d.frames_slow = 0;
     LOGI("Zai-Scale: preset=%d up=%d scale=%d%% sharp=%d%% neural=%d%% gen=%dx temporal=%d auto=%d",
@@ -1204,7 +1228,15 @@ bool GpuCompositor::active() const {
 
 bool GpuCompositor::internal_scaling() const {
     const GraphicsConfig c = impl_->snapshot();
-    return c.upscaler != kUpscalerOff && c.scale_percent < 100;
+    // Anything other than 1:1 needs the offscreen target: below 100% it is an
+    // upscale, above it is DLAA super-sampling.
+    return c.upscaler != kUpscalerOff && c.scale_percent != 100;
+}
+
+int GpuCompositor::scale_percent() const { return impl_->scale.load(); }
+
+bool GpuCompositor::guest_drew_internal() const {
+    return impl_->internal_bound.load();
 }
 
 int GpuCompositor::synthetic_count() const { return impl_->effective_extras(); }
@@ -1378,7 +1410,9 @@ void GpuCompositor::wait_subframe() {
     const int extras = d.effective_extras();
     if (extras <= 0) return;
     double slice = d.interval_ms / static_cast<double>(extras + 1);
-    slice = std::max(2.0, std::min(slice, 9.0));
+    // 1 ms floor keeps an unlucky measurement from busy-looping; the 9 ms cap is
+    // a latency bound, not a refresh-rate bound.
+    slice = std::max(1.0, std::min(slice, 9.0));
 
     // Absolute pacing: wait until this synthetic frame's slot boundary rather
     // than sleeping a fixed slice on top of the present cost. A frame that is
@@ -1418,11 +1452,16 @@ std::string GpuCompositor::stats() const {
     char buf[768];
     std::snprintf(buf, sizeof buf,
                   "mode=%s preset=%d scale=%d%% sharpness=%d%% neural=%d%% "
-                  "frameGen=%dx temporal=%d autoMfg=%d compare=%.2f source=%dx%d "
+                  "frameGen=%s temporal=%d autoMfg=%d compare=%.2f source=%dx%d "
                   "display=%dx%d guestFrames=%llu outputFrames=%llu generated=%llu "
                   "guestFps=%.1f outputFps=%.1f frameMs=%.2f shaderFailures=%d gl=%s",
                   mode, c.preset, c.scale_percent, c.sharpness_percent,
-                  c.neural_percent, c.frame_gen, c.temporal, c.auto_mfg,
+                  c.neural_percent,
+                  c.frame_gen == kFrameGenUnlimited ? "unlimited"
+                      : (c.frame_gen >= 2 ? (c.frame_gen == 2 ? "2x" :
+                         c.frame_gen == 3 ? "3x" : c.frame_gen == 4 ? "4x" :
+                         c.frame_gen == 5 ? "5x" : "8x") : "off"),
+                  c.temporal, c.auto_mfg,
                   static_cast<double>(d.compare_milli.load()) / 1000.0,
                   d.source_w, d.source_h, d.display_w, d.display_h,
                   static_cast<unsigned long long>(d.guest_frames),

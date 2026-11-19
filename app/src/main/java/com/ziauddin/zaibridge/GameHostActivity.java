@@ -1,6 +1,7 @@
 package com.ziauddin.zaibridge;
 
 import android.app.Activity;
+import android.content.Intent;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.os.Bundle;
@@ -36,6 +37,7 @@ import com.ziauddin.zaibridge.core.UnicornBridge;
 import com.ziauddin.zaibridge.data.Game;
 import com.ziauddin.zaibridge.data.GameRepository;
 import com.ziauddin.zaibridge.data.GraphicsSettings;
+import com.ziauddin.zaibridge.data.SaveStateManager;
 
 import java.io.File;
 import java.util.Locale;
@@ -78,6 +80,7 @@ public class GameHostActivity extends Activity {
     private volatile int sessionGeneration = -1;
 
     private GraphicsSettings graphics;
+    private int saveSlot = SaveStateManager.SLOT_QUICK;
 
     private View drawer;
     private TextView drawerStats;
@@ -425,6 +428,13 @@ public class GameHostActivity extends Activity {
             result = UnicornBridge.startSession(gameDir.getAbsolutePath(), obb, pkg,
                     guestLoader, guestActivity);
             sessionGeneration = UnicornBridge.sessionGeneration();
+            // The game's renderer libraries are mapped by now; rewrite the GOT
+            // slots that appeared since install() so the compositor sees them.
+            int patched = EglSwapHook.refreshHooks();
+            if (patched > 0) {
+                Log.i(TAG, "PLT hooks refreshed for the running renderer: "
+                        + patched + " slot(s)");
+            }
         } catch (Throwable t) {
             Log.e(TAG, "native session crashed", t);
         }
@@ -517,7 +527,13 @@ public class GameHostActivity extends Activity {
                 : String.format(Locale.US, "%s MFG · %s %d%%",
                 graphics.frameGenName(), graphics.upscalerName(), graphics.scalePercent);
         telemetry.setText(text);
-        if (drawerStats != null) drawerStats.setText(stats);
+        if (drawerStats != null) {
+            // GL compositor, the 64-bit GOT path and the Vulkan present counter
+            // are three independent clocks; show all three so a passthrough
+            // session is not mistaken for a dead one.
+            drawerStats.setText(stats + "\n" + EglSwapHook.pltStats()
+                    + "\n" + EglSwapHook.vulkanStats());
+        }
     }
 
     private static double number(String stats, String key) {
@@ -622,7 +638,8 @@ public class GameHostActivity extends Activity {
                 {getString(R.string.preset_fsr_perf), "1"},
                 {getString(R.string.preset_fsr_quality), "2"},
                 {getString(R.string.preset_dlss_ultra), "3"},
-                {getString(R.string.preset_dlss_overdrive), "4"}
+                {getString(R.string.preset_dlss_overdrive), "4"},
+                {getString(R.string.preset_berserk), "5"}
         }, String.valueOf(graphics.preset), value -> {
             int preset = Integer.parseInt(value);
             GraphicsSettings next = GraphicsSettings.ofPreset(preset);
@@ -659,7 +676,10 @@ public class GameHostActivity extends Activity {
                 {getString(R.string.graphics_off), "0"},
                 {"2x", "2"},
                 {"3x", "3"},
-                {"4x", "4"}
+                {"4x", "4"},
+                {"5x", "5"},
+                {"8x", "8"},
+                {getString(R.string.graphics_frame_gen_unlimited), "-1"}
         }, String.valueOf(graphics.frameGen), value -> {
             graphics.frameGen = Integer.parseInt(value);
             if (graphics.frameGen != GraphicsSettings.FRAME_GEN_OFF
@@ -671,6 +691,39 @@ public class GameHostActivity extends Activity {
             applyGraphics();
             rebuildDrawer();
         }));
+
+        // Force Save / Force Load ---------------------------------------
+        body.addView(sectionLabel(R.string.save_state));
+        body.addView(chipRow(new String[][]{
+                {getString(R.string.save_slot_quick), "0"},
+                {getString(R.string.save_slot_1), "1"},
+                {getString(R.string.save_slot_2), "2"},
+                {getString(R.string.save_slot_3), "3"}
+        }, String.valueOf(saveSlot), value -> {
+            saveSlot = Integer.parseInt(value);
+            rebuildDrawer();
+        }));
+
+        LinearLayout saveRow = new LinearLayout(this);
+        saveRow.setOrientation(LinearLayout.HORIZONTAL);
+        saveRow.setPadding(0, dp(8), 0, 0);
+        saveRow.addView(drawerButton(R.string.force_save, 0x2600E5FF, 0x9900E5FF,
+                this::forceSave), weightedParams(true));
+        saveRow.addView(drawerButton(R.string.force_load, 0x1AFFB300, 0x66FFB300,
+                this::forceLoad), weightedParams(false));
+        body.addView(saveRow);
+
+        TextView saveInfo = new TextView(this);
+        saveInfo.setTextSize(9f);
+        saveInfo.setTextColor(0xFF5F6E80);
+        saveInfo.setPadding(0, dp(6), 0, 0);
+        long stamp = SaveStateManager.timestamp(gameDir, saveSlot);
+        saveInfo.setText(stamp > 0
+                ? SaveStateManager.labelOf(saveSlot) + " · " + new java.text.SimpleDateFormat(
+                        "yyyy-MM-dd HH:mm", Locale.US).format(new java.util.Date(stamp))
+                : SaveStateManager.labelOf(saveSlot) + " · "
+                        + getString(R.string.save_state_empty));
+        body.addView(saveInfo);
 
         // Compare wipe ---------------------------------------------------
         body.addView(sectionLabel(R.string.compare_wipe));
@@ -841,6 +894,64 @@ public class GameHostActivity extends Activity {
         return wrap;
     }
 
+    // ---------------------------------------------------------------------
+    // In-game Force Save / Force Load
+    // ---------------------------------------------------------------------
+
+    private void forceSave() {
+        File written = SaveStateManager.save(this, gameDir, saveSlot);
+        Toast.makeText(this, written != null
+                        ? getString(R.string.save_written, SaveStateManager.labelOf(saveSlot))
+                        : getString(R.string.save_failed, SaveStateManager.labelOf(saveSlot)),
+                Toast.LENGTH_SHORT).show();
+        rebuildDrawer();
+    }
+
+    private void forceLoad() {
+        int restored = SaveStateManager.restore(this, gameDir, saveSlot);
+        if (restored < 0) {
+            Toast.makeText(this, getString(R.string.save_missing,
+                    SaveStateManager.labelOf(saveSlot)), Toast.LENGTH_SHORT).show();
+            return;
+        }
+        Toast.makeText(this, getString(R.string.save_restored,
+                SaveStateManager.labelOf(saveSlot)), Toast.LENGTH_LONG).show();
+        restartGame();
+    }
+
+    /** Releases the guest, then relaunches the host so it starts from disk. */
+    private void restartGame() {
+        final Intent intent = getIntent();
+        final int generation = sessionGeneration;
+        SURFACE_QUEUE.execute(() -> {
+            UnicornBridge.setSurface(null);
+            if (generation >= 0) UnicornBridge.endSession(generation);
+        });
+        finish();
+        startActivity(intent);
+    }
+
+    private LinearLayout.LayoutParams weightedParams(boolean lead) {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, dp(46), 1f);
+        params.setMarginEnd(lead ? dp(8) : 0);
+        return params;
+    }
+
+    private Button drawerButton(int textRes, int fill, int stroke, Runnable action) {
+        Button button = new Button(this);
+        button.setText(textRes);
+        button.setAllCaps(false);
+        button.setTextSize(12f);
+        button.setTextColor(0xFFE8EEF7);
+        GradientDrawable background = new GradientDrawable();
+        background.setColor(fill);
+        background.setCornerRadius(dp(14));
+        background.setStroke(dp(1), stroke);
+        button.setBackground(background);
+        button.setOnClickListener(v -> action.run());
+        return button;
+    }
+
     private void applyGraphics() {
         EglSwapHook.configure(graphics);
         applyFrameRateHint(graphics);
@@ -853,7 +964,18 @@ public class GameHostActivity extends Activity {
 
     private void applyFrameRateHint(GraphicsSettings settings) {
         if (surfaceView == null || settings == null || Build.VERSION.SDK_INT < 30) return;
-        final float rate = settings.frameGen != GraphicsSettings.FRAME_GEN_OFF ? 120f : 60f;
+        // UNCAPPED asks the display for no preferred rate at all: the frame
+        // clock becomes the compositor's, not the panel's.
+        final float rate;
+        if (settings.frameGen == GraphicsSettings.FRAME_GEN_UNLIMITED) {
+            rate = 0f;
+        } else if (settings.frameGen >= GraphicsSettings.FRAME_GEN_5X) {
+            rate = 240f;
+        } else if (settings.frameGen != GraphicsSettings.FRAME_GEN_OFF) {
+            rate = 120f;
+        } else {
+            rate = 60f;
+        }
         try {
             Surface surface = surfaceView.getHolder().getSurface();
             if (surface != null && surface.isValid()) {
