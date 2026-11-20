@@ -46,6 +46,7 @@
 // =============================================================================
 
 #include <jni.h>
+#include <zlib.h>
 #include <unicorn/unicorn.h>
 #include <android/log.h>
 #include <android/native_window.h>
@@ -152,18 +153,6 @@ inline std::shared_ptr<GuestSem> get_guest_sem(uint32_t addr) {
     auto s = std::make_shared<GuestSem>();
     s_sem_map[addr] = s;
     return s;
-}
-
-static std::mutex s_mutex_map_mtx;
-static std::unordered_map<uint32_t, std::shared_ptr<std::recursive_mutex>> s_mutex_map;
-
-inline std::shared_ptr<std::recursive_mutex> get_guest_mutex(uint32_t addr) {
-    std::lock_guard<std::mutex> lk(s_mutex_map_mtx);
-    auto it = s_mutex_map.find(addr);
-    if (it != s_mutex_map.end()) return it->second;
-    auto m = std::make_shared<std::recursive_mutex>();
-    s_mutex_map[addr] = m;
-    return m;
 }
 
 static std::mutex s_cond_map_mtx;
@@ -347,6 +336,94 @@ size_t   HostTrampolines::used_ = 0;
 // ===========================================================================
 // 2. Emulator: one ARM32 Unicorn instance + guest memory helpers
 // ===========================================================================
+
+// Reentrant lock for the single guest register file.
+//
+// std::recursive_mutex is not enough here: when a guest thread spawned by the
+// payload exits while it still owns the lock (a legacy engine joins a worker
+// from inside a native method), the owner field keeps pointing at a thread that
+// no longer exists and every later call blocks forever. This records the owner,
+// and recovers the lock once that thread is gone.
+class GuestMutex {
+public:
+    void lock() {
+        const pthread_t self = pthread_self();
+        if (owner_tid_ == self) {
+            ++depth_;
+            return;
+        }
+        std::unique_lock<std::mutex> lock(mutex_);
+        int waited_ms = 0;
+        while (owner_tid_ != 0) {
+            if (cv_.wait_for(lock, std::chrono::milliseconds(250)) ==
+                    std::cv_status::timeout) {
+                waited_ms += 250;
+                if (!thread_alive(owner_tid_)) {
+                    LOGW("guest lock: owner tid=%lu exited without releasing; recovering",
+                         static_cast<unsigned long>(owner_tid_));
+                    owner_tid_ = 0;
+                    break;
+                }
+                if (waited_ms % 2000 == 0) {
+                    LOGW("guest lock: waiting %dms for owner tid=%lu",
+                         waited_ms, static_cast<unsigned long>(owner_tid_));
+                }
+            }
+        }
+        owner_tid_ = self;
+        depth_ = 1;
+    }
+
+    void unlock() {
+        if (owner_tid_ != pthread_self()) return;
+        if (--depth_ > 0) return;
+        { std::lock_guard<std::mutex> lock(mutex_); owner_tid_ = 0; }
+        cv_.notify_one();
+    }
+
+    // Guest pthread_mutex_trylock: acquire only if nobody (live) owns it.
+    bool try_lock() {
+        const pthread_t self = pthread_self();
+        if (owner_tid_ == self) { ++depth_; return true; }
+        std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+        if (!lock.owns_lock()) return false;
+        if (owner_tid_ != 0 && !thread_alive(owner_tid_)) {
+            LOGW("guest lock: trylock reclaimed from dead tid=%lu",
+                 static_cast<unsigned long>(owner_tid_));
+            owner_tid_ = 0;
+        }
+        if (owner_tid_ != 0) return false;
+        owner_tid_ = self;
+        depth_ = 1;
+        return true;
+    }
+
+private:
+    static bool thread_alive(pthread_t tid) {
+        return pthread_kill(tid, 0) == 0 || errno != ESRCH;
+    }
+
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    pthread_t owner_tid_ = 0;
+    int depth_ = 0;
+};
+
+// Guest pthread_mutex_t table. Legacy Unity spawns workers that can exit while
+// still holding a lock; a plain std::recursive_mutex would then wedge every
+// later pthread_mutex_lock on the UI thread (ANR in UnityPlayer.<init>).
+static std::mutex s_mutex_map_mtx;
+static std::unordered_map<uint32_t, std::shared_ptr<GuestMutex>> s_mutex_map;
+
+inline std::shared_ptr<GuestMutex> get_guest_mutex(uint32_t addr) {
+    std::lock_guard<std::mutex> lk(s_mutex_map_mtx);
+    auto it = s_mutex_map.find(addr);
+    if (it != s_mutex_map.end()) return it->second;
+    auto m = std::make_shared<GuestMutex>();
+    s_mutex_map[addr] = m;
+    return m;
+}
+
 class Emulator {
 public:
     bool init() {
@@ -511,6 +588,13 @@ public:
         for (auto it = free_list_.begin(); it != free_list_.end(); ++it) {
             if (it->second < want) continue;
             const uint32_t at = it->first;
+            // Recycled blocks are only 8-byte aligned. A memalign() request for
+            // a wider boundary has to skip them or the payload gets a pointer
+            // that violates the alignment it asked for (SIMD fast paths and
+            // Unity's job queues both rely on it).
+            if (alignment > 8 && (at & (static_cast<uint32_t>(alignment) - 1u)) != 0) {
+                continue;
+            }
             const uint32_t rest = it->second - want;
             free_list_.erase(it);
             if (rest >= 8) free_list_[at + want] = rest;
@@ -572,6 +656,14 @@ public:
         if (ok) *ok = r;
         return v;
     }
+
+    uint8_t read_u8(uint32_t addr) {
+        uint8_t v = 0;
+        read(addr, &v, sizeof v);
+        return v;
+    }
+
+    bool write_u8(uint32_t addr, uint8_t v) { return write(addr, &v, sizeof v); }
 
     std::string read_cstr(uint32_t addr, size_t max = 1024) {
         std::string s;
@@ -756,7 +848,12 @@ private:
     // the guest frame intact and `paused` is set.
     void run_to_return(uint32_t& pc, const char* what, int budget_ms, bool& paused,
                        uc_err& err) {
-        constexpr uint32_t kChunk = 4u * 1000u * 1000u;
+        // Small chunks are what make `budget_ms` real: 4M instructions can take
+        // seconds on a slow host (an emulator interpreting ARM32), so the check
+        // below would only run long after the UI thread had already been
+        // declared unresponsive. 250k keeps the slice within the budget while
+        // costing only a few thousand extra uc_emu_start calls per frame.
+        constexpr uint32_t kChunk = 250u * 1000u;
         const auto started = std::chrono::steady_clock::now();
         uint64_t budget = kMaxInstructions;
         int state_retries = 0;
@@ -813,6 +910,9 @@ private:
                     const bool live_thumb = reg_read(UC_ARM_REG_CPSR, live_cpsr) &&
                                             (live_cpsr & 0x20u) != 0;
                     pc = cur | (live_thumb ? 1u : 0u);
+                    LOGI("call(%s): suspended at pc=%08x after %lldms (budget %dms); "
+                         "the next native entry resumes it",
+                         what, cur, static_cast<long long>(held), budget_ms);
                     return;
                 }
             }
@@ -1306,6 +1406,13 @@ constexpr int kIdxGetSuperclass    = JNIENV_IDX(GetSuperclass);
 constexpr int kIdxGetMethodID      = JNIENV_IDX(GetMethodID);
 constexpr int kIdxGetStaticMethodID= JNIENV_IDX(GetStaticMethodID);
 constexpr int kIdxGetFieldID       = JNIENV_IDX(GetFieldID);
+
+// Field accessors are two 18-slot runs: object + the eight primitives as
+// getters, then the same nine as setters.
+constexpr int kIdxGetObjectField  = JNIENV_IDX(GetObjectField);
+constexpr int kIdxGetStaticFieldID = JNIENV_IDX(GetStaticFieldID);
+constexpr int kIdxGetStaticObjectField = JNIENV_IDX(GetStaticObjectField);
+constexpr int kFieldAccessSlots = 18;
 constexpr int kIdxNewStringUTF     = JNIENV_IDX(NewStringUTF);
 constexpr int kIdxGetStringUTFLength = JNIENV_IDX(GetStringUTFLength);
 constexpr int kIdxGetStringUTFChars  = JNIENV_IDX(GetStringUTFChars);
@@ -1524,13 +1631,13 @@ public:
         if (!fn) return false;
         if (!force && called_onloads_.find(fn) != called_onloads_.end()) return true;
         called_onloads_.insert(fn);
-        std::lock_guard<std::recursive_mutex> emu_lock(emu_mu_);
+        std::lock_guard<GuestMutex> emu_lock(emu_mu_);
         return emu_.call(fn, {vm_shadow_, 0}, ret, "JNI_OnLoad");
     }
 
     bool call_guest(uint32_t fn, const std::vector<uint32_t>& args, uint32_t& ret, const char* name = "guest_call") {
         if (!fn) return false;
-        std::lock_guard<std::recursive_mutex> emu_lock(emu_mu_);
+        std::lock_guard<GuestMutex> emu_lock(emu_mu_);
         return emu_.call(fn, args, ret, name, 0);
     }
 
@@ -1782,7 +1889,7 @@ public:
         // The guest CPU is a single register file: two ART threads entering it
         // at once would interleave into one another. Recursive because a guest
         // ->Java->guest round trip re-enters from the same thread.
-        std::lock_guard<std::recursive_mutex> emu_lock(emu_mu_);
+        std::lock_guard<GuestMutex> emu_lock(emu_mu_);
 
         if (id >= natives_.size()) return 0;
         const NativeEntry& e = natives_[id];
@@ -2795,9 +2902,15 @@ public:
                 const std::string name = guest_string(arg(2));
                 const std::string sig = guest_string(arg(3));
                 jmethodID m = env_->GetMethodID(c, name.c_str(), sig.c_str());
-                if (!m) { env_->ExceptionClear(); LOGW("GetMethodID(%s%s) failed", name.c_str(), sig.c_str()); }
-                // Remembered so a later Call*Method can rebuild the argument list.
-                else method_sigs_[static_cast<void*>(m)] = sig;
+                if (!m) {
+                    env_->ExceptionClear();
+                    LOGW("GetMethodID(%s%s) failed", name.c_str(), sig.c_str());
+                } else {
+                    // Remembered so a later Call*Method can rebuild the argument list.
+                    method_sigs_[static_cast<void*>(m)] = sig;
+                    method_names_[static_cast<void*>(m)] = name;
+                    LOGI("GetMethodID(%s%s) -> %p", name.c_str(), sig.c_str(), m);
+                }
                 return to_guest_ref(m);
             }
 
@@ -2813,8 +2926,14 @@ public:
                     return 0;
                 }
                 jmethodID m = env_->GetStaticMethodID(c, name.c_str(), sig.c_str());
-                if (!m) { env_->ExceptionClear(); LOGW("GetStaticMethodID(%s%s) failed", name.c_str(), sig.c_str()); }
-                else method_sigs_[static_cast<void*>(m)] = sig;
+                if (!m) {
+                    env_->ExceptionClear();
+                    LOGW("GetStaticMethodID(%s%s) failed", name.c_str(), sig.c_str());
+                } else {
+                    method_sigs_[static_cast<void*>(m)] = sig;
+                    method_names_[static_cast<void*>(m)] = name;
+                    LOGI("GetStaticMethodID(%s%s) -> %p", name.c_str(), sig.c_str(), m);
+                }
                 return to_guest_ref(m);
             }
 
@@ -2826,7 +2945,31 @@ public:
                     LOGW("GetFieldID(%s%s) on null class", name.c_str(), sig.c_str());
                     return 0;
                 }
-                return to_guest_ref(env_->GetFieldID(c, name.c_str(), sig.c_str()));
+                const jfieldID f = env_->GetFieldID(c, name.c_str(), sig.c_str());
+                if (!f) {
+                    env_->ExceptionClear();
+                    LOGW("GetFieldID(%s%s) not found", name.c_str(), sig.c_str());
+                    return 0;
+                }
+                LOGI("GetFieldID(%s%s) -> %p", name.c_str(), sig.c_str(), f);
+                return to_guest_ref(f);
+            }
+
+            case kIdxGetStaticFieldID: {
+                const std::string name = guest_string(arg(2));
+                const std::string sig = guest_string(arg(3));
+                auto* c = static_cast<jclass>(from_guest_ref(arg(1)));
+                if (!c) {
+                    LOGW("GetStaticFieldID(%s%s) on null class", name.c_str(), sig.c_str());
+                    return 0;
+                }
+                const jfieldID f = env_->GetStaticFieldID(c, name.c_str(), sig.c_str());
+                if (!f) {
+                    LOGW("GetStaticFieldID(%s%s) not found", name.c_str(), sig.c_str());
+                    return 0;
+                }
+                LOGI("GetStaticFieldID(%s%s) -> %p", name.c_str(), sig.c_str(), f);
+                return to_guest_ref(f);
             }
 
             case kIdxNewStringUTF: {
@@ -2844,6 +2987,9 @@ public:
                 if (!str) return 0;
                 const char* chars = env_->GetStringUTFChars(str, nullptr);
                 if (!chars) return 0;
+                if (chars[0] == '/' || std::strstr(chars, ".apk")) {
+                    LOGI("path handed to the guest: %s", chars);
+                }
                 // The guest must get a real 32-bit pointer it can dereference,
                 // so hand it a private copy in guest memory.
                 const uint32_t at = guest_str(chars);
@@ -2986,6 +3132,14 @@ public:
                     const int k = index - kIdxGetBooleanArrayRegion;
                     return array_region(array_type(k / 2), (k % 2) == 1);
                 }
+                if (index >= kIdxGetObjectField &&
+                    index < kIdxGetObjectField + kFieldAccessSlots) {
+                    return field_access(index - kIdxGetObjectField, false);
+                }
+                if (index >= kIdxGetStaticObjectField &&
+                    index < kIdxGetStaticObjectField + kFieldAccessSlots) {
+                    return field_access(index - kIdxGetStaticObjectField, true);
+                }
                 if (index >= kIdxGetBooleanArrayElements &&
                     index < kIdxGetBooleanArrayElements + 16) {
                     const int k = index - kIdxGetBooleanArrayElements;
@@ -3056,11 +3210,174 @@ public:
         return static_cast<uint32_t>(b);
     }
 
+    // ARM32 softfp: words 0..3 travel in R0..R3 and everything after that on
+    // the stack, so arg() alone is not enough for a trailing jlong/jdouble.
+    uint32_t arg_word(size_t i) {
+        if (i < 4) return arg(i);
+        uint32_t sp = 0;
+        if (!emu_.reg_read(UC_ARM_REG_SP, sp)) return 0;
+        return emu_.read_u32(sp + static_cast<uint32_t>((i - 4) * 4));
+    }
+
+    // JNI field accessors.
+    //
+    // The 18 slots of each block are, in order: the getters for object,
+    // boolean, byte, char, short, int, long, float and double, then the same
+    // nine setters. They used to fall through to the "unimplemented slot"
+    // path, which returns 0: Unity 4.6's UnityPlayer.nativeFile reads the
+    // current Context out of a static field, got null for both the field and
+    // its value, handed that null to ApplicationErrorReport and the UI thread
+    // died with an NPE before the engine could initialise.
+    uint32_t field_access(int k, bool is_static) {
+        static const char* const kTypeNames[9] = {
+            "Object", "Boolean", "Byte", "Char", "Short",
+            "Int", "Long", "Float", "Double"};
+        const bool setter = k >= 9;
+        const int type = setter ? k - 9 : k;
+
+        jobject holder = static_cast<jobject>(from_guest_ref(arg(1)));
+        const jfieldID fid = static_cast<jfieldID>(from_guest_ref(arg(2)));
+        if (!holder || !fid) {
+            LOGW("%s%s%sField: %s is null", is_static ? "Static" : "",
+                 setter ? "Set" : "Get", kTypeNames[type],
+                 holder ? "fieldID" : "receiver");
+            return 0;
+        }
+
+        jclass cls = is_static ? static_cast<jclass>(holder) : nullptr;
+
+        if (!setter) {
+            switch (type) {
+                case 0: {
+                    const jobject v = is_static ? env_->GetStaticObjectField(cls, fid)
+                                                : env_->GetObjectField(holder, fid);
+                    LOGI("Get%sObjectField(%p) -> %p", is_static ? "Static" : "",
+                         static_cast<void*>(fid), v);
+                    return to_guest_ref(v);
+                }
+                case 1:
+                    return (is_static ? env_->GetStaticBooleanField(cls, fid)
+                                      : env_->GetBooleanField(holder, fid)) ? JNI_TRUE : JNI_FALSE;
+                case 2:
+                    return static_cast<uint32_t>(static_cast<int8_t>(
+                        is_static ? env_->GetStaticByteField(cls, fid)
+                                  : env_->GetByteField(holder, fid)));
+                case 3:
+                    return static_cast<uint32_t>(is_static ? env_->GetStaticCharField(cls, fid)
+                                                           : env_->GetCharField(holder, fid));
+                case 4:
+                    return static_cast<uint32_t>(static_cast<int16_t>(
+                        is_static ? env_->GetStaticShortField(cls, fid)
+                                  : env_->GetShortField(holder, fid)));
+                case 5:
+                    return static_cast<uint32_t>(is_static ? env_->GetStaticIntField(cls, fid)
+                                                           : env_->GetIntField(holder, fid));
+                case 6:
+                    return ret_i64(is_static ? env_->GetStaticLongField(cls, fid)
+                                             : env_->GetLongField(holder, fid));
+                case 7:
+                    return ret_f(is_static ? env_->GetStaticFloatField(cls, fid)
+                                           : env_->GetFloatField(holder, fid));
+                default:
+                    return ret_d(is_static ? env_->GetStaticDoubleField(cls, fid)
+                                           : env_->GetDoubleField(holder, fid));
+            }
+        }
+
+        switch (type) {
+            case 0: {
+                jobject v = static_cast<jobject>(from_guest_ref(arg(3)));
+                LOGI("Set%sObjectField(%p) <- %p", is_static ? "Static" : "",
+                     static_cast<void*>(fid), v);
+                if (is_static) env_->SetStaticObjectField(cls, fid, v);
+                else           env_->SetObjectField(holder, fid, v);
+                break;
+            }
+            case 1:
+                if (is_static) env_->SetStaticBooleanField(cls, fid, static_cast<jboolean>(arg(3) & 0xFFu));
+                else           env_->SetBooleanField(holder, fid, static_cast<jboolean>(arg(3) & 0xFFu));
+                break;
+            case 2:
+                if (is_static) env_->SetStaticByteField(cls, fid, static_cast<jbyte>(arg(3)));
+                else           env_->SetByteField(holder, fid, static_cast<jbyte>(arg(3)));
+                break;
+            case 3:
+                if (is_static) env_->SetStaticCharField(cls, fid, static_cast<jchar>(arg(3) & 0xFFFFu));
+                else           env_->SetCharField(holder, fid, static_cast<jchar>(arg(3) & 0xFFFFu));
+                break;
+            case 4:
+                if (is_static) env_->SetStaticShortField(cls, fid, static_cast<jshort>(arg(3)));
+                else           env_->SetShortField(holder, fid, static_cast<jshort>(arg(3)));
+                break;
+            case 5:
+                if (is_static) env_->SetStaticIntField(cls, fid, static_cast<jint>(arg(3)));
+                else           env_->SetIntField(holder, fid, static_cast<jint>(arg(3)));
+                break;
+            case 6: {
+                const jlong v = static_cast<jlong>(
+                    static_cast<uint64_t>(arg_word(3)) |
+                    (static_cast<uint64_t>(arg_word(4)) << 32));
+                if (is_static) env_->SetStaticLongField(cls, fid, v);
+                else           env_->SetLongField(holder, fid, v);
+                break;
+            }
+            case 7:
+                if (is_static) env_->SetStaticFloatField(cls, fid, f_arg(3));
+                else           env_->SetFloatField(holder, fid, f_arg(3));
+                break;
+            default: {
+                const uint64_t bits = static_cast<uint64_t>(arg_word(3)) |
+                                      (static_cast<uint64_t>(arg_word(4)) << 32);
+                double v;
+                std::memcpy(&v, &bits, sizeof v);
+                if (is_static) env_->SetStaticDoubleField(cls, fid, v);
+                else           env_->SetDoubleField(holder, fid, v);
+                break;
+            }
+        }
+        return 0;
+    }
+
     void write_double(uint32_t at, double d) {
         uint64_t b;
         std::memcpy(&b, &d, sizeof b);
         emu_.write_u32(at, static_cast<uint32_t>(b));
         emu_.write_u32(at + 4, static_cast<uint32_t>(b >> 32));
+    }
+
+    // ---- formatted output ------------------------------------------------
+    //
+    // Unity routes every log line, every shader-compile diagnostic and every
+    // "unable to open X" message through vsnprintf. Answering it with the
+    // generic "unimplemented -> 0" left the engine's own errors unreportable
+    // and its stderr full of NULs, so the guest va_list is walked here and
+    // rewritten by format_guest() against the host snprintf.
+    uint32_t write_formatted(uint32_t dst, uint32_t size, const std::string& text) {
+        const size_t n = text.size();
+        if (dst && size) {
+            const size_t copy = std::min(n, static_cast<size_t>(size - 1));
+            if (copy) emu_.write(dst, text.data(), copy);
+            const char z = 0;
+            emu_.write(dst + static_cast<uint32_t>(copy), &z, 1);
+        }
+        return static_cast<uint32_t>(n);
+    }
+
+    // Presents a guest va_list as the word stream format_guest() consumes.
+    // On ARM32 bionic a va_list is a plain pointer to the first variadic
+    // argument, so each read is one word at the current offset.
+    std::function<uint32_t()> va_reader(uint32_t va) {
+        auto off = std::make_shared<uint32_t>(0);
+        return [this, va, off]() -> uint32_t {
+            const uint32_t w = emu_.read_u32(va + *off);
+            *off += 4;
+            return w;
+        };
+    }
+
+    uint32_t imp_vsnprintf() {
+        const std::string fmt = guest_string(arg(2));
+        return write_formatted(arg(0), arg(1), format_guest(fmt, va_reader(arg(3))));
     }
 
     // ---- pthread / TLS ---------------------------------------------------
@@ -3084,15 +3401,28 @@ public:
         return 0;
     }
 
+    // One value table per host thread, shared by getspecific and setspecific.
+    // These used to be two separate function-local `static thread_local` maps,
+    // so every set went into a table the get never read and
+    // pthread_getspecific() always returned NULL. Unity keeps its per-thread
+    // engine state there: the get-or-create helper allocated the block, failed
+    // to store it, read back NULL and returned it, and UnityPlayer.nativeFile
+    // then wrote through that NULL (UC_ERR_MAP at addr 0) on the UI thread.
+    using TlsMap = std::unordered_map<uint32_t, uint32_t>;
+
+    static TlsMap& tls_values() {
+        static thread_local TlsMap values;
+        return values;
+    }
+
     uint32_t imp_pthread_getspecific() {
-        static thread_local std::unordered_map<uint32_t, uint32_t> t_tls_values;
-        auto it = t_tls_values.find(arg(0));
-        return it == t_tls_values.end() ? 0 : it->second;
+        const TlsMap& values = tls_values();
+        auto it = values.find(arg(0));
+        return it == values.end() ? 0 : it->second;
     }
 
     uint32_t imp_pthread_setspecific() {
-        static thread_local std::unordered_map<uint32_t, uint32_t> t_tls_values;
-        t_tls_values[arg(0)] = arg(1);
+        tls_values()[arg(0)] = arg(1);
         return 0;
     }
 
@@ -3130,6 +3460,7 @@ public:
 
     uint32_t imp_open() {
         std::string path = translate_path(guest_string(arg(0)), "open");
+        if (path.find(".apk") != std::string::npos) LOGI("open(%s)", path.c_str());
         const bool cpuinfo = is_proc_cpuinfo(path) && !virtual_cpuinfo_.empty();
         if (cpuinfo) path = virtual_cpuinfo_;
         const int fd = ::open(path.c_str(),
@@ -3236,6 +3567,7 @@ public:
 
     uint32_t imp_fopen() {
         std::string path = translate_path(guest_string(arg(0)), "fopen");
+        if (path.find(".apk") != std::string::npos) LOGI("fopen(%s)", path.c_str());
         const std::string mode = guest_string(arg(1));
         // A read-only probe of /proc/cpuinfo is served from the synthetic
         // file; a write attempt still opens the real (host) path so nothing
@@ -3263,11 +3595,15 @@ public:
 
     uint32_t imp_fread() {
         FILE* f = host_file(arg(3));
-        if (!f) return 0;
+        if (!f) {
+            LOGW("fread: guest handle %u is not open", arg(3));
+            return 0;
+        }
         const size_t sz = arg(1), n = arg(2);
         std::vector<uint8_t> buf(sz * n);
         const size_t got = ::fread(buf.data(), sz, n, f);
         if (got) emu_.write(arg(0), buf.data(), got * sz);
+        LOGI("fread(sz=%zu, n=%zu) -> %zu (errno=%d)", sz, n, got, errno);
         return static_cast<uint32_t>(got);
     }
 
@@ -4811,6 +5147,7 @@ public:
 
         install_looper_handlers();
         install_asset_handlers();
+        install_zlib_handlers();
         install_config_handlers();
         install_input_handlers();
         install_native_activity_handlers();
@@ -4910,6 +5247,217 @@ public:
             return fn ? static_cast<uint32_t>(fn(from_guest_ref(arg(0)),
                                                  static_cast<int>(arg(1))))
                       : static_cast<uint32_t>(-1);
+        };
+    }
+
+    // =====================================================================
+    // zlib
+    //
+    // The guest reads its own APK as a zip, so it decompresses every entry with
+    // inflate(). Those symbols were unresolved, which is why Unity reported
+    // "Unable to locate player settings. bin/Data/settings.xml" for a settings
+    // file that is present in the APK, and then gave up with "Unable to
+    // open/read APK file!".
+    //
+    // A host z_stream cannot be handed a 32-bit guest address, so every call
+    // marshals the input and output windows through host buffers and keeps the
+    // real stream in guest_zstreams_. `state` is ours to fill in; the guest
+    // only ever treats it as opaque.
+    // =====================================================================
+    static constexpr uint32_t kZStreamWords = 14;   // 32-bit z_stream
+
+    z_stream* guest_zstream(uint32_t at) {
+        auto it = guest_zstreams_.find(at);
+        return it == guest_zstreams_.end() ? nullptr : it->second;
+    }
+
+    void install_zlib_handlers() {
+        import_handlers_["zlibVersion"] = [this] {
+            return guest_str(::zlibVersion());
+        };
+
+        auto init = [this](bool window_bits) {
+            const uint32_t at = arg(0);
+            if (!at) return static_cast<uint32_t>(Z_STREAM_ERROR);
+            z_stream* zs = new z_stream();
+            std::memset(zs, 0, sizeof *zs);
+            const int rc = window_bits ? ::inflateInit(zs)
+                                       : ::inflateInit2(zs, static_cast<int>(arg(1)));
+            if (rc != Z_OK) {
+                delete zs;
+                return static_cast<uint32_t>(rc);
+            }
+            // Stale stream at the same address (re-init without end).
+            auto old = guest_zstreams_.find(at);
+            if (old != guest_zstreams_.end()) {
+                ::inflateEnd(old->second);
+                delete old->second;
+            }
+            guest_zstreams_[at] = zs;
+            emu_.write_u32(at + 28, static_cast<uint32_t>(reinterpret_cast<uintptr_t>(zs) & 0xFFFFFFFFu));
+            return static_cast<uint32_t>(Z_OK);
+        };
+        import_handlers_["inflateInit_"] = [init] { return init(true); };
+        import_handlers_["inflateInit2_"] = [init] { return init(false); };
+
+        import_handlers_["inflate"] = [this] {
+            const uint32_t at = arg(0);
+            z_stream* zs = guest_zstream(at);
+            if (!zs) return static_cast<uint32_t>(Z_STREAM_ERROR);
+
+            const uint32_t next_in = emu_.read_u32(at + 0);
+            const uint32_t avail_in = emu_.read_u32(at + 4);
+            const uint32_t next_out = emu_.read_u32(at + 12);
+            const uint32_t avail_out = emu_.read_u32(at + 16);
+
+            std::vector<uint8_t> in(avail_in), out(avail_out);
+            if (avail_in && !emu_.read(next_in, in.data(), in.size())) {}
+            zs->next_in = in.empty() ? Z_NULL : in.data();
+            zs->avail_in = avail_in;
+            zs->next_out = out.empty() ? Z_NULL : out.data();
+            zs->avail_out = avail_out;
+
+            const int rc = ::inflate(zs, static_cast<int>(arg(1)));
+
+            const uint32_t consumed = avail_in - zs->avail_in;
+            const uint32_t produced = avail_out - zs->avail_out;
+            if (produced) emu_.write(next_out, out.data(), produced);
+
+            emu_.write_u32(at + 0, next_in + consumed);
+            emu_.write_u32(at + 4, zs->avail_in);
+            emu_.write_u32(at + 12, next_out + produced);
+            emu_.write_u32(at + 16, zs->avail_out);
+            emu_.write_u32(at + 20, static_cast<uint32_t>(zs->total_out));
+            emu_.write_u32(at + 48, static_cast<uint32_t>(zs->adler));
+            emu_.write_u32(at + 24, 0);          // msg: not translated
+            emu_.write_u32(at + 44, static_cast<uint32_t>(zs->data_type));
+            return static_cast<uint32_t>(rc);
+        };
+
+        import_handlers_["inflateReset"] = [this] {
+            z_stream* zs = guest_zstream(arg(0));
+            return zs ? static_cast<uint32_t>(::inflateReset(zs))
+                      : static_cast<uint32_t>(Z_STREAM_ERROR);
+        };
+        import_handlers_["inflateEnd"] = [this] {
+            const uint32_t at = arg(0);
+            z_stream* zs = guest_zstream(at);
+            if (!zs) return static_cast<uint32_t>(Z_STREAM_ERROR);
+            const int rc = ::inflateEnd(zs);
+            guest_zstreams_.erase(at);
+            delete zs;
+            emu_.write_u32(at + 28, 0);
+            return static_cast<uint32_t>(rc);
+        };
+
+        // deflate is only used by the guest for its own save/telemetry files.
+        import_handlers_["deflateInit2_"] = [this] {
+            const uint32_t at = arg(0);
+            if (!at) return static_cast<uint32_t>(Z_STREAM_ERROR);
+            z_stream* zs = new z_stream();
+            std::memset(zs, 0, sizeof *zs);
+            const int rc = ::deflateInit2(zs, static_cast<int>(arg(1)),
+                                          static_cast<int>(arg(2)),
+                                          static_cast<int>(arg(3)),
+                                          static_cast<int>(arg(4)),
+                                          static_cast<int>(arg(5)));
+            if (rc != Z_OK) {
+                delete zs;
+                return static_cast<uint32_t>(rc);
+            }
+            auto old = guest_zstreams_.find(at);
+            if (old != guest_zstreams_.end()) {
+                ::deflateEnd(old->second);
+                delete old->second;
+            }
+            guest_zstreams_[at] = zs;
+            emu_.write_u32(at + 28, static_cast<uint32_t>(reinterpret_cast<uintptr_t>(zs) & 0xFFFFFFFFu));
+            return static_cast<uint32_t>(Z_OK);
+        };
+        import_handlers_["deflateInit_"] = [this] {
+            const uint32_t at = arg(0);
+            if (!at) return static_cast<uint32_t>(Z_STREAM_ERROR);
+            z_stream* zs = new z_stream();
+            std::memset(zs, 0, sizeof *zs);
+            const int rc = ::deflateInit(zs, static_cast<int>(arg(1)));
+            if (rc != Z_OK) {
+                delete zs;
+                return static_cast<uint32_t>(rc);
+            }
+            guest_zstreams_[at] = zs;
+            emu_.write_u32(at + 28, static_cast<uint32_t>(reinterpret_cast<uintptr_t>(zs) & 0xFFFFFFFFu));
+            return static_cast<uint32_t>(Z_OK);
+        };
+        import_handlers_["deflate"] = [this] {
+            const uint32_t at = arg(0);
+            z_stream* zs = guest_zstream(at);
+            if (!zs) return static_cast<uint32_t>(Z_STREAM_ERROR);
+
+            const uint32_t next_in = emu_.read_u32(at + 0);
+            const uint32_t avail_in = emu_.read_u32(at + 4);
+            const uint32_t next_out = emu_.read_u32(at + 12);
+            const uint32_t avail_out = emu_.read_u32(at + 16);
+
+            std::vector<uint8_t> in(avail_in), out(avail_out);
+            if (avail_in) emu_.read(next_in, in.data(), in.size());
+            zs->next_in = in.empty() ? Z_NULL : in.data();
+            zs->avail_in = avail_in;
+            zs->next_out = out.empty() ? Z_NULL : out.data();
+            zs->avail_out = avail_out;
+
+            const int rc = ::deflate(zs, static_cast<int>(arg(1)));
+
+            const uint32_t consumed = avail_in - zs->avail_in;
+            const uint32_t produced = avail_out - zs->avail_out;
+            if (produced) emu_.write(next_out, out.data(), produced);
+
+            emu_.write_u32(at + 0, next_in + consumed);
+            emu_.write_u32(at + 4, zs->avail_in);
+            emu_.write_u32(at + 12, next_out + produced);
+            emu_.write_u32(at + 16, zs->avail_out);
+            emu_.write_u32(at + 20, static_cast<uint32_t>(zs->total_out));
+            emu_.write_u32(at + 48, static_cast<uint32_t>(zs->adler));
+            emu_.write_u32(at + 24, 0);
+            return static_cast<uint32_t>(rc);
+        };
+        import_handlers_["deflateEnd"] = [this] {
+            const uint32_t at = arg(0);
+            z_stream* zs = guest_zstream(at);
+            if (!zs) return static_cast<uint32_t>(Z_STREAM_ERROR);
+            const int rc = ::deflateEnd(zs);
+            guest_zstreams_.erase(at);
+            delete zs;
+            return static_cast<uint32_t>(rc);
+        };
+
+        import_handlers_["crc32"] = [this] {
+            const uint32_t n = arg(2);
+            std::vector<uint8_t> buf(n);
+            if (n && !emu_.read(arg(1), buf.data(), n)) return 0u;
+            return static_cast<uint32_t>(::crc32(arg(0), buf.data(), n));
+        };
+        import_handlers_["adler32"] = [this] {
+            const uint32_t n = arg(2);
+            std::vector<uint8_t> buf(n);
+            if (n && !emu_.read(arg(1), buf.data(), n)) return 0u;
+            return static_cast<uint32_t>(::adler32(arg(0), buf.data(), n));
+        };
+        import_handlers_["compressBound"] = [this] {
+            return static_cast<uint32_t>(::compressBound(static_cast<uLong>(arg(0))));
+        };
+        import_handlers_["uncompress"] = [this] {
+            const uint32_t dst = arg(0), dst_len_p = arg(1);
+            const uint32_t src = arg(2), src_len = arg(3);
+            uLongf cap = emu_.read_u32(dst_len_p);
+            std::vector<uint8_t> in(src_len), out(cap);
+            if (src_len && !emu_.read(src, in.data(), in.size())) return static_cast<uint32_t>(Z_BUF_ERROR);
+            uLongf got = cap;
+            const int rc = ::uncompress(out.data(), &got, in.data(), src_len);
+            if (rc == Z_OK) {
+                emu_.write(dst, out.data(), got);
+                emu_.write_u32(dst_len_p, static_cast<uint32_t>(got));
+            }
+            return static_cast<uint32_t>(rc);
         };
     }
 
@@ -5641,6 +6189,29 @@ public:
         import_handlers_["__errno"] = [this] { return errno_cell_; };
         import_handlers_["__errno_location"] = [this] { return errno_cell_; };
         import_handlers_["calloc"]  = [this] { return imp_calloc(); };
+        import_handlers_["memalign"] = [this] { return imp_memalign(); };
+        import_handlers_["aligned_alloc"] = [this] { return imp_memalign(); };
+        import_handlers_["posix_memalign"] = [this] { return imp_posix_memalign(); };
+        import_handlers_["valloc"] = [this] { return imp_valloc(); };
+        import_handlers_["pvalloc"] = [this] {
+            const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+            const size_t size = static_cast<size_t>(arg(0));
+            const size_t rounded = (size + page - 1) / page * page;
+            return imp_memalign_value(page, rounded ? rounded : page);
+        };
+        import_handlers_["memmem"] = [this] { return imp_memmem(); };
+        import_handlers_["vsnprintf"] = [this] { return imp_vsnprintf(); };
+        import_handlers_["vsprintf"] = [this] {
+            const std::string fmt = guest_string(arg(1));
+            return write_formatted(arg(0), 0xFFFFFFFFu,
+                                   format_guest(fmt, va_reader(arg(2))));
+        };
+        // __vsnprintf_chk(dst, size, flags, slen, fmt, va_list)
+        import_handlers_["__vsnprintf_chk"] = [this] {
+            const std::string fmt = guest_string(arg_word(4));
+            return write_formatted(arg(0), arg(1),
+                                   format_guest(fmt, va_reader(arg_word(5))));
+        };
         import_handlers_["realloc"] = [this] { return imp_realloc(); };
         import_handlers_["free"]    = [this] { return imp_free(); };
         import_handlers_["memcpy"]  = [this] { return imp_memcpy(); };
@@ -6640,9 +7211,17 @@ public:
         };
         import_handlers_["fseek"] = [this] {
             FILE* f = host_file(arg(0));
-            if (!f) return static_cast<uint32_t>(-1);
-            return ::fseek(f, static_cast<long>(arg(1)), static_cast<int>(arg(2))) == 0
-                       ? 0u : static_cast<uint32_t>(-1);
+            if (!f) {
+                LOGW("fseek: guest handle %u is not open", arg(0));
+                return static_cast<uint32_t>(-1);
+            }
+            // The offset is a signed long. Widening the raw 32-bit word
+            // straight to a 64-bit long turns -22 into 4294967274, which seeks
+            // past EOF: every read then returns 0 and Unity reported "Unable to
+            // locate player settings" for an APK it had just opened.
+            const long off = static_cast<long>(static_cast<int32_t>(arg(1)));
+            const int rc = ::fseek(f, off, static_cast<int>(arg(2)));
+            return rc == 0 ? 0u : static_cast<uint32_t>(-1);
         };
         import_handlers_["ftell"] = [this] {
             FILE* f = host_file(arg(0));
@@ -6811,11 +7390,176 @@ public:
                 return ::iscntrl(c) ? 1u : 0u;
             };
         }
+        // Wide-character classification. The default "unimplemented -> 0" path
+        // told mono that every wide character was unprintable, which corrupts
+        // its UTF-8/UTF-16 conversion paths.
+        import_handlers_["wctob"] = [this] {
+            const int32_t wc = static_cast<int32_t>(arg(0));
+            if (wc < 0 || wc > 0x7F) return 0xFFFFFFFFu;   // WEOF
+            return static_cast<uint32_t>(wc);
+        };
+        import_handlers_["btowc"] = [this] {
+            const uint32_t c = arg(0) & 0xFFu;
+            if (c == 0xFFu) return 0xFFFFFFFFu;            // WEOF
+            return c;
+        };
+        import_handlers_["wctype"] = [this] {
+            // bionic returns a small non-zero class id and 0 for "unknown".
+            const std::string name = guest_string(arg(0));
+            static const std::pair<const char*, uint32_t> kClasses[] = {
+                {"alnum", 1u}, {"alpha", 2u}, {"blank", 3u}, {"cntrl", 4u},
+                {"digit", 5u}, {"graph", 6u}, {"lower", 7u}, {"print", 8u},
+                {"punct", 9u}, {"space", 10u}, {"upper", 11u}, {"xdigit", 12u},
+            };
+            for (const auto& entry : kClasses) {
+                if (name == entry.first) return entry.second;
+            }
+            return 0u;
+        };
+        import_handlers_["iswspace"] = [this] {
+            const int32_t wc = static_cast<int32_t>(arg(0));
+            return (wc == ' ' || wc == '\t' || wc == '\n' || wc == '\r' ||
+                    wc == '\f' || wc == '\v') ? 1u : 0u;
+        };
+        import_handlers_["iswdigit"] = [this] {
+            const int32_t wc = static_cast<int32_t>(arg(0));
+            return (wc >= '0' && wc <= '9') ? 1u : 0u;
+        };
+        import_handlers_["iswalpha"] = [this] {
+            const int32_t wc = static_cast<int32_t>(arg(0));
+            return ((wc >= 'a' && wc <= 'z') || (wc >= 'A' && wc <= 'Z')) ? 1u : 0u;
+        };
         import_handlers_["getauxval"] = [this] {
             return arg(0) == 6 ? 4096u : 0u;   // AT_PAGESZ
         };
         import_handlers_["__cxa_atexit"] = [] { return 0u; };
         import_handlers_["__cxa_finalize"] = [] { return 0u; };
+        // Function-local C++ statics. The default "unimplemented -> 0" answer
+        // looks exactly like "already initialised", so the guest skipped the
+        // initialiser and then dereferenced the still-null static pointer:
+        // libunity's initJni died with UC_ERR_MAP on the UI thread.
+        import_handlers_["__cxa_guard_acquire"] = [this] {
+            const uint32_t guard = arg(0);
+            std::lock_guard<std::mutex> lk(cxa_guard_mtx_);
+            return cxa_guards_.count(guard) ? 0u : 1u;   // 1 = run the initialiser
+        };
+        import_handlers_["__cxa_guard_release"] = [this] {
+            const uint32_t guard = arg(0);
+            if (guard) {
+                std::lock_guard<std::mutex> lk(cxa_guard_mtx_);
+                cxa_guards_.insert(guard);
+            }
+            return 0u;
+        };
+        import_handlers_["__cxa_guard_abort"] = [this] {
+            const uint32_t guard = arg(0);
+            std::lock_guard<std::mutex> lk(cxa_guard_mtx_);
+            cxa_guards_.erase(guard);
+            return 0u;
+        };
+        import_handlers_["strtoull"] = [this] {
+            const std::string s = guest_string(arg(0));
+            char* end = nullptr;
+            const unsigned long long v = std::strtoull(s.c_str(), &end, static_cast<int>(arg(2)));
+            if (arg(1)) emu_.write_u32(arg(1), arg(0) + static_cast<uint32_t>(end - s.c_str()));
+            return ret_i64(static_cast<int64_t>(v));
+        };
+        import_handlers_["isnan"] = [this] {
+            double d;
+            const uint64_t bits = static_cast<uint64_t>(arg(0)) |
+                                  (static_cast<uint64_t>(arg(1)) << 32);
+            std::memcpy(&d, &bits, sizeof d);
+            return std::isnan(d) ? 1u : 0u;
+        };
+        import_handlers_["towupper"] = [this] {
+            const int32_t wc = static_cast<int32_t>(arg(0));
+            if (wc >= 'a' && wc <= 'z') return static_cast<uint32_t>(wc - 32);
+            return static_cast<uint32_t>(wc);
+        };
+        import_handlers_["strcoll"] = [this] {
+            return static_cast<uint32_t>(std::strcmp(guest_string(arg(0)).c_str(),
+                                                     guest_string(arg(1)).c_str()));
+        };
+        import_handlers_["wcscoll"] = [] { return 0u; };   // C locale: equal ordering
+        import_handlers_["wcsxfrm"] = [this] {
+            // C locale transform is the identity; n may be 0 (length query).
+            const uint32_t dst = arg(0), src = arg(1), n = arg(2);
+            uint32_t len = 0;
+            while (n == 0 || len + 1 < n) {
+                const uint32_t wc = emu_.read_u32(src + len * 4);
+                if (!wc) break;
+                if (dst && n != 0) emu_.write_u32(dst + len * 4, wc);
+                ++len;
+            }
+            if (dst && n != 0) emu_.write_u32(dst + len * 4, 0);
+            return len;
+        };
+        import_handlers_["strxfrm"] = [this] {
+            const std::string s = guest_string(arg(1));
+            const uint32_t n = arg(2);
+            if (n > 0) {
+                const uint32_t copy = static_cast<uint32_t>(
+                    std::min<size_t>(s.size(), static_cast<size_t>(n - 1)));
+                for (uint32_t i = 0; i < copy; ++i) {
+                    emu_.write(arg(0) + i, s.data() + i, 1);
+                }
+                const char z = 0;
+                emu_.write(arg(0) + copy, &z, 1);
+            }
+            return static_cast<uint32_t>(s.size());
+        };
+        import_handlers_["mbrtowc"] = [this] {
+            const uint32_t out = arg(0), src = arg(1), n = arg(2);
+            if (!src || n == 0) return 0u;
+            const uint32_t b = emu_.read_u8(src);
+            if (out) emu_.write_u32(out, b);
+            return b ? 1u : 0u;
+        };
+        import_handlers_["wcrtomb"] = [this] {
+            const uint32_t out = arg(0), wc = arg(1);
+            if (out) emu_.write_u8(out, static_cast<uint8_t>(wc & 0xFFu));
+            return 1u;
+        };
+        import_handlers_["wmemset"] = [this] {
+            const uint32_t dst = arg(0), val = arg(1), n = arg(2);
+            for (uint32_t i = 0; i < n; ++i) emu_.write_u32(dst + i * 4, val);
+            return dst;
+        };
+        import_handlers_["getwc"] = [this] { return 0xFFFFFFFFu; };   // EOF on the guest's FILE*
+        import_handlers_["strsep"] = [this] {
+            const uint32_t pptr = arg(0);
+            const std::string delims = guest_string(arg(1));
+            const uint32_t s = emu_.read_u32(pptr);
+            if (!s) return 0u;
+            uint32_t start = s, cur = s;
+            while (true) {
+                const uint8_t c = emu_.read_u8(cur);
+                if (c == 0) { emu_.write_u32(pptr, 0); break; }
+                if (delims.find(static_cast<char>(c)) != std::string::npos) {
+                    emu_.write_u8(cur, 0);
+                    emu_.write_u32(pptr, cur + 1);
+                    break;
+                }
+                ++cur;
+            }
+            return start;
+        };
+        import_handlers_["strcasestr"] = [this] {
+            std::string hay = guest_string(arg(0));
+            const std::string needle = guest_string(arg(1));
+            if (needle.empty()) return arg(0);
+            std::transform(hay.begin(), hay.end(), hay.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            std::string nd = needle;
+            std::transform(nd.begin(), nd.end(), nd.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            const size_t at = hay.find(nd);
+            return at == std::string::npos ? 0u : arg(0) + static_cast<uint32_t>(at);
+        };
+        import_handlers_["flock"] = [] { return 0u; };
+        import_handlers_["clearerr"] = [] { return 0u; };
+        import_handlers_["geteuid"] = [] { return 0u; };      // root-owned app sandbox
+        import_handlers_["getuid"] = [] { return 0u; };
         import_handlers_["dlopen"] = [this] {
             const std::string name = guest_string(arg(0));
             const uint32_t handle = guest_dlopen(name);
@@ -6970,6 +7714,72 @@ public:
     }
 
     uint32_t imp_malloc() { return guest_alloc(arg(0)); }
+
+    // memalign(posix) is what Unity 4.x uses for its job-queue buffers and
+    // texture staging rows. Reporting it as unimplemented made the core return
+    // NULL, and the very next store in libunity's static constructors faulted
+    // on address 0 with UC_ERR_MAP, so every constructor of the engine aborted.
+    uint32_t imp_memalign() {
+        const size_t alignment = static_cast<size_t>(arg(0));
+        const size_t size = static_cast<size_t>(arg(1));
+        if (alignment == 0 || (alignment & (alignment - 1)) != 0) return 0;
+        const size_t effective = alignment < sizeof(void*) ? sizeof(void*) : alignment;
+        const uint32_t p = emu_.alloc(size, effective);
+        if (p) guest_allocs_[p] = size;
+        return p;
+    }
+
+    // int posix_memalign(void** memptr, size_t alignment, size_t size)
+    uint32_t imp_posix_memalign() {
+        const uint32_t out = arg(0);
+        const size_t alignment = static_cast<size_t>(arg(1));
+        const size_t size = static_cast<size_t>(arg(2));
+        if (!out) return 22u;                                   // EINVAL
+        if (alignment == 0 || (alignment & (alignment - 1)) != 0 ||
+            alignment % sizeof(void*) != 0) {
+            return 22u;                                         // EINVAL
+        }
+        const uint32_t p = imp_memalign_value(alignment, size);
+        if (!p) return 12u;                                     // ENOMEM
+        const uint32_t slot = p;
+        if (!emu_.write(out, &slot, sizeof slot)) return 22u;
+        return 0;
+    }
+
+    uint32_t imp_valloc() {
+        const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+        return imp_memalign_value(page, static_cast<size_t>(arg(0)));
+    }
+
+    uint32_t imp_memalign_value(size_t alignment, size_t size) {
+        const size_t effective = alignment < sizeof(void*) ? sizeof(void*) : alignment;
+        const uint32_t p = emu_.alloc(size, effective);
+        if (p) guest_allocs_[p] = size;
+        return p;
+    }
+
+    // memmem() has no bionic NDK equivalent to delegate to, and returning NULL
+    // makes mono's string search silently miss every match.
+    uint32_t imp_memmem() {
+        const uint32_t hay = arg(0);
+        const uint32_t hay_len = arg(1);
+        const uint32_t needle = arg(2);
+        const uint32_t needle_len = arg(3);
+        if (!hay || !needle) return 0;
+        if (needle_len == 0) return hay;
+        if (needle_len > hay_len) return 0;
+
+        std::vector<uint8_t> h(hay_len), n(needle_len);
+        if (!emu_.read(hay, h.data(), h.size())) return 0;
+        if (!emu_.read(needle, n.data(), n.size())) return 0;
+        for (size_t i = 0; i + n.size() <= h.size(); ++i) {
+            if (h[i] != n[0]) continue;
+            if (std::memcmp(h.data() + i, n.data(), n.size()) == 0) {
+                return hay + static_cast<uint32_t>(i);
+            }
+        }
+        return 0;
+    }
 
     uint32_t imp_calloc() {
         const uint64_t total = static_cast<uint64_t>(arg(0)) * static_cast<uint64_t>(arg(1));
@@ -7516,8 +8326,13 @@ public:
         if (variant == 2) {
             jv_base = arg(3);
         } else if (variant == 1) {
-            const uint32_t va = arg(3);
-            va_ptr = va ? emu_.read_u32(va) : 0;
+            // On ARM32 bionic a va_list is a plain pointer to the first variadic
+            // argument (unlike AArch64, where it is a struct holding one).
+            // Dereferencing it once too often turned every argument into the
+            // contents of whatever the *handle* pointed at: the Context handle
+            // reached ApplicationErrorReport as null and Unity's nativeFile
+            // died with an NPE on the UI thread.
+            va_ptr = arg(3);
         } else {
             emu_.reg_read(UC_ARM_REG_SP, sp);
         }
@@ -7608,6 +8423,15 @@ public:
         args.reserve(sig.size());
         if (!read_args(sig, variant, args)) return 0;
         jvalue* a = args.empty() ? nullptr : args.data();
+
+        {
+            const auto nm = method_names_.find(static_cast<void*>(mid));
+            LOGI("Call%s%s v%d raw=%08x %08x %08x %08x (obj handles %u)",
+                 is_static ? "Static" : "",
+                 nm == method_names_.end() ? "?" : nm->second.c_str(), variant,
+                 arg_word(3), arg_word(4), arg_word(5), arg_word(6),
+                 static_cast<unsigned>(args.size()));
+        }
 
         switch (ret) {
             case 'V':
@@ -7744,7 +8568,7 @@ public:
     Deferred deferred_;
 
     static constexpr int kStartupCallBudgetMs = 250;
-    std::recursive_mutex emu_mu_;                     // serialises ART -> guest
+    GuestMutex   emu_mu_;                             // serialises ART -> guest
     std::chrono::steady_clock::time_point startup_begin_{};
 
     std::unordered_map<std::string, ImportHandler> import_handlers_;
@@ -7810,6 +8634,10 @@ public:
     jobject guest_thiz_ = nullptr;
 
     std::unordered_map<void*, std::string> method_sigs_;   // jmethodID -> descriptor
+    std::unordered_map<void*, std::string> method_names_;  // jmethodID -> method name
+    std::mutex cxa_guard_mtx_;
+    std::unordered_set<uint32_t> cxa_guards_;              // released __cxa_guard_*
+    std::unordered_map<uint32_t, z_stream*> guest_zstreams_;   // guest z_stream -> host
     std::unordered_map<uint32_t, ArrayPin> pins_;          // guest buffer -> pinned array
     std::unordered_map<uint32_t, uint32_t> tls_values_;    // pthread key -> value
     uint32_t next_tls_key_ = 1;
@@ -7882,6 +8710,27 @@ extern "C" uint64_t bridge_native_entry(uint32_t id, uint64_t* host_args) {
 // ===========================================================================
 namespace {
 
+// A candidate must really be an ELF32 little-endian EM_ARM image.
+//
+// The guest's `native/` directory doubles as the alias directory of its class
+// loader, which is where GuestDexLoader copies the *host* bridge and the host
+// libc++_shared.so so that System.loadLibrary() finds them. Those are x86_64 /
+// arm64 ELFs: mapping one fails, and a single failed map used to abort the whole
+// session before JNI_OnLoad could register Unity's natives.
+bool is_arm32_elf(const std::string& path) {
+    int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    unsigned char hdr[20] = {0};
+    const ssize_t n = ::read(fd, hdr, sizeof hdr);
+    ::close(fd);
+    if (n != static_cast<ssize_t>(sizeof hdr)) return false;
+    if (hdr[0] != 0x7f || hdr[1] != 'E' || hdr[2] != 'L' || hdr[3] != 'F') return false;
+    if (hdr[4] != 1 || hdr[5] != 1) return false;   // ELFCLASS32, little endian
+    const unsigned machine = static_cast<unsigned>(hdr[18]) |
+                             (static_cast<unsigned>(hdr[19]) << 8);
+    return machine == 40;                           // EM_ARM
+}
+
 // Every ARM32 payload staged by the ingestion engine in a game's private
 // directory. The `*32.so` suffix is the only contract: whatever the APK
 // shipped in lib/armeabi-v7a, renamed, gets mapped. Nothing here knows about
@@ -7903,9 +8752,13 @@ std::vector<std::string> discover_payloads(const std::string& dir) {
             } else if (name.size() > 3 && name.compare(name.size() - 3, 3, ".so") == 0) {
                 base_id = name.substr(0, name.size() - 3);
             }
-            if (!base_id.empty() && seen.insert(base_id).second) {
-                out.push_back(d + "/" + name);
+            if (base_id.empty() || !seen.insert(base_id).second) continue;
+            const std::string path = d + "/" + name;
+            if (!is_arm32_elf(path)) {
+                LOGI("payload scan: skipping %s (not an ARM32 ELF)", path.c_str());
+                continue;
             }
+            out.push_back(path);
         }
         closedir(dp);
     };

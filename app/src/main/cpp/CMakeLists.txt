@@ -83,6 +83,10 @@ if(ZAI_TRANSLATING_ABI)
         GLESv2
         GLESv3
         OpenSLES
+        # The guest opens its own APK as a zip: inflate/inflateInit_ are guest
+        # imports the core has to serve, and the host copy of zlib is what
+        # actually decompresses the entries.
+        z
     )
 
     # Unicorn's internal (TCG / softmmu) symbols must stay out of the exported

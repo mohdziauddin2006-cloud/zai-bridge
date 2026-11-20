@@ -383,8 +383,12 @@ public final class GameImporter {
                                 + " (" + out64.length() + " bytes)");
                     } else if (name.startsWith("lib/armeabi-v7a/")
                             || name.startsWith("lib/armeabi/")
-                            || name.startsWith("lib/arm/")
-                            || name.startsWith("lib/x86/")) {
+                            || name.startsWith("lib/arm/")) {
+                        // 32-bit is always translated by the ARM32 Unicorn core,
+                        // which maps EM_ARM only. A lib/x86 copy staged under the
+                        // same payload name would overwrite the ARM library and
+                        // the guest would fail with UnsatisfiedLinkError on its
+                        // first UnityPlayer native call, so x86 is skipped here.
                         if (!name.endsWith(".so")) continue;
                         String base = name.substring(name.lastIndexOf('/') + 1);
                         if (!base.startsWith("lib")) continue;
@@ -431,6 +435,11 @@ public final class GameImporter {
                             stats.abi64 = lowerPath.contains("x86_64") ? "x86_64" : "arm64-v8a";
                         }
                     } else {
+                        // Same rule as above: an x86 nativeLibraryDir cannot feed
+                        // the ARM32 translation core.
+                        if (lowerPath.contains("/x86") && !lowerPath.contains("x86_64")) {
+                            continue;
+                        }
                         File dstPayload = new File(payload32Dir, payloadName(base));
                         if (!dstPayload.isFile() || dstPayload.length() != so.length()) {
                             copyFile(so, dstPayload);

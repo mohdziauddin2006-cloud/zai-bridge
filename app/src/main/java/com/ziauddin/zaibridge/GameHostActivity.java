@@ -97,6 +97,9 @@ public class GameHostActivity extends Activity {
     };
 
     private final Object startLock = new Object();
+    /** Counted down once the native session has registered the guest natives. */
+    private final java.util.concurrent.CountDownLatch sessionReady =
+            new java.util.concurrent.CountDownLatch(1);
 
     /**
      * Surface callbacks are handed to the core from this single background
@@ -335,6 +338,19 @@ public class GameHostActivity extends Activity {
                     return;
                 }
 
+                // The natives have to be registered before the guest Activity
+                // exists. UnityPlayer.<init> calls nativeFile on the main thread
+                // and a NativeActivity calls ANativeActivity_onCreate from its
+                // onCreate; both need a live emulator, otherwise ART throws
+                // UnsatisfiedLinkError before the engine ever starts. So the
+                // session is opened first and the Activity is created after.
+                guestPrepared = true;
+                dispatchSessionIfReady();
+                final boolean sessionUp =
+                        sessionReady.await(15, java.util.concurrent.TimeUnit.SECONDS);
+                Log.i(TAG, "native session up=" + sessionUp
+                        + "; creating guest Activity");
+
                 if (loader != null) {
                     final GuestActivityHost host =
                             new GuestActivityHost(this, gameDir, pkgName, loader);
@@ -352,6 +368,9 @@ public class GameHostActivity extends Activity {
                                 host.onCreate();
                                 host.onStart();
                                 host.onResume();
+                                if (host.getGuest() != null) {
+                                    UnicornBridge.setGuestActivity(host.getGuest());
+                                }
                             }
                         } finally {
                             created.countDown();
@@ -359,9 +378,6 @@ public class GameHostActivity extends Activity {
                     });
                     created.await(10, java.util.concurrent.TimeUnit.SECONDS);
                 }
-
-                guestPrepared = true;
-                dispatchSessionIfReady();
             } catch (Throwable t) {
                 Log.e(TAG, "guest runtime failed to prepare", t);
                 reportSession(UnicornBridge.SESSION_INIT_FAILED);
@@ -437,6 +453,8 @@ public class GameHostActivity extends Activity {
             }
         } catch (Throwable t) {
             Log.e(TAG, "native session crashed", t);
+        } finally {
+            sessionReady.countDown();
         }
         reportSession(result);
     }

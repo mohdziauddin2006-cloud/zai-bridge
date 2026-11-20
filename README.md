@@ -150,6 +150,29 @@ pwsh ./scripts/build_and_push.ps1
 | **Zipalign Verification** | `PASSED` | 4-byte boundary aligned (`zipalign -p -f 4`) |
 | **Signature Schemes** | `VERIFIED` | APK Signature Scheme v2 + v3 verified via `apksigner` |
 | **16 KB Memory Pages** | `COMPLIANT` | Verified `-Wl,-z,max-page-size=16384` on Android 15/16 |
+
+### On-device run: Hell Zombie (Unity 4.6.6f2, `NativeActivity`)
+
+Validated on an x86_64 API 34 emulator (`-gpu swiftshader_indirect`) through the
+ARM32 Unicorn core, with the guest payload taken from `Hell-Zombie-v1-07.apk`.
+
+| Stage | Status |
+|---|---|
+| Import & stage 32-bit APK (70 MB, `mode=unicorn32`, 4 `armeabi-v7a` libs) | `PASSED` |
+| `JNI_OnLoad` / `RegisterNatives` for `libunity32.so` + `libmono32.so` | `PASSED` (5/5 `WWW` natives, `UnityPlayer` natives bound) |
+| 236 `libunity` static constructors run to completion | `PASSED` |
+| APK zip read over the marshalled `fseek`/`fread`/`fopen` path | `PASSED` ("Unable to open/read APK file!" eliminated) |
+| `UnityPlayer.<init>` → `nativeFile` → `initJni` → `nativeInitWWW` | `PASSED`, no CheckJNI abort |
+| `nativeSetDefaultDisplay`, guest `SurfaceView` inflate + surface hook | `PASSED` |
+| Guest `Activity` resumed, first `eglSwapBuffers` frame | **NOT YET REACHED** |
+
+Remaining blocker: the guest (`AndroidManifest` `lib_name`) loads the bridge a
+second time through the staged `libmain.so` alias copy, so the framework's
+`ANativeActivity_onCreate` lands in an instance whose session globals are null
+(`bridge or emulator not initialised`). Unity then tears the guest `Activity`
+down before it is resumed. The fix is to share the session state across the
+alias instance (a small shim library both copies link against) rather than to
+copy the runtime.
 | **Unity NativeLoader JNI** | `RESOLVED` | Handle-scoped `dlsym`, per-method `RegisterNatives` isolation |
 | **UI MainThread ANR** | `RESOLVED` | Background executor staging + Material 3 loading state |
 | **Hardware GPU Detection** | `RESOLVED` | EGL14 1x1 pbuffer background renderer probe |
