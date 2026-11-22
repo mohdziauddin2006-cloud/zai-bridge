@@ -43,6 +43,10 @@ std::string cpuinfo_text();
 // redirects guest opens of /proc/cpuinfo here.
 std::string virtual_cpuinfo_path(const std::string& cache_dir);
 
+// Synthetic /proc/stat; the guest cannot read the real one on modern Android.
+std::string proc_stat_text();
+std::string virtual_proc_stat_path(const std::string& cache_dir);
+
 // AT_HWCAP / AT_HWCAP2 values an ARMv7-A + VFPv3-D32 + NEON part reports.
 uint32_t guest_hwcap();
 uint32_t guest_hwcap2();

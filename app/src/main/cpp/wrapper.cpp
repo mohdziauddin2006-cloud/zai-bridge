@@ -70,6 +70,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -196,7 +197,11 @@ std::string g_last_import;
 // Guest address space
 // ---------------------------------------------------------------------------
 constexpr uint32_t kHeapBase   = 0x30000000u;
-constexpr size_t   kHeapSize   = 64u * 1024u * 1024u;
+// Unity's mono start-up (mscorlib + every assembly, textures and reflection
+// metadata) lives in this arena and had exhausted 64 MB before the first frame
+// was ever drawn. It fills the 256 MB between the heap base and the first
+// library slot; pages are only committed as they are touched.
+constexpr size_t   kHeapSize   = 256u * 1024u * 1024u;
 
 constexpr uint32_t kImageBase0 = 0x40000000u;
 constexpr uint32_t kImageStride = 0x01000000u;  // 16 MB per library slot
@@ -209,13 +214,41 @@ constexpr size_t   kStubRegionSz = kStubCount * kStubStride;
 constexpr uint32_t kReturnSentinel = 0x500F0000u;
 
 constexpr uint32_t kStackTop  = 0x7FF00000u;
-constexpr size_t   kStackSize = 1u * 1024u * 1024u;
+// Mono's start-up recurses deeply enough (GC init + reflection over every
+// managed assembly) to need more than 1 MB; a 1 MB stack put SP below the
+// mapped region and the next store became UC_ERR_MAP at boot.
+constexpr size_t   kStackSize = 8u * 1024u * 1024u;
 
 // Guard against runaway guest code (a broken import bridge shows up as a hang).
 // This is deliberately generous: a level-load legitimately burns hundreds of
 // millions of instructions decoding textures, so the wall-clock limit in call()
 // is what actually catches a guest that never returns.
 constexpr uint64_t kMaxInstructions = 4000ull * 1000ull * 1000ull;
+
+// A guest longjmp() cannot write PC from an import hook (Unicorn clears CPSR.T
+// on a PC write, so a Thumb resume lands in ARM mode), so the handler points LR
+// at this unmapped word instead: the guest's own `bx lr` / `pop {pc}` preserves
+// the instruction set, the fetch faults, and the run loop applies the saved
+// context and continues at the real target.
+constexpr uint32_t kLongjmpSentinel = 0x500F0010u;
+
+// Guest signal disposition table (SIGSEGV is what Boehm's stack-bound probes
+// need). One guest VM per process, so a file-static table is enough.
+struct GuestSigAction {
+    uint32_t handler  = 0;   // 0 = SIG_DFL, 1 = SIG_IGN
+    uint32_t flags    = 0;
+    uint32_t restorer = 0;
+};
+static GuestSigAction g_sig_actions[65];
+static std::mutex     g_sig_actions_mtx;
+
+// Lowest address / size of the emulated thread stack, published by
+// Emulator::init() for pthread_attr_getstack() and getrlimit().
+static uint32_t g_guest_stack_base = 0;
+static uint32_t g_guest_stack_size = 0;
+
+// Magic stamped into a guest pthread_attr_t handed out by pthread_getattr_np().
+constexpr uint32_t kGuestAttrMagic = 0x5A414154u;   // "ZAAT"
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -504,6 +537,9 @@ public:
 
         // Every stub starts as `bx lr`; the code hook intercepts before it runs,
         // so this is only a safety net if a hook is ever missed.
+        g_guest_stack_base = kStackTop - static_cast<uint32_t>(kStackSize);
+        g_guest_stack_size = static_cast<uint32_t>(kStackSize);
+
         std::vector<uint8_t> stub(kStubStride, 0);
         for (size_t i = 0; i < kStubCount; ++i) {
             stub[0] = 0x1E; stub[1] = 0xFF; stub[2] = 0x2F; stub[3] = 0xE1;
@@ -541,7 +577,18 @@ public:
     static void mem_fault_thunk(uc_engine* uc, uc_mem_type type, uint64_t address,
                                 int size, int64_t value, void* user_data) {
         (void)value;
-        (void)user_data;
+        Emulator* self = static_cast<Emulator*>(user_data);
+        if (self) {
+            self->fault_.valid = true;
+            self->fault_.addr = address;
+            self->fault_.size = size;
+            self->fault_.write = type == UC_MEM_WRITE_UNMAPPED;
+            self->fault_.fetch = type == UC_MEM_FETCH_UNMAPPED;
+            for (int i = 0; i < 16; ++i) {
+                uc_reg_read(uc, UC_ARM_REG_R0 + i, &self->fault_.regs[i]);
+            }
+            uc_reg_read(uc, UC_ARM_REG_CPSR, &self->fault_.cpsr);
+        }
         uint32_t pc = 0, lr = 0, sp = 0;
         uc_reg_read(uc, UC_ARM_REG_PC, &pc);
         uc_reg_read(uc, UC_ARM_REG_LR, &lr);
@@ -727,6 +774,12 @@ public:
         uc_context* saved = nullptr;
         uint32_t    entry = 0;
         std::string what;
+        // Only the ART thread that was inside the call may continue it. The
+        // guest's suspended frame can be holding guest mutexes that this very
+        // thread's continuation needs, so resuming it from a *different*
+        // thread deadlocks both against the guest and against the emulator
+        // lock.
+        pthread_t   owner = 0;
     };
 
     // Enter the guest, stopping when PC reaches the return sentinel.
@@ -790,6 +843,7 @@ public:
             pending_.saved = saved;
             pending_.entry = entry;
             pending_.what = what;
+            pending_.owner = pthread_self();
             if (paused_out) *paused_out = true;
             LOGI("call(%s) @%08x suspended at pc=%08x after %dms: "
                  "ART thread released, continuing on the next native entry",
@@ -817,6 +871,19 @@ public:
                  what, entry, uc_strerror(err), pc, lr, sp, cpsr,
                  (cpsr & 0x20u) ? "THUMB" : "ARM",
                  r0, r1, r2, r3, g_last_import.c_str());
+            std::string chain;
+            char frame_buf[16];
+            uint32_t fp = 0;
+            reg_read(UC_ARM_REG_R11, fp);
+            for (int i = 0; i < 14 && fp > kHeapBase && fp < kStackTop; ++i) {
+                const uint32_t ret = read_u32(fp);
+                std::snprintf(frame_buf, sizeof frame_buf, " %08x", ret);
+                chain += frame_buf;
+                const uint32_t next = read_u32(fp - 4);
+                if (next <= fp) break;
+                fp = next;
+            }
+            LOGE("call(%s): backtrace:%s", what, chain.c_str());
         }
 
         uc_context_restore(uc_, saved);
@@ -851,6 +918,7 @@ public:
             pending_.saved = saved;
             pending_.entry = entry;
             pending_.what = what;
+            pending_.owner = pthread_self();
             return false;
         }
         --depth_;
@@ -870,7 +938,164 @@ public:
 
     bool has_pending() const { return pending_.active; }
 
+    bool pending_owned_by_current_thread() const {
+        return pending_.active && pending_.owner == pthread_self();
+    }
+
+    // A guest longjmp() that must resume in the middle of the current run.
+    struct LongjmpTarget {
+        bool     active = false;
+        uint32_t pc = 0;      // target, Thumb bit preserved
+        uint32_t cpsr = 0;
+    } pending_longjmp_;
+
+    // Number of guest signal handlers currently on the emulated stack, so a
+    // fault raised *by* a handler is not forwarded to it again forever.
+    int sig_depth_ = 0;
+
 private:
+    struct Fault {
+        bool     valid = false;
+        bool     write = false;
+        bool     fetch = false;
+        uint64_t addr = 0;
+        int      size = 0;
+        uint32_t regs[16] = {0};
+        uint32_t cpsr = 0;
+    } fault_;
+
+    // Turn the recorded unmapped access into a guest signal frame and return the
+    // handler address (0 when no guest handler wants it). ARM32 bionic layouts:
+    // siginfo_t is 128 bytes with si_signo/si_errno/si_code then `_sigfault._addr`
+    // at +12, ucontext_t starts uc_flags/uc_link/uc_stack/uc_sigmask then
+    // mcontext_t at +24 with arm_r0..arm_pc/arm_cpsr.
+    uint32_t build_signal_frame(int sig, uint32_t& out_frame_sp) {
+        GuestSigAction act;
+        {
+            std::lock_guard<std::mutex> lk(g_sig_actions_mtx);
+            act = g_sig_actions[sig & 63];
+        }
+        if (!act.handler || act.handler == 1u) return 0;
+        if (sig_depth_ >= 2) {
+            LOGE("SIGSEGV raised inside a guest handler (depth %d) - giving up", sig_depth_);
+            return 0;
+        }
+
+        const uint32_t sp0 = align_down(fault_.regs[13], 8);
+        const uint32_t uc = sp0 - 320;
+        const uint32_t si = uc - 160;
+        const uint32_t frame = align_down(si - 32, 8);
+        if (frame < g_guest_stack_base || frame + 32 > kStackTop) {
+            LOGE("SIGSEGV frame would leave the guest stack (sp=%08x)", sp0);
+            return 0;
+        }
+
+        std::vector<uint8_t> info(128, 0), ctx(256, 0);
+        auto put32 = [](std::vector<uint8_t>& b, size_t off, uint32_t v) {
+            std::memcpy(&b[off], &v, 4);
+        };
+        put32(info, 0, static_cast<uint32_t>(sig));
+        put32(info, 8, 1u);                        // si_code = SEGV_MAPERR
+        put32(info, 12, static_cast<uint32_t>(fault_.addr));   // si_addr
+        put32(ctx, 8, g_guest_stack_base);         // uc_stack.ss_sp
+        put32(ctx, 12, 0);                         // uc_stack.ss_flags
+        put32(ctx, 16, g_guest_stack_size);        // uc_stack.ss_size
+        for (int i = 0; i < 13; ++i) put32(ctx, 36 + static_cast<size_t>(i) * 4, fault_.regs[i]);
+        put32(ctx, 36 + 13 * 4, fault_.regs[13]);  // arm_sp
+        put32(ctx, 36 + 14 * 4, fault_.regs[14]);  // arm_lr
+        put32(ctx, 36 + 15 * 4, fault_.regs[15]);  // arm_pc
+        put32(ctx, 36 + 16 * 4, fault_.cpsr);      // arm_cpsr
+
+        if (!write(si, info.data(), info.size()) || !write(uc, ctx.data(), ctx.size())) {
+            return 0;
+        }
+
+        reg_write(UC_ARM_REG_R0, static_cast<uint32_t>(sig));
+        reg_write(UC_ARM_REG_R1, si);
+        reg_write(UC_ARM_REG_R2, uc);
+        reg_write(UC_ARM_REG_R3, 0);
+        reg_write(UC_ARM_REG_SP, frame);
+        reg_write(UC_ARM_REG_LR, kReturnSentinel);
+        out_frame_sp = frame;
+        fault_.valid = false;
+        ++sig_depth_;
+        LOGE("SIGSEGV: delivering addr=%08llx (%s) to guest handler %08x (sp=%08x)",
+             static_cast<unsigned long long>(fault_.addr),
+             fault_.write ? "write" : fault_.fetch ? "fetch" : "read",
+             act.handler, frame);
+        return act.handler;
+    }
+
+    // Apply a guest longjmp() that was parked while the handler unwound.
+    bool apply_pending_longjmp(uint32_t& pc_out) {
+        if (!pending_longjmp_.active) return false;
+        const LongjmpTarget t = pending_longjmp_;
+        pending_longjmp_ = LongjmpTarget{};
+        uint32_t cpsr = t.cpsr;
+        uc_reg_write(uc_, UC_ARM_REG_CPSR, &cpsr);
+        pc_out = (t.pc & 1u) ? (t.pc | 1u) : (t.pc & ~1u);
+        sig_depth_ = 0;
+        LOGI("guest longjmp: resumed at pc=%08x", pc_out & ~1u);
+        return true;
+    }
+
+    // A guest that issues a raw `svc` (Mono's JIT does this for
+    // __ARM_NR_cacheflush and __ARM_NR_set_tls instead of calling libc) stops
+    // the engine with UC_ERR_EXCEPTION. Service the handful the runtime needs
+    // and step over the instruction.
+    bool handle_guest_svc(uint32_t& pc_out) {
+        uint32_t pc = 0, cpsr = 0;
+        if (!reg_read(UC_ARM_REG_PC, pc) || !reg_read(UC_ARM_REG_CPSR, cpsr)) return false;
+        const bool thumb = (cpsr & 0x20u) != 0;
+        uint32_t insn = 0;
+        if (thumb) {
+            uint16_t h = 0;
+            if (!read(pc - 2, &h, 2) || (h & 0xFF00u) != 0xDF00u) return false;
+        } else {
+            if (!read(pc - 4, &insn, 4) || (insn & 0xFFF00000u) != 0xEF000000u) return false;
+        }
+
+        uint32_t nr = 0, a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+        reg_read(UC_ARM_REG_R7, nr);
+        reg_read(UC_ARM_REG_R0, a0);
+        reg_read(UC_ARM_REG_R1, a1);
+        reg_read(UC_ARM_REG_R2, a2);
+        reg_read(UC_ARM_REG_R3, a3);
+
+        uint32_t ret = static_cast<uint32_t>(-38);   // -ENOSYS
+        switch (nr) {
+            case 0x0F0001:   // __ARM_NR_set_tls
+                reg_write(UC_ARM_REG_C13_C0_3, a0);
+                ret = 0;
+                break;
+            case 0x0F0002:   // __ARM_NR_cacheflush
+            case 125:        // mprotect
+            case 91:         // munmap
+            case 215:        // munmap2
+            case 20:         // getpid
+                ret = nr == 20 ? static_cast<uint32_t>(::getpid()) : 0;
+                break;
+            case 224:        // gettid
+                ret = static_cast<uint32_t>(::syscall(__NR_gettid));
+                break;
+            case 45:         // brk
+                ret = a0;
+                break;
+            default:
+                static std::mutex log_mtx;
+                static std::set<uint32_t> seen;
+                std::lock_guard<std::mutex> lk(log_mtx);
+                if (seen.insert(nr).second) {
+                    LOGW("guest svc #%u (r0=%08x r1=%08x r2=%08x) -> -ENOSYS", nr, a0, a1, a2);
+                }
+                break;
+        }
+        (void)a3;
+        reg_write(UC_ARM_REG_R0, ret);
+        pc_out = pc | (thumb ? 1u : 0u);
+        return true;
+    }
+
     // Chunked execution from `pc` up to the return sentinel.
     //
     // Chunks keep a guest that spins (typically a wait loop for a worker thread
@@ -915,11 +1140,40 @@ private:
                     continue;
                 }
             }
-            if (err != UC_ERR_OK) return;
+            // An unmapped access is a guest signal, not an emulator failure:
+            // Boehm's GC finds the stack bound by catching SIGSEGV around a
+            // probing write. Hand the fault to the guest handler in this same
+            // run so its siglongjmp() resumes the interrupted code.
+            if (err == UC_ERR_READ_UNMAPPED || err == UC_ERR_WRITE_UNMAPPED ||
+                err == UC_ERR_FETCH_UNMAPPED) {
+                uint32_t stop_pc = 0;
+                reg_read(UC_ARM_REG_PC, stop_pc);
+                if (stop_pc != kLongjmpSentinel && fault_.valid) {
+                    uint32_t frame_sp = 0;
+                    const uint32_t handler = build_signal_frame(11, frame_sp);
+                    if (handler) {
+                        pc = (handler & 1u) ? (handler | 1u) : (handler & ~1u);
+                        continue;
+                    }
+                }
+            }
+            if (err == UC_ERR_EXCEPTION && handle_guest_svc(pc)) continue;
+            if (err != UC_ERR_OK) {
+                // A guest longjmp() parked its target while the handler unwound;
+                // the fetch of the sentinel is where it becomes resumable.
+                if (apply_pending_longjmp(pc)) continue;
+                return;
+            }
 
             uint32_t cur = 0;
             reg_read(UC_ARM_REG_PC, cur);
-            if (cur == kReturnSentinel) return;   // normal return
+            if (cur == kReturnSentinel) {   // normal return
+                if (sig_depth_) {
+                    LOGE("guest SIGSEGV handler returned without longjmp()");
+                    sig_depth_ = 0;
+                }
+                return;
+            }
 
             budget -= std::min<uint64_t>(budget, kChunk);
             const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
@@ -1577,6 +1831,21 @@ public:
         const uint32_t stdio_files = emu_.alloc(3 * 256, 16);   // bionic __sF[3]
         const uint32_t environ_slot = emu_.alloc(4, 4);
         const uint32_t environ_array = emu_.alloc(4, 4);
+        // Mono's mono_pagesize() reads the bionic global __page_size instead of
+        // calling sysconf(). Resolving that OBJECT to a code stub made it read
+        // the stub's `bx lr` word (0xE12FFF1E) as the page size, so every
+        // mono_valloc() asked mmap() for ~3.7 GB: the GC/JIT arena allocation
+        // failed, mono_code_manager_reserve() returned NULL and the trampoline
+        // builder wrote generated code to address 0.
+        const uint32_t page_size_cell = emu_.alloc(8, 8);
+        if (page_size_cell) {
+            emu_.write_u32(page_size_cell, 4096);
+            emu_.write_u32(page_size_cell + 4, 12);   // __page_shift
+            data_slots_["__page_size"] = page_size_cell;
+            data_slots_["__page_shift"] = page_size_cell + 4;
+        } else {
+            LOGE("data imports: cannot allocate __page_size cell");
+        }
         if (stdio_files && environ_slot && environ_array) {
             // environ is a char** whose first entry is the NULL terminator.
             // Pointing the symbol straight at NULL makes TclSetupEnv load
@@ -1773,6 +2042,7 @@ public:
         data_dir_ = root + "/data";
         // Synthetic /proc/cpuinfo: every SoC's guest sees ARMv7-A + NEON.
         virtual_cpuinfo_ = zai::cpu::virtual_cpuinfo_path(data_dir_);
+        virtual_proc_stat_ = zai::cpu::virtual_proc_stat_path(data_dir_);
         ::mkdir(game_root_.c_str(), 0700);
         ::mkdir(obb_dir_.c_str(), 0700);
         ::mkdir(data_dir_.c_str(), 0700);
@@ -1986,6 +2256,19 @@ public:
         // than this call's budget, let ART have this call back too. Dropping a
         // frame here is harmless -- the engine is still initialising, and the
         // frame the UI thread waits for has already been answered.
+        if (emu_.has_pending() && !emu_.pending_owned_by_current_thread()) {
+            // A different thread is standing inside the guest. Let it continue
+            // its own call on its own stack: taking it over here would put two
+            // ART threads into one emulated CPU at once, and the suspended
+            // guest frame may hold the very guest mutex this call needs.
+            deferred_.active = true;
+            deferred_.fn = e.guest_fn;
+            deferred_.args = args;
+            deferred_.name = e.name;
+            LOGI("native %s%s deferred: guest call suspended on another thread",
+                 e.name.c_str(), e.sig.c_str());
+            return suspended_result(e);
+        }
         if (emu_.has_pending()) {
             bool still_paused = false;
             uint32_t ignored = 0;
@@ -2000,7 +2283,11 @@ public:
                 deferred_.name = e.name;
                 LOGI("native %s%s deferred: guest engine still initialising",
                      e.name.c_str(), e.sig.c_str());
-                return 0;
+                return suspended_result(e);
+            }
+            if (e.name == "render") {
+                ++frames_;
+                LOGI("eglSwapBuffers: frame %u presented (resumed render call)", frames_);
             }
             if (deferred_.active) {
                 uint32_t replayed = 0;
@@ -2012,9 +2299,12 @@ public:
             }
         }
 
-        const bool ok = emu_.call(e.guest_fn, args, ret, e.name.c_str(), budget_ms);
+        bool guest_paused = false;
+        const bool ok = emu_.call(e.guest_fn, args, ret, e.name.c_str(), budget_ms,
+                                  &guest_paused);
         if (n < 3) LOGI("native %s -> %s (ret=%d)", e.name.c_str(), ok ? "returned" : "FAILED",
                         static_cast<int>(ret));
+        if (!ok && guest_paused) return suspended_result(e);
         if (ok && e.name == "render") {
             // The swap itself belongs to the guest's Java renderer: it owns the
             // EGL context (javax.microedition.khronos.egl) and calls
@@ -2304,7 +2594,13 @@ private:
 
     static void code_hook_thunk(uc_engine* uc, uint64_t address, uint32_t size,
                                 void* user_data) {
-        (void)uc; (void)size;
+        (void)size;
+        // The hook's engine is the one executing this stub. Binding it here is
+        // what makes arg()/the R0 write-back address the right register file:
+        // ANativeActivity_onCreate arrives on the framework thread, where the
+        // thread-local set by init() never ran, so every import was dispatched
+        // with R0-R3 reading as zero.
+        t_current_uc = uc;
         static_cast<JniBridge*>(user_data)->on_stub(static_cast<uint32_t>(address));
     }
 
@@ -2313,8 +2609,6 @@ private:
         const size_t slot = (pc - kStubBase) / kStubStride;
         if (slot >= slots_.size()) return;
 
-        static thread_local bool t_redirected = false;
-        t_redirected = false;
         const StubSlot& s = slots_[slot];
         uint32_t ret = 0;
         switch (s.kind) {
@@ -2328,8 +2622,12 @@ private:
         }
 
         // A handler may have re-pointed PC itself (an in-guest call such as
-        // pthread_once); in that case returning to LR here would skip it.
-        if (t_redirected) return;
+        // pthread_once, abort(), or a corrupt-jmp_buf longjmp). Writing R0 and
+        // falling back to `bx lr` would undo that redirect.
+        if (redirected_) {
+            redirected_ = false;
+            return;
+        }
 
         uc_engine* uc = current_uc();
         if (uc) {
@@ -2382,6 +2680,136 @@ private:
     // storage grant on many devices), so every path that names the package is
     // rewritten onto the ingested copy before it reaches the host.
     // =====================================================================
+    // ---- files inside the game APK ---------------------------------------
+    // Unity addresses the assets it ships in its own APK as
+    // "<path>/game.apk/assets/bin/Data/Managed/mscorlib.dll", and Mono mmaps
+    // the assembly it finds there. The host cannot open a path that continues
+    // past the APK, and the old fallback handed back the APK itself, so Mono's
+    // image loader parsed the zip container: the first "pointer" it dereferenced
+    // was the central-directory signature 'PK\1\2'. Every entry is extracted
+    // once into the data directory and opened from there instead.
+    static uint16_t zip_u16(const uint8_t* p) {
+        return static_cast<uint16_t>(p[0] | (p[1] << 8));
+    }
+
+    static uint32_t zip_u32(const uint8_t* p) {
+        return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+               (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+    }
+
+    bool extract_apk_entry(const std::string& apk, const std::string& entry,
+                           std::string& out) {
+        if (apk.empty() || entry.empty() || entry.find("..") != std::string::npos) {
+            return false;
+        }
+        const std::string dest = data_dir_ + "/apk/" + entry;
+        struct stat st {};
+        if (::stat(dest.c_str(), &st) == 0 && st.st_size > 0) {
+            out = dest;
+            return true;
+        }
+
+        FILE* f = ::fopen(apk.c_str(), "rb");
+        if (!f) return false;
+
+        std::vector<uint8_t> data;
+        bool ok = false;
+        do {
+            if (::fseek(f, 0, SEEK_END) != 0) break;
+            const long size = ::ftell(f);
+            if (size < 22) break;
+            const long tail = std::min<long>(size, 66000);
+            std::vector<uint8_t> t(static_cast<size_t>(tail));
+            if (::fseek(f, size - tail, SEEK_SET) != 0) break;
+            if (::fread(t.data(), 1, t.size(), f) != t.size()) break;
+            long eocd = -1;
+            for (long i = static_cast<long>(t.size()) - 22; i >= 0; --i) {
+                if (zip_u32(&t[static_cast<size_t>(i)]) == 0x06054b50u) {
+                    eocd = i;
+                    break;
+                }
+            }
+            if (eocd < 0) break;
+            const uint32_t cd_size = zip_u32(&t[static_cast<size_t>(eocd) + 12]);
+            const uint32_t cd_off = zip_u32(&t[static_cast<size_t>(eocd) + 16]);
+            std::vector<uint8_t> cd(cd_size);
+            if (::fseek(f, static_cast<long>(cd_off), SEEK_SET) != 0) break;
+            if (::fread(cd.data(), 1, cd.size(), f) != cd.size()) break;
+
+            uint32_t p = 0;
+            uint16_t method = 0;
+            uint32_t csize = 0, usize = 0, lho = 0;
+            bool found = false;
+            while (p + 46 <= cd.size() && zip_u32(&cd[p]) == 0x02014b50u) {
+                const uint16_t name_len = zip_u16(&cd[p + 28]);
+                const uint16_t extra_len = zip_u16(&cd[p + 30]);
+                const uint16_t comment_len = zip_u16(&cd[p + 32]);
+                if (p + 46u + name_len <= cd.size() &&
+                    entry.size() == name_len &&
+                    std::memcmp(&cd[p + 46], entry.data(), name_len) == 0) {
+                    method = zip_u16(&cd[p + 10]);
+                    csize = zip_u32(&cd[p + 20]);
+                    usize = zip_u32(&cd[p + 24]);
+                    lho = zip_u32(&cd[p + 42]);
+                    found = true;
+                    break;
+                }
+                p += 46u + name_len + extra_len + comment_len;
+            }
+            if (!found) break;
+
+            uint8_t lh[30];
+            if (::fseek(f, static_cast<long>(lho), SEEK_SET) != 0) break;
+            if (::fread(lh, 1, sizeof lh, f) != sizeof lh) break;
+            if (zip_u32(lh) != 0x04034b50u) break;
+            const long data_at = static_cast<long>(lho) + 30 + zip_u16(lh + 26) +
+                                 zip_u16(lh + 28);
+            std::vector<uint8_t> in(csize);
+            if (::fseek(f, data_at, SEEK_SET) != 0) break;
+            if (::fread(in.data(), 1, in.size(), f) != in.size()) break;
+
+            if (method == 0) {
+                data = in;
+            } else if (method == 8) {
+                data.assign(usize, 0);
+                z_stream zs{};
+                if (::inflateInit2(&zs, -MAX_WBITS) != Z_OK) break;
+                zs.next_in = in.data();
+                zs.avail_in = csize;
+                zs.next_out = data.data();
+                zs.avail_out = usize;
+                const int rc = ::inflate(&zs, Z_FINISH);
+                const uint32_t produced = usize - zs.avail_out;
+                ::inflateEnd(&zs);
+                if (rc != Z_STREAM_END) break;
+                data.resize(produced);
+            } else {
+                break;
+            }
+            ok = true;
+        } while (false);
+        ::fclose(f);
+        if (!ok) return false;
+
+        const size_t slash = dest.find_last_of('/');
+        if (slash != std::string::npos) {
+            const std::string dir = dest.substr(0, slash);
+            for (size_t i = 1; i <= dir.size(); ++i) {
+                if (i == dir.size() || dir[i] == '/') {
+                    ::mkdir(dir.substr(0, i).c_str(), 0700);
+                }
+            }
+        }
+        FILE* w = ::fopen(dest.c_str(), "wb");
+        if (!w) return false;
+        const size_t wrote = ::fwrite(data.data(), 1, data.size(), w);
+        ::fclose(w);
+        if (wrote != data.size()) return false;
+        LOGI("extracted %s -> %s (%zu bytes)", entry.c_str(), dest.c_str(), data.size());
+        out = dest;
+        return true;
+    }
+
     std::string translate_path(const std::string& in, const char* why) {
         if (in.empty()) return in;
 
@@ -2446,6 +2874,16 @@ private:
                  in.compare(0, 11, "/mnt/sdcard") == 0)) {
                 const size_t slash = in.find_last_of('/');
                 out = data_dir_ + "/" + in.substr(slash + 1);
+                changed = true;
+            }
+        }
+
+        const size_t apk_at = out.find(".apk/");
+        if (apk_at != std::string::npos) {
+            std::string extracted;
+            if (extract_apk_entry(out.substr(0, apk_at + 4), out.substr(apk_at + 5),
+                                  extracted)) {
+                out = extracted;
                 changed = true;
             }
         }
@@ -2778,12 +3216,23 @@ public:
         // request to wrap the heap cursor. Report it with the register file so
         // the next investigation sees the caller rather than a later fault.
         if (len > kHeapSize) {
-            uint32_t pc = 0, lr = 0;
+            uint32_t pc = 0, lr = 0, fp = 0, sp = 0;
             emu_.reg_read(UC_ARM_REG_PC, pc);
             emu_.reg_read(UC_ARM_REG_LR, lr);
+            emu_.reg_read(UC_ARM_REG_R11, fp);
+            emu_.reg_read(UC_ARM_REG_SP, sp);
+            // AAPCS ARM frame chain: [fp] is the caller's return address,
+            // [fp-4] the caller's fp.
+            uint32_t chain[6] = {0};
+            uint32_t f = fp;
+            for (int i = 0; i < 6 && f > kHeapBase && f < kStackTop; ++i) {
+                chain[i] = emu_.read_u32(f);
+                f = emu_.read_u32(f - 4);
+            }
             LOGE("mmap: rejecting %u-byte request (arena %zu bytes, addr=%08x prot=%u "
-                 "flags=%u pc=%08x lr=%08x)", len, kHeapSize, arg(0), arg(2), arg(3),
-                 pc, lr);
+                 "flags=%u pc=%08x lr=%08x fp=%08x sp=%08x backtrace=%08x %08x %08x "
+                 "%08x %08x)", len, kHeapSize, arg(0), arg(2), arg(3), pc, lr, fp, sp,
+                 chain[0], chain[1], chain[2], chain[3], chain[4]);
             return kMapFailed;
         }
 
@@ -2881,6 +3330,17 @@ public:
 
     uint32_t dispatch_import(size_t slot, const StubSlot& s) {
         g_last_import = s.name;
+        static int trace_n = 0;
+        if (s.name == "malloc" || s.name == "__aeabi_memset" || s.name == "memset" ||
+            s.name == "calloc" || s.name == "free") {
+            ++trace_n;
+            if (trace_n < 200) {
+                uint32_t lr = 0;
+                emu_.reg_read(UC_ARM_REG_LR, lr);
+                LOGI("import %s(r0=%08x r1=%08x r2=%08x) ret_to=%08x", s.name.c_str(),
+                     arg(0), arg(1), arg(2), lr);
+            }
+        }
         auto it = import_handlers_.find(s.name);
         if (it != import_handlers_.end()) return it->second();
 
@@ -3498,6 +3958,12 @@ public:
     // Only the handle is narrowed: the guest gets a small integer, the host
     // keeps the real descriptor / FILE*.
     int host_fd(uint32_t g) {
+        // The guest's own stdio descriptors are never opened through imp_open,
+        // so they are not in fd_map_. Without this passthrough every
+        // fprintf(stderr, ...) -- including Mono's fatal-error reporting, which
+        // retries on failure and therefore recursed until the guest stack ran
+        // out -- failed with EBADF.
+        if (g <= 2) return static_cast<int>(g);
         auto it = fd_map_.find(g);
         return it == fd_map_.end() ? -1 : it->second;
     }
@@ -3506,10 +3972,11 @@ public:
         std::string path = translate_path(guest_string(arg(0)), "open");
         if (path.find(".apk") != std::string::npos) LOGI("open(%s)", path.c_str());
         ZAI_TRACE("open(%s, flags=%u)", path.c_str(), arg(1));
-        const bool cpuinfo = is_proc_cpuinfo(path) && !virtual_cpuinfo_.empty();
-        if (cpuinfo) path = virtual_cpuinfo_;
+        std::string redirected;
+        const bool virt = redirect_proc_file(path, redirected);
+        if (virt) path = redirected;
         const int fd = ::open(path.c_str(),
-                              cpuinfo ? O_RDONLY : static_cast<int>(arg(1)),
+                              virt ? O_RDONLY : static_cast<int>(arg(1)),
                               static_cast<int>(arg(2)));
         if (fd < 0) {
             LOGW("open(%s) -> %s", path.c_str(), strerror(errno));
@@ -3547,6 +4014,11 @@ public:
         const uint32_t n = arg(2);
         std::vector<uint8_t> buf(n);
         if (n && !emu_.read(src, buf.data(), n)) return static_cast<uint32_t>(-1);
+        if ((fd == 1 || fd == 2) && n && n < 600) {
+            std::string text(reinterpret_cast<const char*>(buf.data()), n);
+            while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) text.pop_back();
+            LOGW("guest stderr: %s", text.c_str());
+        }
         return static_cast<uint32_t>(::write(fd, buf.data(), n));
     }
 
@@ -3634,11 +4106,12 @@ public:
         // A read-only probe of /proc/cpuinfo is served from the synthetic
         // file; a write attempt still opens the real (host) path so nothing
         // silently succeeds where the kernel would refuse.
-        const bool cpuinfo = is_proc_cpuinfo(path) && !virtual_cpuinfo_.empty() &&
-                             mode.find('w') == std::string::npos &&
-                             mode.find('a') == std::string::npos &&
-                             mode.find('+') == std::string::npos;
-        if (cpuinfo) path = virtual_cpuinfo_;
+        const bool readonly = mode.find('w') == std::string::npos &&
+                              mode.find('a') == std::string::npos &&
+                              mode.find('+') == std::string::npos;
+        std::string redirected;
+        const bool virt = readonly && redirect_proc_file(path, redirected);
+        if (virt) path = redirected;
         FILE* f = ::fopen(path.c_str(), mode.c_str());
         if (!f) {
             LOGW("fopen(%s, %s) -> %s", path.c_str(), mode.c_str(), strerror(errno));
@@ -3729,6 +4202,190 @@ public:
         return 0;
     }
 
+    // ------------------------------------------------------------------
+    // setjmp / longjmp
+    //
+    // Mono's Boehm GC and its exception machinery bounce out of a fault with
+    // sigsetjmp/siglongjmp. Stubs returning 0 left every handler "succeeding"
+    // without a saved context, so the first longjmp restored garbage -- which
+    // is where the bogus 0xE12FFF1E mmap sizes came from. The cookie below is
+    // what turns a stale jmp_buf into a clean abort instead of a wild jump.
+    // ------------------------------------------------------------------
+    static constexpr uint32_t kJmpMagic = 0x5A414A4Du;   // "ZAJM"
+
+    uint32_t imp_setjmp(bool save_mask) {
+        const uint32_t env = arg(0);
+        if (!env) {
+            LOGE("setjmp(NULL): refusing to save a context");
+            return 0;
+        }
+        std::array<uint32_t, 32> buf{};
+        buf[0] = kJmpMagic;
+        buf[1] = save_mask ? 1u : 0u;
+        for (int i = 0; i < 8; ++i) emu_.reg_read(UC_ARM_REG_R4 + i, buf[2 + i]);
+        uint32_t sp = 0, lr = 0, cpsr = 0;
+        emu_.reg_read(UC_ARM_REG_SP, sp);
+        emu_.reg_read(UC_ARM_REG_LR, lr);
+        emu_.reg_read(UC_ARM_REG_CPSR, cpsr);
+        buf[10] = sp;
+        buf[11] = lr;
+        buf[12] = cpsr;
+        for (int i = 0; i < 8; ++i) {
+            int64_t d = 0;
+            if (uc_reg_read(emu_.uc(), UC_ARM_REG_D8 + i, &d) == UC_ERR_OK) {
+                buf[13 + i * 2] = static_cast<uint32_t>(static_cast<uint64_t>(d));
+                buf[14 + i * 2] = static_cast<uint32_t>(static_cast<uint64_t>(d) >> 32);
+            }
+        }
+        emu_.write(env, buf.data(), buf.size() * sizeof(uint32_t));
+        ZAI_TRACE("setjmp(%08x): sp=%08x lr=%08x", env, sp, lr);
+        return 0;
+    }
+
+    uint32_t imp_longjmp() {
+        const uint32_t env = arg(0);
+        const uint32_t val = arg(1);
+        const uint32_t magic = env ? emu_.read_u32(env) : 0;
+        if (magic != kJmpMagic) {
+            LOGE("longjmp(%08x): no saved context (cookie %08x) - stopping the run",
+                 env, magic);
+            emu_.reg_write(UC_ARM_REG_PC, kReturnSentinel);
+            redirected_ = true;
+            return 0;
+        }
+        std::array<uint32_t, 32> buf{};
+        if (!emu_.read(env, buf.data(), buf.size() * sizeof(uint32_t))) return 0;
+        for (int i = 0; i < 8; ++i) emu_.reg_write(UC_ARM_REG_R4 + i, buf[2 + i]);
+        emu_.reg_write(UC_ARM_REG_SP, buf[10]);
+        for (int i = 0; i < 8; ++i) {
+            const int64_t d = static_cast<int64_t>(
+                (static_cast<uint64_t>(buf[14 + i * 2]) << 32) | buf[13 + i * 2]);
+            uc_reg_write(emu_.uc(), UC_ARM_REG_D8 + i, &d);
+        }
+        const uint32_t resume = val ? val : 1u;
+        emu_.reg_write(UC_ARM_REG_R0, resume);
+        emu_.pending_longjmp_ = Emulator::LongjmpTarget{true, buf[11], buf[12]};
+        emu_.reg_write(UC_ARM_REG_LR, kLongjmpSentinel);
+        ZAI_TRACE("longjmp(%08x, %u) -> pc=%08x sp=%08x", env, val, buf[11], buf[10]);
+        return resume;
+    }
+
+    // ---- signals ------------------------------------------------------
+    // bionic arm32 struct sigaction: handler@0, sa_mask@4, sa_flags@8,
+    // sa_restorer@12.
+    uint32_t imp_sigaction() {
+        const int signum = static_cast<int>(arg(0));
+        const uint32_t act = arg(1);
+        const uint32_t old = arg(2);
+        if (signum <= 0 || signum >= 65) return 22u;   // EINVAL
+        std::lock_guard<std::mutex> lk(g_sig_actions_mtx);
+        if (old) {
+            emu_.write_u32(old + 0, g_sig_actions[signum].handler);
+            emu_.write_u32(old + 4, 0);                // sa_mask
+            emu_.write_u32(old + 8, g_sig_actions[signum].flags);
+            emu_.write_u32(old + 12, g_sig_actions[signum].restorer);
+        }
+        if (act) {
+            const uint32_t handler = emu_.read_u32(act);
+            g_sig_actions[signum].handler = handler;
+            g_sig_actions[signum].flags = emu_.read_u32(act + 8);
+            g_sig_actions[signum].restorer = emu_.read_u32(act + 12);
+            LOGI("sigaction(%d): handler=%08x flags=%08x restorer=%08x", signum,
+                 handler, g_sig_actions[signum].flags, g_sig_actions[signum].restorer);
+        }
+        return 0;
+    }
+
+    uint32_t imp_signal() {
+        const int signum = static_cast<int>(arg(0));
+        const uint32_t handler = arg(1);
+        if (signum <= 0 || signum >= 65) return 0xFFFFFFFFu;   // SIG_ERR
+        std::lock_guard<std::mutex> lk(g_sig_actions_mtx);
+        const uint32_t prev = g_sig_actions[signum].handler;
+        g_sig_actions[signum].handler = handler;
+        g_sig_actions[signum].flags = 0;
+        LOGI("signal(%d): handler=%08x", signum, handler);
+        return prev;
+    }
+
+    uint32_t imp_sigset_op(int op) {
+        const uint32_t set = arg(0);
+        if (!set) return 22u;
+        switch (op) {
+            case 0: emu_.write_u32(set, 0); return 0;                 // sigemptyset
+            case 1: emu_.write_u32(set, ~0u); return 0;               // sigfillset
+            case 2: {                                                 // sigaddset
+                const int sig = static_cast<int>(arg(1));
+                if (sig <= 0 || sig > 32) return 22u;
+                emu_.write_u32(set, emu_.read_u32(set) | (1u << (sig - 1)));
+                return 0;
+            }
+            case 3: {                                                 // sigdelset
+                const int sig = static_cast<int>(arg(1));
+                if (sig <= 0 || sig > 32) return 22u;
+                emu_.write_u32(set, emu_.read_u32(set) & ~(1u << (sig - 1)));
+                return 0;
+            }
+            default: {                                                // sigismember
+                const int sig = static_cast<int>(arg(1));
+                if (sig <= 0 || sig > 32) return 22u;
+                return (emu_.read_u32(set) >> (sig - 1)) & 1u;
+            }
+        }
+    }
+
+    uint32_t imp_sigprocmask() {
+        const uint32_t old = arg(2);
+        if (old) emu_.write_u32(old, 0);
+        return 0;
+    }
+
+    // ---- guest pthread attributes -------------------------------------
+    // Mono asks pthread_getattr_np() for the *live* stack bounds and then walks
+    // that range for GC roots. Both functions used to return 0 without writing
+    // their out-parameters, so the collector scanned whatever was on the stack
+    // and treated the result as heap sizes (the 0xE12FFF1E mmap request).
+    uint32_t imp_pthread_getattr_np() {
+        const uint32_t attr = arg(1);
+        if (!attr) return 22u;
+        std::vector<uint8_t> zero(24, 0);
+        emu_.write(attr, zero.data(), zero.size());
+        emu_.write_u32(attr, kGuestAttrMagic);
+        uint32_t sp = 0;
+        emu_.reg_read(UC_ARM_REG_SP, sp);
+        emu_.write_u32(attr + 4, sp);
+        return 0;
+    }
+
+    void thread_stack_bounds(uint32_t attr, uint32_t& base, uint32_t& size) {
+        base = g_guest_stack_base;
+        uint32_t top = kStackTop;
+        uint32_t sp = 0;
+        if (attr && emu_.read_u32(attr) == kGuestAttrMagic) {
+            sp = emu_.read_u32(attr + 4);
+            if (sp > base && sp <= kStackTop) top = sp;
+        } else {
+            emu_.reg_read(UC_ARM_REG_SP, sp);
+            if (sp > base && sp <= kStackTop) top = sp;
+        }
+        size = top - base;
+    }
+
+    uint32_t imp_pthread_attr_getstack() {
+        uint32_t base = 0, size = 0;
+        thread_stack_bounds(arg(0), base, size);
+        if (arg(1)) emu_.write_u32(arg(1), base);
+        if (arg(2)) emu_.write_u32(arg(2), size);
+        return 0;
+    }
+
+    uint32_t imp_pthread_attr_getstacksize() {
+        uint32_t base = 0, size = 0;
+        thread_stack_bounds(arg(0), base, size);
+        if (arg(1)) emu_.write_u32(arg(1), size);
+        return 0;
+    }
+
     // struct rlimit on 32-bit bionic uses 64-bit rlim_t fields. Leaving the
     // structure unwritten while returning 0 makes Mono read whatever was on its
     // stack as the address-space limit, which it then passes to mmap as a size.
@@ -3749,21 +4406,59 @@ public:
         return 0;
     }
 
+    static uint32_t host_total_pages() {
+        static const uint32_t pages = [] {
+            FILE* f = ::fopen("/proc/meminfo", "r");
+            unsigned long kb = 524288;   // 512 MB fallback
+            if (f) {
+                if (std::fscanf(f, "MemTotal: %lu kB", &kb) != 1) kb = 524288;
+                ::fclose(f);
+            }
+            return static_cast<uint32_t>(kb / 4);   // kB -> 4 KB pages
+        }();
+        return pages;
+    }
+
     uint32_t imp_sysconf() {
         // The guest is told about the host's real cores. A legacy engine sizes
         // its job/batching pools from these values, so a hard-coded 4 was both
         // wrong on an 8-core Dimensity and a bottleneck on a 4-core part.
         switch (static_cast<int>(arg(0))) {
+            case 4:  return 1024;    // _SC_OPEN_MAX
             case 39: return 4096;    // _SC_PAGESIZE
             case 30: return 4096;    // _SC_PAGE_SIZE
             case 96: return static_cast<uint32_t>(zai::cpu::topology().cores_conf);
             case 97: return static_cast<uint32_t>(zai::cpu::topology().cores_online);
-            default: return 1;       // a plausible "supported" answer
+            // Mono sizes its GC heap from these; a hard-coded 1 page told the
+            // collector the device had 4 KB of RAM.
+            case 85: return host_total_pages();                       // _SC_PHYS_PAGES
+            case 86: return host_total_pages() / 2;                   // _SC_AVPHYS_PAGES
+            case 84: return 65536;                                    // _SC_STREAM_MAX
+            default: return 1;
         }
     }
 
     bool is_proc_cpuinfo(const std::string& path) const {
         return path == "/proc/cpuinfo" || path == "/proc/self/cpuinfo";
+    }
+
+    bool is_proc_stat(const std::string& path) const {
+        return path == "/proc/stat" || path == "/proc/self/stat" ||
+               path == "/proc/self/statm";
+    }
+
+    // Redirects guest pseudo-files the app process may not read to the
+    // synthetic copies staged in the data directory.
+    bool redirect_proc_file(const std::string& path, std::string& out) const {
+        if (is_proc_cpuinfo(path) && !virtual_cpuinfo_.empty()) {
+            out = virtual_cpuinfo_;
+            return true;
+        }
+        if (is_proc_stat(path) && !virtual_proc_stat_.empty()) {
+            out = virtual_proc_stat_;
+            return true;
+        }
+        return false;
     }
 
     // bionic ARM32 struct statfs, filled from the host's statvfs.
@@ -6975,11 +7670,12 @@ public:
         import_handlers_["__open_2"] = [this] { return imp_open(); };
         import_handlers_["openat"] = [this] {
             std::string p = translate_path(guest_string(arg(1)), "openat");
-            const bool cpuinfo = is_proc_cpuinfo(p) && !virtual_cpuinfo_.empty();
-            if (cpuinfo) p = virtual_cpuinfo_;
-            const int fd = ::openat(cpuinfo ? AT_FDCWD : static_cast<int>(arg(0)),
+            std::string redirected;
+            const bool virt = redirect_proc_file(p, redirected);
+            if (virt) p = redirected;
+            const int fd = ::openat(virt ? AT_FDCWD : static_cast<int>(arg(0)),
                                     p.c_str(),
-                                    cpuinfo ? O_RDONLY : static_cast<int>(arg(2)),
+                                    virt ? O_RDONLY : static_cast<int>(arg(2)),
                                     static_cast<int>(arg(3)));
             if (fd < 0) return static_cast<uint32_t>(-1);
             const uint32_t g = next_handle_++;
@@ -7202,6 +7898,32 @@ public:
             emu_.write_u32(outpp, at);
             return static_cast<uint32_t>(out.size());
         };
+        // Mono formats every diagnostic through vasprintf. A stub returning 0
+        // without storing *strp left the caller reading the uninitialised
+        // pointer (the guest then strlen'd 0x7 and memcpy'd from it).
+        import_handlers_["vasprintf"] = [this, guest_va_list] {
+            const uint32_t outpp = arg(0);
+            if (!outpp) return static_cast<uint32_t>(-1);
+            const std::string fmt = safe_guest_string(arg(1), "vasprintf");
+            const std::string out = format_guest(fmt, guest_va_list(arg(2)));
+            const uint32_t at = guest_alloc(out.size() + 1);
+            if (!at) return static_cast<uint32_t>(-1);
+            emu_.write(at, out.c_str(), out.size() + 1);
+            emu_.write_u32(outpp, at);
+            return static_cast<uint32_t>(out.size());
+        };
+        import_handlers_["readlink"] = [this] {
+            const std::string path = translate_path(guest_string(arg(0)), "readlink");
+            std::vector<char> buf(1024, 0);
+            const ssize_t n = ::readlink(path.c_str(), buf.data(), buf.size() - 1);
+            if (n < 0) {
+                set_guest_errno_from_host();
+                return static_cast<uint32_t>(-1);
+            }
+            const uint32_t len = std::min<uint32_t>(static_cast<uint32_t>(n), arg(2));
+            if (len) emu_.write(arg(1), buf.data(), len);
+            return len;
+        };
         import_handlers_["fcntl"] = [this] {
             const int fd = host_fd(arg(0));
             if (fd < 0) return static_cast<uint32_t>(-1);
@@ -7218,15 +7940,22 @@ public:
             return 0u;
         };
         import_handlers_["fputc"] = [this] { return static_cast<uint32_t>(arg(0)); };
+        // Mono sizes its file-descriptor table from this. Answering 0 left the
+        // table NULL, and the first fd lookup then indexed address 0 + fd*60.
+        import_handlers_["getdtablesize"] = [] { return 1024u; };
         import_handlers_["perror"] = [this] {
             LOGW("guest perror: %s", guest_string(arg(0)).c_str());
             return 0u;
         };
         import_handlers_["fstat"]   = [this] { return imp_stat_common(true); };
+        import_handlers_["fstat64"] = [this] { return imp_stat_common(true); };
+        import_handlers_["__fstat64"] = [this] { return imp_stat_common(true); };
         import_handlers_["stat"]    = [this] { return imp_stat_common(false); };
         import_handlers_["stat64"]  = [this] { return imp_stat_common(false); };
+        import_handlers_["__stat64"] = [this] { return imp_stat_common(false); };
         import_handlers_["lstat"]   = [this] { return imp_stat_common(false); };
         import_handlers_["lstat64"] = [this] { return imp_stat_common(false); };
+        import_handlers_["__lstat64"] = [this] { return imp_stat_common(false); };
         import_handlers_["statfs"]  = [this] { return imp_statfs(); };
         import_handlers_["__statfs"] = [this] { return imp_statfs(); };
         import_handlers_["access"]  = [this] {
@@ -7351,6 +8080,12 @@ public:
             redirected_ = true;
             return 0u;
         };
+        import_handlers_["raise"] = [this] {
+            const int sig = static_cast<int>(arg(0));
+            LOGE("guest raise(%d)", sig);
+            if (sig == 6) return imp_abort();
+            return 0u;
+        };
         import_handlers_["abort"] = [this] { return imp_abort(); };
         import_handlers_["exit"] = [this] { return imp_abort(); };
         import_handlers_["_exit"] = [this] { return imp_abort(); };
@@ -7389,8 +8124,42 @@ public:
         import_handlers_["system"] = [] { return static_cast<uint32_t>(-1); };
         import_handlers_["waitpid"] = [] { return static_cast<uint32_t>(-1); };
         import_handlers_["dup2"] = [] { return static_cast<uint32_t>(-1); };
-        import_handlers_["setjmp"] = [] { return 0u; };
-        import_handlers_["sigsetjmp"] = [] { return 0u; };
+        import_handlers_["setjmp"] = [this] { return imp_setjmp(false); };
+        import_handlers_["_setjmp"] = [this] { return imp_setjmp(false); };
+        import_handlers_["sigsetjmp"] = [this] { return imp_setjmp(true); };
+        import_handlers_["__sigsetjmp"] = [this] { return imp_setjmp(true); };
+        import_handlers_["longjmp"] = [this] { return imp_longjmp(); };
+        import_handlers_["_longjmp"] = [this] { return imp_longjmp(); };
+        import_handlers_["siglongjmp"] = [this] { return imp_longjmp(); };
+        import_handlers_["sigaction"] = [this] { return imp_sigaction(); };
+        import_handlers_["signal"] = [this] { return imp_signal(); };
+        import_handlers_["bsd_signal"] = [this] { return imp_signal(); };
+        import_handlers_["sigemptyset"] = [this] { return imp_sigset_op(0); };
+        import_handlers_["sigfillset"] = [this] { return imp_sigset_op(1); };
+        import_handlers_["sigaddset"] = [this] { return imp_sigset_op(2); };
+        import_handlers_["sigdelset"] = [this] { return imp_sigset_op(3); };
+        import_handlers_["sigismember"] = [this] { return imp_sigset_op(4); };
+        import_handlers_["sigprocmask"] = [this] { return imp_sigprocmask(); };
+        import_handlers_["pthread_sigmask"] = [this] { return imp_sigprocmask(); };
+        import_handlers_["pthread_getattr_np"] = [this] { return imp_pthread_getattr_np(); };
+        import_handlers_["pthread_attr_getstack"] = [this] { return imp_pthread_attr_getstack(); };
+        import_handlers_["pthread_attr_getstacksize"] = [this] { return imp_pthread_attr_getstacksize(); };
+        import_handlers_["pthread_attr_setstack"] = [] { return 0u; };
+        import_handlers_["gettid"] = [] { return static_cast<uint32_t>(::syscall(__NR_gettid)); };
+        import_handlers_["kill"] = [] { return 0u; };
+        import_handlers_["sched_get_priority_max"] = [] { return 0u; };
+        import_handlers_["sched_get_priority_min"] = [] { return 0u; };
+        import_handlers_["strncat"] = [this] {
+            const uint32_t dst = arg(0);
+            const std::string src = safe_guest_string(arg(1), "strncat");
+            const size_t n = arg(2);
+            size_t len = 0;
+            while (len < 4096 && emu_.read_u8(dst + static_cast<uint32_t>(len)) != 0) ++len;
+            const std::string part = src.substr(0, n);
+            emu_.write(dst + static_cast<uint32_t>(len), part.data(), part.size());
+            emu_.write_u8(dst + static_cast<uint32_t>(len + part.size()), 0);
+            return dst;
+        };
         import_handlers_["__aeabi_atexit"] = [] { return 0u; };
         import_handlers_["fwide"] = [] { return 0u; };
         import_handlers_["strncasecmp"] = [this] {
@@ -7705,10 +8474,7 @@ public:
         import_handlers_["fork"] = [] { return static_cast<uint32_t>(-1); };
         import_handlers_["execv"] = [] { return static_cast<uint32_t>(-1); };
         import_handlers_["execl"] = [] { return static_cast<uint32_t>(-1); };
-        for (const char* n : {"sigaction", "sigprocmask", "sigemptyset", "sigfillset",
-                              "sigaddset", "sigdelset", "sigismember", "signal",
-                              "pthread_sigmask", "setpriority", "nice", "setbuf",
-                              "pthread_attr_setstack", "pthread_getattr_np",
+        for (const char* n : {"setpriority", "nice", "setbuf",
                               "pthread_getschedparam", "pthread_exit", "gmtime_r",
                               "localtime_r"}) {
             import_handlers_[n] = [] { return 0u; };
@@ -7797,7 +8563,9 @@ public:
         return len;
     }
 
-    uint32_t imp_malloc() { return guest_alloc(arg(0)); }
+    uint32_t imp_malloc() {
+        return guest_alloc(arg(0));
+    }
 
     // memalign(posix) is what Unity 4.x uses for its job-queue buffers and
     // texture staging rows. Reporting it as unimplemented made the core return
@@ -7868,9 +8636,20 @@ public:
     uint32_t imp_calloc() {
         const uint64_t total = static_cast<uint64_t>(arg(0)) * static_cast<uint64_t>(arg(1));
         if (total > 0x7FFFFFFFu) return 0;
-        // The heap arena is mapped zeroed and never recycled, so fresh
-        // allocations are already content-free.
-        return guest_alloc(static_cast<size_t>(total));
+        const uint32_t p = guest_alloc(static_cast<size_t>(total));
+        if (!p) return 0;
+        // The arena is mapped zeroed, but alloc() recycles freed blocks, so a
+        // recycled block still holds its previous contents. Mono builds its
+        // hash tables with calloc: an unzeroed bucket made a hash lookup treat
+        // a leftover zip signature ('PK\1\2') as a chain pointer.
+        std::vector<uint8_t> zeros(static_cast<size_t>(std::min<uint64_t>(total, 8192)));
+        uint64_t done = 0;
+        while (done < total) {
+            const size_t chunk = static_cast<size_t>(std::min<uint64_t>(total - done, zeros.size()));
+            if (!emu_.write(p + static_cast<uint32_t>(done), zeros.data(), chunk)) break;
+            done += chunk;
+        }
+        return p;
     }
 
     uint32_t imp_realloc() {
@@ -8650,6 +9429,15 @@ public:
     };
     Deferred deferred_;
 
+    // A native that is only *suspended* has not failed: the guest is still
+    // standing in the middle of it and the next entry continues it. Answering
+    // `false` from a boolean native is not neutral, though -- Unity's GL thread
+    // reads a false return from nativeRender() as "the engine is gone" and
+    // calls Activity.finish(), which tore the game down mid-initialisation.
+    static uint64_t suspended_result(const NativeEntry& e) {
+        return e.ret_type == 'Z' ? 1u : 0u;
+    }
+
     static constexpr int kStartupCallBudgetMs = 250;
     GuestMutex   emu_mu_;                             // serialises ART -> guest
     std::chrono::steady_clock::time_point startup_begin_{};
@@ -8713,6 +9501,7 @@ public:
     GLuint   current_fbo_ = 0;
     int      gles_major_ = 0;
     std::string virtual_cpuinfo_;
+    std::string virtual_proc_stat_;
     std::map<std::string, uint32_t> entry_points_;
     jobject guest_thiz_ = nullptr;
 

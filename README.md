@@ -165,6 +165,8 @@ ARM32 Unicorn core, with the guest payload taken from `Hell-Zombie-v1-07.apk`.
 | `UnityPlayer.<init>` → `nativeFile` → `initJni` → `nativeInitWWW` | `PASSED`, no CheckJNI abort |
 | `nativeSetDefaultDisplay`, guest `SurfaceView` inflate + surface hook | `PASSED` |
 | Guest `Activity` resumed (`onResume` → `nativeResume` returns) | `PASSED` |
+| Mono start-up: `setjmp`/`siglongjmp`, GC fault probe, `mono_valloc`, JIT init | `PASSED` (no `SIGSEGV`, no `abort()`) |
+| `mscorlib.dll` loaded from inside `game.apk` | `PASSED` (entry extracted on first use) |
 | First `eglSwapBuffers` frame | **NOT YET REACHED** |
 
 Session state is now shared with the guest's alias library through
@@ -174,12 +176,37 @@ few kilobytes that forwards `JNI_OnLoad`, `ANativeActivity_onCreate` and the
 session published in `ZAI_BRIDGE_SESSION_BINDING`. No duplicate runtime copy is
 mapped and `bridge or emulator not initialised` no longer occurs.
 
-Remaining blocker: the first `nativeRender` call enters Mono's start-up, where
-the GC reserves a garbage-sized region (`mmap` of `0xE12FFF1E` bytes) and then
-writes generated trampoline code into a NULL code-manager block, so the render
-call aborts before Unity presents a frame. Guest `sysconf`/`getrlimit`, the
-32-bit bionic `struct stat` layout and the heap-arena overflow guard have been
-corrected along the way; the Mono GC/JIT allocation path is the outstanding fix.
+Fixes landed while getting Mono past start-up, each one a real defect rather
+than a workaround:
+
+* ARM32 `setjmp`/`longjmp`/`sigsetjmp`/`siglongjmp` with a real register file
+  cookie, and `UC_ERR_READ/WRITE_UNMAPPED` forwarded to the guest's `SIGSEGV`
+  handler with a 32-bit `siginfo_t`/`ucontext_t` so Boehm's probe protocol works.
+* Guest file descriptors `0`/`1`/`2` are no longer "not open": every
+  `fprintf(stderr, ...)` used to fail with `EBADF`, and Mono's error reporter
+  retried in a loop until the guest stack was exhausted.
+* `vasprintf` now stores its buffer pointer (Mono formatted diagnostics through
+  it and then `strlen`'d the uninitialised pointer).
+* `/proc/stat` and `/proc/cpuinfo` are served from synthetic copies; the GC no
+  longer reports `-1` CPUs.
+* Files addressed as `<apk>/<entry>` are extracted once into the data directory.
+  Mono used to `mmap` the APK itself, parse `PK\1\2` as a pointer, and crash in a
+  metadata hash lookup.
+* `calloc` zeroes its block: the arena recycles freed blocks, so Mono's hash
+  tables could be born full of another allocation's bytes.
+* `getdtablesize` returns 1024; a 0 made Mono allocate a NULL fd table.
+* A native suspended for the cooperative time slice now answers `true`, not
+  `false`: `UnityPlayer$b` treats a false `nativeRender()` as "engine gone" and
+  calls `Activity.finish()` mid-initialisation.
+* The guest heap arena is 256 MB (was 64 MB) and a suspended call may only be
+  resumed by the thread that suspended it.
+
+Remaining blocker: with those fixed, `nativeRender` runs 20 000+ log lines into
+Unity's resource and managed-code initialisation and then aborts because the
+256 MB guest arena is full (`guest heap exhausted`, then writes through NULL
+pointers returned by `malloc`/`calloc`). Boehm's heap grows without collecting
+back, so the next step is the GC's segment accounting (or a per-frame allocation
+leak in the guest) rather than anything in the bridge's import layer.
 | **Unity NativeLoader JNI** | `RESOLVED` | Handle-scoped `dlsym`, per-method `RegisterNatives` isolation |
 | **UI MainThread ANR** | `RESOLVED` | Background executor staging + Material 3 loading state |
 | **Hardware GPU Detection** | `RESOLVED` | EGL14 1x1 pbuffer background renderer probe |

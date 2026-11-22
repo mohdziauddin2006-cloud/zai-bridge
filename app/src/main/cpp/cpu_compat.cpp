@@ -266,20 +266,51 @@ std::string cpuinfo_text() {
     return out.str();
 }
 
-std::string virtual_cpuinfo_path(const std::string& cache_dir) {
+namespace {
+
+// Stages `text` as `cache_dir/name`, once, and returns the file path.
+std::string publish(const std::string& cache_dir, const char* name, const std::string& text) {
     if (cache_dir.empty()) return {};
     ::mkdir(cache_dir.c_str(), 0755);
-    const std::string path = cache_dir + "/.zai-cpuinfo";
+    const std::string path = cache_dir + "/" + name;
     struct stat st {};
-    if (::stat(path.c_str(), &st) == 0 && st.st_size > 0) return path;
+    if (::stat(path.c_str(), &st) == 0 && st.st_size == static_cast<off_t>(text.size())) {
+        return path;
+    }
 
     FILE* f = ::fopen(path.c_str(), "we");
     if (f == nullptr) return {};
-    const std::string text = cpuinfo_text();
     ::fwrite(text.data(), 1, text.size(), f);
     ::fclose(f);
-    LOGI("virtual /proc/cpuinfo published at %s (%zu bytes)", path.c_str(), text.size());
     return path;
+}
+
+}  // namespace
+
+std::string virtual_cpuinfo_path(const std::string& cache_dir) {
+    const std::string path = publish(cache_dir, ".zai-cpuinfo", cpuinfo_text());
+    if (!path.empty()) {
+        LOGI("virtual /proc/cpuinfo published at %s", path.c_str());
+    }
+    return path;
+}
+
+std::string proc_stat_text() {
+    const Topology& t = topology();
+    std::ostringstream out;
+    // glibc/bionic get_nprocs() count the per-core "cpuN" lines here, and
+    // Mono's Boehm GC falls back to it when sched_getaffinity is unavailable.
+    // Without this file the guest reported -1 CPUs.
+    out << "cpu  1200 0 900 8000 400 0 20 0 0 0\n";
+    for (int i = 0; i < t.cores_online; ++i) {
+        out << "cpu" << i << " 1200 0 900 8000 400 0 20 0 0 0\n";
+    }
+    out << "intr 0\nctxt 0\nbtime 0\nprocesses 1\nprocs_running 1\nprocs_blocked 0\n";
+    return out.str();
+}
+
+std::string virtual_proc_stat_path(const std::string& cache_dir) {
+    return publish(cache_dir, ".zai-proc-stat", proc_stat_text());
 }
 
 int pin_current_thread_to_performance() {
