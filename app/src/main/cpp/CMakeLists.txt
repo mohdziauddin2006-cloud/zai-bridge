@@ -110,3 +110,32 @@ else()
     )
     message(STATUS "zai-bridge: ${ANDROID_ABI} uses the native passthrough backend")
 endif()
+
+# =============================================================================
+# Guest alias shim — staged as lib<name>.so for the guest's System.loadLibrary.
+#
+# The guest dex loader used to stage a byte copy of libwrapper.so for every
+# library name the guest asked for. ART accepts that (each name is a distinct
+# path) but it produces a second runtime instance, so the framework's
+# ANativeActivity_onCreate landed in a copy whose session state was empty and
+# NativeActivity titles never started. This shim is tiny, links against nothing
+# but libc, and forwards every entry point to the single live libwrapper.so.
+#
+# It is not a DT_NEEDED dependency on purpose: the alias directory is the guest
+# class loader's library search path, where libwrapper.so need not be
+# resolvable. The shim resolves the resident instance at runtime instead and
+# falls back to the /proc/self/maps path.
+# =============================================================================
+add_library(bridge_alias_shim SHARED alias_shim.cpp)
+target_link_libraries(bridge_alias_shim PRIVATE dl log)
+target_compile_options(bridge_alias_shim PRIVATE -Wall -Wextra)
+# The shim is plain C: it must not acquire a DT_NEEDED on libc++_shared.so, which
+# the guest class loader's linker namespace cannot resolve (that namespace only
+# sees this alias directory). Without -nostdlib++ the NDK adds the C++ runtime to
+# every C++ target, and ART rejects the alias with "library libc++_shared.so not
+# found: needed by .../native/libmain.so".
+target_link_options(bridge_alias_shim PRIVATE -nostdlib++)
+set_target_properties(bridge_alias_shim PROPERTIES
+    OUTPUT_NAME "bridge_alias_shim"
+    POSITION_INDEPENDENT_CODE ON
+)

@@ -22,13 +22,18 @@ import dalvik.system.DexClassLoader;
  *
  * <p>ART refuses to open one library path from two class loaders
  * ({@code UnsatisfiedLinkError: ... already opened by ClassLoader ...}), so each
- * requested name gets its own read-only copy of the bridge runtime in the game's
- * private directory. That copy is a distinct file, ART accepts it, and its
- * {@code JNI_OnLoad} is harmless: it only stores the JavaVM.
+ * requested name gets its own copy of {@code libbridge_alias_shim.so} in the
+ * game's private directory. The shim is a few kilobytes that forwards
+ * {@code JNI_OnLoad}, {@code ANativeActivity_onCreate} and the Unity
+ * {@code NativeLoader} thunks to the one live {@code libwrapper.so}, so the
+ * guest never gets a second, empty copy of the runtime's session state.
  */
 public final class GuestDexLoader extends DexClassLoader {
 
     private static final String TAG = "ZaiBridge";
+
+    /** Tiny forwarding library staged in place of the guest's native payload. */
+    public static final String SHIM_LIBRARY = "libbridge_alias_shim.so";
 
     private final File aliasDir;
     private final String hostLibrary;
@@ -56,32 +61,53 @@ public final class GuestDexLoader extends DexClassLoader {
         return null;
     }
 
+    /**
+     * Stages the alias the guest's {@code System.loadLibrary(name)} resolves to.
+     *
+     * <p>ART refuses to open one library path from two class loaders, so every
+     * requested name needs its own file. That file is now a copy of the tiny
+     * forwarding shim rather than of the whole runtime: the shim re-exports the
+     * JNI and NativeActivity entry points and dispatches them to the single
+     * live {@code libwrapper.so}, so {@code ANativeActivity_onCreate} reaches the
+     * session the bridge actually opened.
+     */
     private File aliasFor(String name) {
         if (aliasDir == null) return null;
         synchronized (GuestDexLoader.class) {
             if (!aliasDir.isDirectory() && !aliasDir.mkdirs()) return null;
-            // The runtime is linked against the shared C++ runtime, so the alias
-            // directory must stay self-contained for the guest's dlopen.
-            copySibling("libc++_shared.so");
             String fileName = name.startsWith("lib")
                     ? (name.endsWith(".so") ? name : name + ".so")
                     : "lib" + name + ".so";
             File target = new File(aliasDir, fileName);
-            File src = new File(hostLibrary);
-            if (target.isFile() && target.length() == src.length() && target.lastModified() >= src.lastModified()) {
-                return target;
+            File host = new File(hostLibrary);
+            File shim = new File(host.getParentFile(), SHIM_LIBRARY);
+            if (!shim.isFile()) {
+                // Older staging layout: fall back to a copy of the runtime. It
+                // still loads, but the copy cannot see the live session state.
+                Log.w(TAG, "alias shim missing; staging the full runtime copy");
+                copySibling("libc++_shared.so");
+                return copyAlias(host, target, name);
             }
-            try (InputStream in = new FileInputStream(src);
-                 OutputStream out = new FileOutputStream(target)) {
-                byte[] buf = new byte[64 * 1024];
-                int n;
-                while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
-                Log.i(TAG, "staged bridge library alias: " + target.getName() + " (" + target.length() + " bytes)");
-                return target;
-            } catch (Throwable t) {
-                Log.e(TAG, "bridge alias copy failed for " + name, t);
-                return null;
-            }
+            return copyAlias(shim, target, name);
+        }
+    }
+
+    private File copyAlias(File src, File target, String name) {
+        if (target.isFile() && target.length() == src.length()
+                && target.lastModified() >= src.lastModified()) {
+            return target;
+        }
+        try (InputStream in = new FileInputStream(src);
+             OutputStream out = new FileOutputStream(target)) {
+            byte[] buf = new byte[64 * 1024];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+            Log.i(TAG, "staged guest alias: " + target.getName()
+                    + " (" + src.getName() + ", " + target.length() + " bytes)");
+            return target;
+        } catch (Throwable t) {
+            Log.e(TAG, "bridge alias copy failed for " + name, t);
+            return null;
         }
     }
 

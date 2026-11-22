@@ -48,18 +48,38 @@ public final class GuestContext extends ContextWrapper {
      */
     private void mergeGuestResources() {
         if (!apk.isFile()) return;
+        resourcesMerged = mergeInto(super.getAssets());
+    }
+
+    /**
+     * Adds the guest APK to the given asset table.
+     *
+     * <p>An Activity's {@code getAssets()} does not answer through its base
+     * context: it goes to the AssetManager held by the Activity's own Resources,
+     * which the framework built from the host APK. Merging only the application's
+     * table is therefore not enough — guest Java code (Unity 4's
+     * {@code new FileInputStream} fallback reads {@code bin/Data/settings.xml}
+     * the same way) still looks at the host table and throws
+     * {@code FileNotFoundException}, which Unity treats as fatal. Both tables are
+     * merged so every access path sees the game's assets.
+     *
+     * @return true when the table accepted the guest APK
+     */
+    boolean mergeInto(AssetManager assets) {
+        if (!apk.isFile() || assets == null) return false;
         try {
-            AssetManager assets = super.getAssets();
             Method addAssetPath =
                     AssetManager.class.getMethod("addAssetPath", String.class);
             Object cookie = addAssetPath.invoke(assets, apk.getAbsolutePath());
-            resourcesMerged = cookie instanceof Integer && (Integer) cookie != 0;
-            Log.i(TAG, "guest resources " + (resourcesMerged ? "merged" : "rejected")
-                    + " from " + apk.getName());
+            final boolean merged = cookie instanceof Integer && (Integer) cookie != 0;
+            Log.i(TAG, "guest resources " + (merged ? "merged" : "rejected")
+                    + " from " + apk.getName() + " into " + assets);
+            return merged;
         } catch (Throwable t) {
             // addAssetPath is a non-SDK interface on recent releases; a clean
             // host theme is still usable when enforcement blocks it.
             Log.w(TAG, "guest resource merge unavailable: " + t);
+            return false;
         }
     }
 

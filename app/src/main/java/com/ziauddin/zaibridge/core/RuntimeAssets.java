@@ -25,7 +25,7 @@ public final class RuntimeAssets {
     private static final String TAG = "ZaiBridge";
 
     /** Bump when the bundled runtime changes, to force a re-extract. */
-    private static final String VERSION = "r2.1.0";
+    private static final String VERSION = "r2.1.1";
 
     private static volatile File root;
 

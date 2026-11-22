@@ -285,6 +285,11 @@ public final class GuestLauncher {
             base.set(guest, guestContext);
             Log.i(TAG, "guest base context installed (files=" + guestContext.getFilesDir()
                     + ", obb=" + guestContext.getObbDir() + ")");
+            // The Activity's own Resources table is separate from the
+            // application's, so the guest APK has to be merged into both before
+            // the guest's onCreate reads its assets (Unity opens
+            // bin/Data/settings.xml through Activity.getAssets()).
+            guestContext.mergeInto(guest.getAssets());
         } catch (Throwable t) {
             Log.w(TAG, "guest context injection failed: " + t);
         }

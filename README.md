@@ -164,15 +164,22 @@ ARM32 Unicorn core, with the guest payload taken from `Hell-Zombie-v1-07.apk`.
 | APK zip read over the marshalled `fseek`/`fread`/`fopen` path | `PASSED` ("Unable to open/read APK file!" eliminated) |
 | `UnityPlayer.<init>` → `nativeFile` → `initJni` → `nativeInitWWW` | `PASSED`, no CheckJNI abort |
 | `nativeSetDefaultDisplay`, guest `SurfaceView` inflate + surface hook | `PASSED` |
-| Guest `Activity` resumed, first `eglSwapBuffers` frame | **NOT YET REACHED** |
+| Guest `Activity` resumed (`onResume` → `nativeResume` returns) | `PASSED` |
+| First `eglSwapBuffers` frame | **NOT YET REACHED** |
 
-Remaining blocker: the guest (`AndroidManifest` `lib_name`) loads the bridge a
-second time through the staged `libmain.so` alias copy, so the framework's
-`ANativeActivity_onCreate` lands in an instance whose session globals are null
-(`bridge or emulator not initialised`). Unity then tears the guest `Activity`
-down before it is resumed. The fix is to share the session state across the
-alias instance (a small shim library both copies link against) rather than to
-copy the runtime.
+Session state is now shared with the guest's alias library through
+`libbridge_alias_shim.so`: the guest's `System.loadLibrary("main")` alias is a
+few kilobytes that forwards `JNI_OnLoad`, `ANativeActivity_onCreate` and the
+`NativeLoader` thunks to the single resident `libwrapper.so`, or adopts the live
+session published in `ZAI_BRIDGE_SESSION_BINDING`. No duplicate runtime copy is
+mapped and `bridge or emulator not initialised` no longer occurs.
+
+Remaining blocker: the first `nativeRender` call enters Mono's start-up, where
+the GC reserves a garbage-sized region (`mmap` of `0xE12FFF1E` bytes) and then
+writes generated trampoline code into a NULL code-manager block, so the render
+call aborts before Unity presents a frame. Guest `sysconf`/`getrlimit`, the
+32-bit bionic `struct stat` layout and the heap-arena overflow guard have been
+corrected along the way; the Mono GC/JIT allocation path is the outstanding fix.
 | **Unity NativeLoader JNI** | `RESOLVED` | Handle-scoped `dlsym`, per-method `RegisterNatives` isolation |
 | **UI MainThread ANR** | `RESOLVED` | Background executor staging + Material 3 loading state |
 | **Hardware GPU Detection** | `RESOLVED` | EGL14 1x1 pbuffer background renderer probe |

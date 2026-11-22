@@ -103,6 +103,20 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
+// Per-instruction translation traces (JNI reflection lookups, field access and
+// the stdio marshalling used by the legacy APK readers). These paths run for
+// every guest call, so logging them costs more than the emulation itself and
+// floods logcat. Compile with -DZAI_VERBOSE_TRACE (or the zaiVerboseTrace CMake
+// option) when a specific reflection or file-access problem needs tracing.
+#ifdef ZAI_VERBOSE_TRACE
+#define ZAI_TRACE(...) LOGI(__VA_ARGS__)
+#else
+// Kept as a dead branch rather than an empty statement so the arguments are
+// still type-checked and never trigger unused-variable warnings; the compiler
+// drops the call entirely.
+#define ZAI_TRACE(...) do { if (false) LOGI(__VA_ARGS__); } while (0)
+#endif
+
 // Implemented at file scope: referenced by the trampoline generator and by the
 // module-directory probe before their definitions are reached.
 extern "C" uint64_t bridge_native_entry(uint32_t id, uint64_t* host_args);
@@ -137,6 +151,14 @@ static std::string g_custom_func_name;
 static std::string g_custom_lib_name;
 static jobject g_guest_loader = nullptr;
 static ANativeActivity* g_host_activity = nullptr;
+
+// A JNIEnv is only valid on the thread it belongs to. The session is entered
+// from several ART threads (the UI thread for NativeLoader.load and the
+// NativeActivity callbacks, the guest's own threads through registered
+// trampolines), and a single cached pointer made ART abort with "using JNIEnv*
+// from thread ..." as soon as the second thread reached a JNI call. Each thread
+// keeps its own environment instead, attached on demand from the shared VM.
+static thread_local JNIEnv* t_env = nullptr;
 
 struct GuestSem {
     std::mutex mtx;
@@ -601,8 +623,18 @@ public:
             return at;
         }
 
+        // Overflow-safe bounds check. `at + want` in uint32 wraps for a large
+        // request, which used to pass the check, wrap heap_cursor_ below the
+        // arena base and hand the guest unmapped addresses (Mono's first JIT
+        // mmap asks for a size read from a failed config load, so this is not
+        // hypothetical).
+        if (want > kHeapSize) {
+            LOGE("guest heap: refusing %zu-byte allocation (arena is %zu bytes)",
+                 bytes, kHeapSize);
+            return 0;
+        }
         const uint32_t at = align_up(heap_cursor_, static_cast<uint32_t>(alignment));
-        if (at + want > kHeapBase + kHeapSize) {
+        if (at < kHeapBase || at - kHeapBase > kHeapSize - want) {
             LOGE("guest heap exhausted (want %zu bytes, %zu bytes live)", bytes,
                  static_cast<size_t>(heap_cursor_ - kHeapBase));
             return 0;
@@ -1504,7 +1536,7 @@ public:
     explicit JniBridge(Emulator& emu) : emu_(emu), linker_(emu) {}
 
     bool init(JavaVM* vm, JNIEnv* env) {
-        env_ = env;
+        t_env = env;
         vm_ = vm;
         if (!HostTrampolines::init()) return false;
 
@@ -1688,9 +1720,9 @@ public:
         if (pending_.empty()) return;
         // A guest callback that threw leaves an exception pending; resolving a
         // class while one is pending aborts the process under CheckJNI.
-        if (env_->ExceptionCheck()) {
+        if (t_env->ExceptionCheck()) {
             LOGW("deferred binding: clearing pending exception");
-            env_->ExceptionClear();
+            t_env->ExceptionClear();
         }
         std::vector<JavaExport> still;
         for (const auto& e : pending_) {
@@ -1885,7 +1917,7 @@ public:
 
     // ---- called from the generated ARM64 trampoline -----------------------
     uint64_t native_entry(uint32_t id, uint64_t* host_args) {
-        EnvScope env_scope(env_, vm_);
+        EnvScope env_scope(t_env, vm_);
         // The guest CPU is a single register file: two ART threads entering it
         // at once would interleave into one another. Recursive because a guest
         // ->Java->guest round trip re-enters from the same thread.
@@ -2008,9 +2040,9 @@ public:
 private:
     // ---- Java_* binding helpers --------------------------------------------
     bool bind_one(const JavaExport& e) {
-        jclass cls = find_class_through(env_, guest_loader_, e.class_path);
+        jclass cls = find_class_through(t_env, guest_loader_, e.class_path);
         if (!cls) {
-            env_->ExceptionClear();   // normal while the class is still loading
+            t_env->ExceptionClear();   // normal while the class is still loading
             return false;
         }
 
@@ -2018,7 +2050,7 @@ private:
         if (!find_method_signature(cls, e.method, sig)) {
             LOGW("Java_* %s.%s: no Java method with that name", e.class_path.c_str(),
                  e.method.c_str());
-            env_->DeleteLocalRef(cls);
+            t_env->DeleteLocalRef(cls);
             return false;
         }
 
@@ -2032,117 +2064,117 @@ private:
 
         void* code = HostTrampolines::emit(ne.id, reinterpret_cast<void*>(&bridge_native_entry));
         if (!code) {
-            env_->DeleteLocalRef(cls);
+            t_env->DeleteLocalRef(cls);
             return false;
         }
         ne.code = code;
         natives_.push_back(ne);
 
         JNINativeMethod m{natives_.back().name.c_str(), natives_.back().sig.c_str(), code};
-        const jint rc = env_->RegisterNatives(cls, &m, 1);
+        const jint rc = t_env->RegisterNatives(cls, &m, 1);
         if (rc != JNI_OK) {
-            env_->ExceptionClear();
+            t_env->ExceptionClear();
             natives_.pop_back();
-            env_->DeleteLocalRef(cls);
+            t_env->DeleteLocalRef(cls);
             return false;
         }
 
         entry_points_[e.class_path + "." + e.method] = e.fn;
         LOGI("  bound %s.%s%s -> guest %08x", e.class_path.c_str(), e.method.c_str(),
              sig.c_str(), e.fn);
-        env_->DeleteLocalRef(cls);
+        t_env->DeleteLocalRef(cls);
         return true;
     }
 
     // Walks the class's declared methods and returns the descriptor of the one
     // whose name matches, e.g. "(Ljava/lang/String;I)V".
     bool find_method_signature(jclass cls, const std::string& want, std::string& sig) {
-        jclass class_cls = env_->FindClass("java/lang/Class");
-        jclass method_cls = env_->FindClass("java/lang/reflect/Method");
+        jclass class_cls = t_env->FindClass("java/lang/Class");
+        jclass method_cls = t_env->FindClass("java/lang/reflect/Method");
         if (!class_cls || !method_cls) {
-            env_->ExceptionClear();
+            t_env->ExceptionClear();
             return false;
         }
 
-        jmethodID get_declared = env_->GetMethodID(class_cls, "getDeclaredMethods",
+        jmethodID get_declared = t_env->GetMethodID(class_cls, "getDeclaredMethods",
                                                    "()[Ljava/lang/reflect/Method;");
-        jmethodID get_name = env_->GetMethodID(method_cls, "getName", "()Ljava/lang/String;");
-        jmethodID get_ret = env_->GetMethodID(method_cls, "getReturnType", "()Ljava/lang/Class;");
-        jmethodID get_params = env_->GetMethodID(method_cls, "getParameterTypes",
+        jmethodID get_name = t_env->GetMethodID(method_cls, "getName", "()Ljava/lang/String;");
+        jmethodID get_ret = t_env->GetMethodID(method_cls, "getReturnType", "()Ljava/lang/Class;");
+        jmethodID get_params = t_env->GetMethodID(method_cls, "getParameterTypes",
                                                  "()[Ljava/lang/Class;");
         if (!get_declared || !get_name || !get_ret || !get_params) {
-            env_->ExceptionClear();
+            t_env->ExceptionClear();
             return false;
         }
 
-        auto methods = static_cast<jobjectArray>(env_->CallObjectMethod(cls, get_declared));
+        auto methods = static_cast<jobjectArray>(t_env->CallObjectMethod(cls, get_declared));
         if (!methods) {
-            env_->ExceptionClear();
+            t_env->ExceptionClear();
             return false;
         }
 
         bool found = false;
-        const jsize count = env_->GetArrayLength(methods);
+        const jsize count = t_env->GetArrayLength(methods);
         for (jsize i = 0; i < count && !found; ++i) {
-            jobject m = env_->GetObjectArrayElement(methods, i);
+            jobject m = t_env->GetObjectArrayElement(methods, i);
             if (!m) continue;
 
             if (method_name(m, get_name) == want) {
-                auto ret = static_cast<jclass>(env_->CallObjectMethod(m, get_ret));
-                auto params = static_cast<jobjectArray>(env_->CallObjectMethod(m, get_params));
+                auto ret = static_cast<jclass>(t_env->CallObjectMethod(m, get_ret));
+                auto params = static_cast<jobjectArray>(t_env->CallObjectMethod(m, get_params));
                 if (ret && params) {
                     sig = "(";
-                    const jsize argc = env_->GetArrayLength(params);
+                    const jsize argc = t_env->GetArrayLength(params);
                     for (jsize k = 0; k < argc; ++k) {
-                        auto pc = static_cast<jclass>(env_->GetObjectArrayElement(params, k));
+                        auto pc = static_cast<jclass>(t_env->GetObjectArrayElement(params, k));
                         sig += class_descriptor(pc);
-                        if (pc) env_->DeleteLocalRef(pc);
+                        if (pc) t_env->DeleteLocalRef(pc);
                     }
                     sig += ")";
                     sig += class_descriptor(ret);
                     found = true;
                 }
-                if (ret) env_->DeleteLocalRef(ret);
-                if (params) env_->DeleteLocalRef(params);
+                if (ret) t_env->DeleteLocalRef(ret);
+                if (params) t_env->DeleteLocalRef(params);
             }
-            env_->DeleteLocalRef(m);
+            t_env->DeleteLocalRef(m);
         }
-        env_->DeleteLocalRef(methods);
+        t_env->DeleteLocalRef(methods);
 
-        if (env_->ExceptionCheck()) {
-            env_->ExceptionClear();
+        if (t_env->ExceptionCheck()) {
+            t_env->ExceptionClear();
             return false;
         }
         return found;
     }
 
     std::string method_name(jobject method, jmethodID get_name) {
-        auto jn = static_cast<jstring>(env_->CallObjectMethod(method, get_name));
+        auto jn = static_cast<jstring>(t_env->CallObjectMethod(method, get_name));
         if (!jn) return {};
         std::string out;
-        const char* p = env_->GetStringUTFChars(jn, nullptr);
+        const char* p = t_env->GetStringUTFChars(jn, nullptr);
         if (p) {
             out = p;
-            env_->ReleaseStringUTFChars(jn, p);
+            t_env->ReleaseStringUTFChars(jn, p);
         }
-        env_->DeleteLocalRef(jn);
+        t_env->DeleteLocalRef(jn);
         return out;
     }
 
     std::string class_descriptor(jclass c) {
         if (!c) return "V";
-        jclass class_cls = env_->FindClass("java/lang/Class");
-        if (!class_cls) { env_->ExceptionClear(); return "V"; }
-        jmethodID get_name = env_->GetMethodID(class_cls, "getName", "()Ljava/lang/String;");
-        env_->DeleteLocalRef(class_cls);
+        jclass class_cls = t_env->FindClass("java/lang/Class");
+        if (!class_cls) { t_env->ExceptionClear(); return "V"; }
+        jmethodID get_name = t_env->GetMethodID(class_cls, "getName", "()Ljava/lang/String;");
+        t_env->DeleteLocalRef(class_cls);
         if (!get_name) return "V";
 
-        auto jn = static_cast<jstring>(env_->CallObjectMethod(c, get_name));
+        auto jn = static_cast<jstring>(t_env->CallObjectMethod(c, get_name));
         std::string name;
         if (jn) {
-            const char* p = env_->GetStringUTFChars(jn, nullptr);
-            if (p) { name = p; env_->ReleaseStringUTFChars(jn, p); }
-            env_->DeleteLocalRef(jn);
+            const char* p = t_env->GetStringUTFChars(jn, nullptr);
+            if (p) { name = p; t_env->ReleaseStringUTFChars(jn, p); }
+            t_env->DeleteLocalRef(jn);
         }
         if (name.empty()) return "V";
 
@@ -2277,7 +2309,7 @@ private:
     }
 
     void on_stub(uint32_t pc) {
-        EnvScope env_scope(env_, vm_);
+        EnvScope env_scope(t_env, vm_);
         const size_t slot = (pc - kStubBase) / kStubStride;
         if (slot >= slots_.size()) return;
 
@@ -2742,6 +2774,18 @@ public:
         (void)mmap64;
         const uint32_t len = arg(1);
         if (len == 0) return kMapFailed;
+        // A length the arena cannot possibly satisfy is a bad call, not a
+        // request to wrap the heap cursor. Report it with the register file so
+        // the next investigation sees the caller rather than a later fault.
+        if (len > kHeapSize) {
+            uint32_t pc = 0, lr = 0;
+            emu_.reg_read(UC_ARM_REG_PC, pc);
+            emu_.reg_read(UC_ARM_REG_LR, lr);
+            LOGE("mmap: rejecting %u-byte request (arena %zu bytes, addr=%08x prot=%u "
+                 "flags=%u pc=%08x lr=%08x)", len, kHeapSize, arg(0), arg(2), arg(3),
+                 pc, lr);
+            return kMapFailed;
+        }
 
         const int fd = static_cast<int>(stacked_arg(4));
         const uint32_t off = stacked_arg(5);
@@ -2852,34 +2896,34 @@ public:
 
         switch (index) {
             case kIdxGetVersion:
-                return static_cast<uint32_t>(env_->GetVersion());
+                return static_cast<uint32_t>(t_env->GetVersion());
 
             case kIdxFindClass: {
                 const std::string name = guest_string(arg(1));
                 // CheckJNI turns a FindClass with a pending exception into a
                 // process abort. A guest callback that threw has already been
                 // reported; drop the exception so the bridge can continue.
-                if (env_->ExceptionCheck()) {
+                if (t_env->ExceptionCheck()) {
                     LOGW("FindClass(%s) with a pending exception; clearing", name.c_str());
-                    env_->ExceptionClear();
+                    t_env->ExceptionClear();
                 }
-                // Must resolve through the guest DexClassLoader: env_->FindClass
+                // Must resolve through the guest DexClassLoader: t_env->FindClass
                 // uses the host application's loader, where the game's classes
                 // do not exist.
-                jclass c = find_class_through(env_, guest_loader_, name);
+                jclass c = find_class_through(t_env, guest_loader_, name);
                 if (!c) {
-                    env_->ExceptionClear();
+                    t_env->ExceptionClear();
                     std::string slash_name = name;
                     std::replace(slash_name.begin(), slash_name.end(), '.', '/');
-                    c = env_->FindClass(slash_name.c_str());
+                    c = t_env->FindClass(slash_name.c_str());
                 }
                 if (!c) {
-                    env_->ExceptionClear();
+                    t_env->ExceptionClear();
                     LOGE("FindClass(%s) failed", name.c_str());
                 } else {
-                    jclass global_c = static_cast<jclass>(env_->NewGlobalRef(c));
+                    jclass global_c = static_cast<jclass>(t_env->NewGlobalRef(c));
                     if (global_c) {
-                        env_->DeleteLocalRef(c);
+                        t_env->DeleteLocalRef(c);
                         c = global_c;
                     }
                 }
@@ -2888,12 +2932,12 @@ public:
 
             case kIdxGetObjectClass: {
                 auto* o = static_cast<jobject>(from_guest_ref(arg(1)));
-                return o ? to_guest_ref(env_->GetObjectClass(o)) : 0;
+                return o ? to_guest_ref(t_env->GetObjectClass(o)) : 0;
             }
 
             case kIdxGetSuperclass: {
                 auto* c = static_cast<jclass>(from_guest_ref(arg(1)));
-                return c ? to_guest_ref(env_->GetSuperclass(c)) : 0;
+                return c ? to_guest_ref(t_env->GetSuperclass(c)) : 0;
             }
 
             case kIdxGetMethodID: {
@@ -2901,15 +2945,15 @@ public:
                 if (!c) return 0;
                 const std::string name = guest_string(arg(2));
                 const std::string sig = guest_string(arg(3));
-                jmethodID m = env_->GetMethodID(c, name.c_str(), sig.c_str());
+                jmethodID m = t_env->GetMethodID(c, name.c_str(), sig.c_str());
                 if (!m) {
-                    env_->ExceptionClear();
+                    t_env->ExceptionClear();
                     LOGW("GetMethodID(%s%s) failed", name.c_str(), sig.c_str());
                 } else {
                     // Remembered so a later Call*Method can rebuild the argument list.
                     method_sigs_[static_cast<void*>(m)] = sig;
                     method_names_[static_cast<void*>(m)] = name;
-                    LOGI("GetMethodID(%s%s) -> %p", name.c_str(), sig.c_str(), m);
+                    ZAI_TRACE("GetMethodID(%s%s) -> %p", name.c_str(), sig.c_str(), m);
                 }
                 return to_guest_ref(m);
             }
@@ -2925,14 +2969,14 @@ public:
                     LOGW("GetStaticMethodID(%s%s) on null class", name.c_str(), sig.c_str());
                     return 0;
                 }
-                jmethodID m = env_->GetStaticMethodID(c, name.c_str(), sig.c_str());
+                jmethodID m = t_env->GetStaticMethodID(c, name.c_str(), sig.c_str());
                 if (!m) {
-                    env_->ExceptionClear();
+                    t_env->ExceptionClear();
                     LOGW("GetStaticMethodID(%s%s) failed", name.c_str(), sig.c_str());
                 } else {
                     method_sigs_[static_cast<void*>(m)] = sig;
                     method_names_[static_cast<void*>(m)] = name;
-                    LOGI("GetStaticMethodID(%s%s) -> %p", name.c_str(), sig.c_str(), m);
+                    ZAI_TRACE("GetStaticMethodID(%s%s) -> %p", name.c_str(), sig.c_str(), m);
                 }
                 return to_guest_ref(m);
             }
@@ -2945,13 +2989,13 @@ public:
                     LOGW("GetFieldID(%s%s) on null class", name.c_str(), sig.c_str());
                     return 0;
                 }
-                const jfieldID f = env_->GetFieldID(c, name.c_str(), sig.c_str());
+                const jfieldID f = t_env->GetFieldID(c, name.c_str(), sig.c_str());
                 if (!f) {
-                    env_->ExceptionClear();
+                    t_env->ExceptionClear();
                     LOGW("GetFieldID(%s%s) not found", name.c_str(), sig.c_str());
                     return 0;
                 }
-                LOGI("GetFieldID(%s%s) -> %p", name.c_str(), sig.c_str(), f);
+                ZAI_TRACE("GetFieldID(%s%s) -> %p", name.c_str(), sig.c_str(), f);
                 return to_guest_ref(f);
             }
 
@@ -2963,29 +3007,29 @@ public:
                     LOGW("GetStaticFieldID(%s%s) on null class", name.c_str(), sig.c_str());
                     return 0;
                 }
-                const jfieldID f = env_->GetStaticFieldID(c, name.c_str(), sig.c_str());
+                const jfieldID f = t_env->GetStaticFieldID(c, name.c_str(), sig.c_str());
                 if (!f) {
                     LOGW("GetStaticFieldID(%s%s) not found", name.c_str(), sig.c_str());
                     return 0;
                 }
-                LOGI("GetStaticFieldID(%s%s) -> %p", name.c_str(), sig.c_str(), f);
+                ZAI_TRACE("GetStaticFieldID(%s%s) -> %p", name.c_str(), sig.c_str(), f);
                 return to_guest_ref(f);
             }
 
             case kIdxNewStringUTF: {
                 const std::string s = guest_string(arg(1));
-                return to_guest_ref(env_->NewStringUTF(s.c_str()));
+                return to_guest_ref(t_env->NewStringUTF(s.c_str()));
             }
 
             case kIdxGetStringUTFLength: {
                 auto* s = static_cast<jstring>(from_guest_ref(arg(1)));
-                return s ? static_cast<uint32_t>(env_->GetStringUTFLength(s)) : 0u;
+                return s ? static_cast<uint32_t>(t_env->GetStringUTFLength(s)) : 0u;
             }
 
             case kIdxGetStringUTFChars: {
                 auto* str = static_cast<jstring>(from_guest_ref(arg(1)));
                 if (!str) return 0;
-                const char* chars = env_->GetStringUTFChars(str, nullptr);
+                const char* chars = t_env->GetStringUTFChars(str, nullptr);
                 if (!chars) return 0;
                 if (chars[0] == '/' || std::strstr(chars, ".apk")) {
                     LOGI("path handed to the guest: %s", chars);
@@ -2993,7 +3037,7 @@ public:
                 // The guest must get a real 32-bit pointer it can dereference,
                 // so hand it a private copy in guest memory.
                 const uint32_t at = guest_str(chars);
-                env_->ReleaseStringUTFChars(str, chars);
+                t_env->ReleaseStringUTFChars(str, chars);
                 return at;
             }
 
@@ -3002,7 +3046,7 @@ public:
                 return 0;
 
             case kIdxNewGlobalRef:
-                return to_guest_ref(env_->NewGlobalRef(
+                return to_guest_ref(t_env->NewGlobalRef(
                     static_cast<jobject>(from_guest_ref(arg(1)))));
 
             case kIdxDeleteGlobalRef:
@@ -3012,11 +3056,11 @@ public:
                 return 0;
 
             case kIdxNewLocalRef:
-                return to_guest_ref(env_->NewLocalRef(
+                return to_guest_ref(t_env->NewLocalRef(
                     static_cast<jobject>(from_guest_ref(arg(1)))));
 
             case kIdxIsSameObject:
-                return env_->IsSameObject(static_cast<jobject>(from_guest_ref(arg(1))),
+                return t_env->IsSameObject(static_cast<jobject>(from_guest_ref(arg(1))),
                                           static_cast<jobject>(from_guest_ref(arg(2))))
                            ? JNI_TRUE : JNI_FALSE;
 
@@ -3027,18 +3071,18 @@ public:
             }
 
             case kIdxExceptionOccurred:
-                return to_guest_ref(env_->ExceptionOccurred());
+                return to_guest_ref(t_env->ExceptionOccurred());
 
             case kIdxExceptionDescribe:
-                env_->ExceptionDescribe();
+                t_env->ExceptionDescribe();
                 return 0;
 
             case kIdxExceptionClear:
-                env_->ExceptionClear();
+                t_env->ExceptionClear();
                 return 0;
 
             case kIdxExceptionCheck:
-                return env_->ExceptionCheck() ? JNI_TRUE : JNI_FALSE;
+                return t_env->ExceptionCheck() ? JNI_TRUE : JNI_FALSE;
 
             case kIdxRegisterNatives:
                 return register_natives();
@@ -3046,22 +3090,22 @@ public:
             case kIdxIsInstanceOf: {
                 auto* o = static_cast<jobject>(from_guest_ref(arg(1)));
                 auto* c = static_cast<jclass>(from_guest_ref(arg(2)));
-                return (o && c && env_->IsInstanceOf(o, c)) ? JNI_TRUE : JNI_FALSE;
+                return (o && c && t_env->IsInstanceOf(o, c)) ? JNI_TRUE : JNI_FALSE;
             }
 
             case kIdxIsAssignableFrom:
-                return env_->IsAssignableFrom(static_cast<jclass>(from_guest_ref(arg(1))),
+                return t_env->IsAssignableFrom(static_cast<jclass>(from_guest_ref(arg(1))),
                                               static_cast<jclass>(from_guest_ref(arg(2))))
                            ? JNI_TRUE : JNI_FALSE;
 
             case kIdxThrow:
                 return static_cast<uint32_t>(
-                    env_->Throw(static_cast<jthrowable>(from_guest_ref(arg(1)))));
+                    t_env->Throw(static_cast<jthrowable>(from_guest_ref(arg(1)))));
 
             case kIdxThrowNew: {
                 const std::string msg = guest_string(arg(2));
                 LOGE("guest throws %s: %s", guest_string(arg(1)).c_str(), msg.c_str());
-                return static_cast<uint32_t>(env_->ThrowNew(
+                return static_cast<uint32_t>(t_env->ThrowNew(
                     static_cast<jclass>(from_guest_ref(arg(1))), msg.c_str()));
             }
 
@@ -3071,19 +3115,19 @@ public:
 
             case kIdxPushLocalFrame:
                 return static_cast<uint32_t>(
-                    env_->PushLocalFrame(static_cast<jint>(arg(1))));
+                    t_env->PushLocalFrame(static_cast<jint>(arg(1))));
 
             case kIdxPopLocalFrame:
                 return to_guest_ref(
-                    env_->PopLocalFrame(static_cast<jobject>(from_guest_ref(arg(1)))));
+                    t_env->PopLocalFrame(static_cast<jobject>(from_guest_ref(arg(1)))));
 
             case kIdxEnsureLocalCapacity:
                 return static_cast<uint32_t>(
-                    env_->EnsureLocalCapacity(static_cast<jint>(arg(1))));
+                    t_env->EnsureLocalCapacity(static_cast<jint>(arg(1))));
 
             case kIdxAllocObject:
                 return to_guest_ref(
-                    env_->AllocObject(static_cast<jclass>(from_guest_ref(arg(1)))));
+                    t_env->AllocObject(static_cast<jclass>(from_guest_ref(arg(1)))));
 
             case kIdxNewObject:   return new_object(0);
             case kIdxNewObjectV:  return new_object(1);
@@ -3091,21 +3135,21 @@ public:
 
             case kIdxGetArrayLength:
                 return static_cast<uint32_t>(
-                    env_->GetArrayLength(static_cast<jarray>(from_guest_ref(arg(1)))));
+                    t_env->GetArrayLength(static_cast<jarray>(from_guest_ref(arg(1)))));
 
             case kIdxNewObjectArray:
-                return to_guest_ref(env_->NewObjectArray(
+                return to_guest_ref(t_env->NewObjectArray(
                     static_cast<jsize>(arg(1)),
                     static_cast<jclass>(from_guest_ref(arg(2))),
                     static_cast<jobject>(from_guest_ref(arg(3)))));
 
             case kIdxGetObjectArrayElement:
-                return to_guest_ref(env_->GetObjectArrayElement(
+                return to_guest_ref(t_env->GetObjectArrayElement(
                     static_cast<jobjectArray>(from_guest_ref(arg(1))),
                     static_cast<jsize>(arg(2))));
 
             case kIdxSetObjectArrayElement:
-                env_->SetObjectArrayElement(
+                t_env->SetObjectArrayElement(
                     static_cast<jobjectArray>(from_guest_ref(arg(1))),
                     static_cast<jsize>(arg(2)),
                     static_cast<jobject>(from_guest_ref(arg(3))));
@@ -3249,89 +3293,89 @@ public:
         if (!setter) {
             switch (type) {
                 case 0: {
-                    const jobject v = is_static ? env_->GetStaticObjectField(cls, fid)
-                                                : env_->GetObjectField(holder, fid);
-                    LOGI("Get%sObjectField(%p) -> %p", is_static ? "Static" : "",
+                    const jobject v = is_static ? t_env->GetStaticObjectField(cls, fid)
+                                                : t_env->GetObjectField(holder, fid);
+                    ZAI_TRACE("Get%sObjectField(%p) -> %p", is_static ? "Static" : "",
                          static_cast<void*>(fid), v);
                     return to_guest_ref(v);
                 }
                 case 1:
-                    return (is_static ? env_->GetStaticBooleanField(cls, fid)
-                                      : env_->GetBooleanField(holder, fid)) ? JNI_TRUE : JNI_FALSE;
+                    return (is_static ? t_env->GetStaticBooleanField(cls, fid)
+                                      : t_env->GetBooleanField(holder, fid)) ? JNI_TRUE : JNI_FALSE;
                 case 2:
                     return static_cast<uint32_t>(static_cast<int8_t>(
-                        is_static ? env_->GetStaticByteField(cls, fid)
-                                  : env_->GetByteField(holder, fid)));
+                        is_static ? t_env->GetStaticByteField(cls, fid)
+                                  : t_env->GetByteField(holder, fid)));
                 case 3:
-                    return static_cast<uint32_t>(is_static ? env_->GetStaticCharField(cls, fid)
-                                                           : env_->GetCharField(holder, fid));
+                    return static_cast<uint32_t>(is_static ? t_env->GetStaticCharField(cls, fid)
+                                                           : t_env->GetCharField(holder, fid));
                 case 4:
                     return static_cast<uint32_t>(static_cast<int16_t>(
-                        is_static ? env_->GetStaticShortField(cls, fid)
-                                  : env_->GetShortField(holder, fid)));
+                        is_static ? t_env->GetStaticShortField(cls, fid)
+                                  : t_env->GetShortField(holder, fid)));
                 case 5:
-                    return static_cast<uint32_t>(is_static ? env_->GetStaticIntField(cls, fid)
-                                                           : env_->GetIntField(holder, fid));
+                    return static_cast<uint32_t>(is_static ? t_env->GetStaticIntField(cls, fid)
+                                                           : t_env->GetIntField(holder, fid));
                 case 6:
-                    return ret_i64(is_static ? env_->GetStaticLongField(cls, fid)
-                                             : env_->GetLongField(holder, fid));
+                    return ret_i64(is_static ? t_env->GetStaticLongField(cls, fid)
+                                             : t_env->GetLongField(holder, fid));
                 case 7:
-                    return ret_f(is_static ? env_->GetStaticFloatField(cls, fid)
-                                           : env_->GetFloatField(holder, fid));
+                    return ret_f(is_static ? t_env->GetStaticFloatField(cls, fid)
+                                           : t_env->GetFloatField(holder, fid));
                 default:
-                    return ret_d(is_static ? env_->GetStaticDoubleField(cls, fid)
-                                           : env_->GetDoubleField(holder, fid));
+                    return ret_d(is_static ? t_env->GetStaticDoubleField(cls, fid)
+                                           : t_env->GetDoubleField(holder, fid));
             }
         }
 
         switch (type) {
             case 0: {
                 jobject v = static_cast<jobject>(from_guest_ref(arg(3)));
-                LOGI("Set%sObjectField(%p) <- %p", is_static ? "Static" : "",
+                ZAI_TRACE("Set%sObjectField(%p) <- %p", is_static ? "Static" : "",
                      static_cast<void*>(fid), v);
-                if (is_static) env_->SetStaticObjectField(cls, fid, v);
-                else           env_->SetObjectField(holder, fid, v);
+                if (is_static) t_env->SetStaticObjectField(cls, fid, v);
+                else           t_env->SetObjectField(holder, fid, v);
                 break;
             }
             case 1:
-                if (is_static) env_->SetStaticBooleanField(cls, fid, static_cast<jboolean>(arg(3) & 0xFFu));
-                else           env_->SetBooleanField(holder, fid, static_cast<jboolean>(arg(3) & 0xFFu));
+                if (is_static) t_env->SetStaticBooleanField(cls, fid, static_cast<jboolean>(arg(3) & 0xFFu));
+                else           t_env->SetBooleanField(holder, fid, static_cast<jboolean>(arg(3) & 0xFFu));
                 break;
             case 2:
-                if (is_static) env_->SetStaticByteField(cls, fid, static_cast<jbyte>(arg(3)));
-                else           env_->SetByteField(holder, fid, static_cast<jbyte>(arg(3)));
+                if (is_static) t_env->SetStaticByteField(cls, fid, static_cast<jbyte>(arg(3)));
+                else           t_env->SetByteField(holder, fid, static_cast<jbyte>(arg(3)));
                 break;
             case 3:
-                if (is_static) env_->SetStaticCharField(cls, fid, static_cast<jchar>(arg(3) & 0xFFFFu));
-                else           env_->SetCharField(holder, fid, static_cast<jchar>(arg(3) & 0xFFFFu));
+                if (is_static) t_env->SetStaticCharField(cls, fid, static_cast<jchar>(arg(3) & 0xFFFFu));
+                else           t_env->SetCharField(holder, fid, static_cast<jchar>(arg(3) & 0xFFFFu));
                 break;
             case 4:
-                if (is_static) env_->SetStaticShortField(cls, fid, static_cast<jshort>(arg(3)));
-                else           env_->SetShortField(holder, fid, static_cast<jshort>(arg(3)));
+                if (is_static) t_env->SetStaticShortField(cls, fid, static_cast<jshort>(arg(3)));
+                else           t_env->SetShortField(holder, fid, static_cast<jshort>(arg(3)));
                 break;
             case 5:
-                if (is_static) env_->SetStaticIntField(cls, fid, static_cast<jint>(arg(3)));
-                else           env_->SetIntField(holder, fid, static_cast<jint>(arg(3)));
+                if (is_static) t_env->SetStaticIntField(cls, fid, static_cast<jint>(arg(3)));
+                else           t_env->SetIntField(holder, fid, static_cast<jint>(arg(3)));
                 break;
             case 6: {
                 const jlong v = static_cast<jlong>(
                     static_cast<uint64_t>(arg_word(3)) |
                     (static_cast<uint64_t>(arg_word(4)) << 32));
-                if (is_static) env_->SetStaticLongField(cls, fid, v);
-                else           env_->SetLongField(holder, fid, v);
+                if (is_static) t_env->SetStaticLongField(cls, fid, v);
+                else           t_env->SetLongField(holder, fid, v);
                 break;
             }
             case 7:
-                if (is_static) env_->SetStaticFloatField(cls, fid, f_arg(3));
-                else           env_->SetFloatField(holder, fid, f_arg(3));
+                if (is_static) t_env->SetStaticFloatField(cls, fid, f_arg(3));
+                else           t_env->SetFloatField(holder, fid, f_arg(3));
                 break;
             default: {
                 const uint64_t bits = static_cast<uint64_t>(arg_word(3)) |
                                       (static_cast<uint64_t>(arg_word(4)) << 32);
                 double v;
                 std::memcpy(&v, &bits, sizeof v);
-                if (is_static) env_->SetStaticDoubleField(cls, fid, v);
-                else           env_->SetDoubleField(holder, fid, v);
+                if (is_static) t_env->SetStaticDoubleField(cls, fid, v);
+                else           t_env->SetDoubleField(holder, fid, v);
                 break;
             }
         }
@@ -3461,6 +3505,7 @@ public:
     uint32_t imp_open() {
         std::string path = translate_path(guest_string(arg(0)), "open");
         if (path.find(".apk") != std::string::npos) LOGI("open(%s)", path.c_str());
+        ZAI_TRACE("open(%s, flags=%u)", path.c_str(), arg(1));
         const bool cpuinfo = is_proc_cpuinfo(path) && !virtual_cpuinfo_.empty();
         if (cpuinfo) path = virtual_cpuinfo_;
         const int fd = ::open(path.c_str(),
@@ -3518,16 +3563,30 @@ public:
     // bionic ARM32 `struct stat` is 104 bytes with these offsets (verified
     // against the NDK's armv7 headers). The host layout is different, so it is
     // marshalled field by field rather than memcpy'd.
+    // 32-bit bionic `struct stat` (96 bytes). The field offsets are not the
+    // host's: st_size sits at 44, not 48. A shifted write used to hand Mono a
+    // file size assembled from the wrong bytes, and Mono then asked its GC for a
+    // multi-gigabyte mmap. Every guest-facing struct in this file follows the
+    // guest ABI exactly for that reason.
     void write_guest_stat(uint32_t at, const struct stat& st) {
         if (!at) return;
-        std::vector<uint8_t> buf(104, 0);
+        std::vector<uint8_t> buf(96, 0);
         auto put32 = [&](size_t off, uint32_t v) { std::memcpy(&buf[off], &v, 4); };
         auto put64 = [&](size_t off, uint64_t v) { std::memcpy(&buf[off], &v, 8); };
         put64(0,  static_cast<uint64_t>(st.st_dev));
+        put32(12, static_cast<uint32_t>(st.st_ino));          // __st_ino
         put32(16, static_cast<uint32_t>(st.st_mode));
-        put64(48, static_cast<uint64_t>(st.st_size));
-        put32(80, static_cast<uint32_t>(st.st_mtime));
-        put64(96, static_cast<uint64_t>(st.st_ino));
+        put32(20, static_cast<uint32_t>(st.st_nlink));
+        put32(24, static_cast<uint32_t>(st.st_uid));
+        put32(28, static_cast<uint32_t>(st.st_gid));
+        put64(32, static_cast<uint64_t>(st.st_rdev));
+        put64(44, static_cast<uint64_t>(st.st_size));
+        put32(52, static_cast<uint32_t>(st.st_blksize));
+        put64(56, static_cast<uint64_t>(st.st_blocks));
+        put32(64, static_cast<uint32_t>(st.st_atime));
+        put32(72, static_cast<uint32_t>(st.st_mtime));
+        put32(80, static_cast<uint32_t>(st.st_ctime));
+        put64(88, static_cast<uint64_t>(st.st_ino));
         emu_.write(at, buf.data(), buf.size());
     }
 
@@ -3561,6 +3620,9 @@ public:
             set_guest_errno_from_host();
             return static_cast<uint32_t>(-1);
         }
+        ZAI_TRACE("stat(%s) -> mode=%o size=%lld",
+                  by_fd ? "<fd>" : guest_string(arg(0)).c_str(),
+                  static_cast<unsigned>(st.st_mode), static_cast<long long>(st.st_size));
         write_guest_stat(out, st);
         return 0;
     }
@@ -3603,7 +3665,7 @@ public:
         std::vector<uint8_t> buf(sz * n);
         const size_t got = ::fread(buf.data(), sz, n, f);
         if (got) emu_.write(arg(0), buf.data(), got * sz);
-        LOGI("fread(sz=%zu, n=%zu) -> %zu (errno=%d)", sz, n, got, errno);
+        ZAI_TRACE("fread(sz=%zu, n=%zu) -> %zu (errno=%d)", sz, n, got, errno);
         return static_cast<uint32_t>(got);
     }
 
@@ -3664,6 +3726,26 @@ public:
     uint32_t imp_assert2() {
         LOGE("guest assertion failed: %s (%s:%u)", guest_string(arg(3)).c_str(),
              guest_string(arg(0)).c_str(), emu_.read_u32(arg(1)));
+        return 0;
+    }
+
+    // struct rlimit on 32-bit bionic uses 64-bit rlim_t fields. Leaving the
+    // structure unwritten while returning 0 makes Mono read whatever was on its
+    // stack as the address-space limit, which it then passes to mmap as a size.
+    uint32_t imp_getrlimit() {
+        const int resource = static_cast<int>(arg(0));
+        const uint32_t out = arg(1);
+        if (!out) return 22u;                                  // EINVAL
+        uint64_t cur = ~0ull, max = ~0ull;                     // RLIM_INFINITY
+        if (resource == 3) {                                   // RLIMIT_STACK
+            cur = max = 8ull * 1024ull * 1024ull;
+        } else if (resource == 7) {                            // RLIMIT_NOFILE
+            cur = max = 1024ull;
+        }
+        emu_.write_u32(out, static_cast<uint32_t>(cur));
+        emu_.write_u32(out + 4, static_cast<uint32_t>(cur >> 32));
+        emu_.write_u32(out + 8, static_cast<uint32_t>(max));
+        emu_.write_u32(out + 12, static_cast<uint32_t>(max >> 32));
         return 0;
     }
 
@@ -5467,7 +5549,7 @@ public:
             if (!fn) return 0u;
             jobject jmgr = static_cast<jobject>(from_guest_ref(arg(1)));
             if (!jmgr) jmgr = assets_object_;
-            void* mgr = fn(env_, jmgr);
+            void* mgr = fn(t_env, jmgr);
             if (!mgr) {
                 LOGW("AAssetManager_fromJava: no AssetManager on the guest context");
                 return 0u;
@@ -6149,21 +6231,21 @@ public:
     // AAssetManager_fromJava with a null/torn-down manager. Guest APK assets are
     // already merged into it by GuestContext, so a native open() finds them.
     jobject current_assets() {
-        if (assets_object_ || !env_) return assets_object_;
-        jclass thread = env_->FindClass("android/app/ActivityThread");
+        if (assets_object_ || !t_env) return assets_object_;
+        jclass thread = t_env->FindClass("android/app/ActivityThread");
         if (!thread) return nullptr;
-        jmethodID current = env_->GetStaticMethodID(
+        jmethodID current = t_env->GetStaticMethodID(
                 thread, "currentApplication", "()Landroid/app/Application;");
-        jobject app = current ? env_->CallStaticObjectMethod(thread, current) : nullptr;
-        env_->DeleteLocalRef(thread);
+        jobject app = current ? t_env->CallStaticObjectMethod(thread, current) : nullptr;
+        t_env->DeleteLocalRef(thread);
         if (!app) return nullptr;
-        jclass appCls = env_->GetObjectClass(app);
-        jmethodID getAssets = env_->GetMethodID(appCls, "getAssets",
+        jclass appCls = t_env->GetObjectClass(app);
+        jmethodID getAssets = t_env->GetMethodID(appCls, "getAssets",
                                                "()Landroid/content/res/AssetManager;");
-        jobject assets = getAssets ? env_->CallObjectMethod(app, getAssets) : nullptr;
-        env_->DeleteLocalRef(appCls);
-        if (env_->ExceptionCheck()) env_->ExceptionClear();
-        if (assets) assets_object_ = env_->NewGlobalRef(assets);
+        jobject assets = getAssets ? t_env->CallObjectMethod(app, getAssets) : nullptr;
+        t_env->DeleteLocalRef(appCls);
+        if (t_env->ExceptionCheck()) t_env->ExceptionClear();
+        if (assets) assets_object_ = t_env->NewGlobalRef(assets);
         if (assets_object_) LOGI("asset bridge: process AssetManager %p", assets_object_);
         return assets_object_;
     }
@@ -7275,6 +7357,8 @@ public:
         import_handlers_["__assert2"] = [this] { return imp_assert2(); };
         import_handlers_["__assert"] = [this] { return imp_assert2(); };
         import_handlers_["sysconf"] = [this] { return imp_sysconf(); };
+        import_handlers_["getrlimit"] = [this] { return imp_getrlimit(); };
+        import_handlers_["getrlimit64"] = [this] { return imp_getrlimit(); };
         // ARMv7 capability words. A guest that probes AT_HWCAP instead of
         // parsing cpuinfo must reach the same NEON-capable conclusion on
         // Snapdragon, Dimensity, Exynos, Tensor, Kirin and Unisoc parts.
@@ -7584,7 +7668,7 @@ public:
         import_handlers_["ANativeWindow_fromSurface"] = [this] {
             jobject surface = static_cast<jobject>(from_guest_ref(arg(1)));
             if (!surface) return 0u;
-            ANativeWindow* window = ANativeWindow_fromSurface(env_, surface);
+            ANativeWindow* window = ANativeWindow_fromSurface(t_env, surface);
             if (!window) {
                 LOGE("ANativeWindow_fromSurface failed");
                 return 0u;
@@ -8077,7 +8161,7 @@ public:
 
     // Guest -> env->RegisterNatives(env, clazz, methods, n)
     uint32_t register_natives() {
-        EnvScope env_scope(env_, vm_);
+        EnvScope env_scope(t_env, vm_);
         auto* clazz = static_cast<jclass>(from_guest_ref(arg(1)));
         const uint32_t methods = arg(2);
         const uint32_t count = arg(3);
@@ -8137,7 +8221,7 @@ public:
         for (size_t i = 0; i < host_methods.size(); ++i) {
             const auto& hm = host_methods[i];
             const uint32_t guest_fn = natives_[start_idx + i].guest_fn;
-            jint r = env_->RegisterNatives(clazz, &hm, 1);
+            jint r = t_env->RegisterNatives(clazz, &hm, 1);
             if (r == JNI_OK) {
                 registered++;
                 LOGI("RegisterNatives: bound %s.%s%s -> 0x%08x",
@@ -8145,7 +8229,7 @@ public:
             } else {
                 LOGW("RegisterNatives: skipped optional/missing method %s.%s%s with ART (rc=%d)",
                      cls_name.c_str(), hm.name, hm.signature, r);
-                env_->ExceptionClear();
+                t_env->ExceptionClear();
             }
         }
         LOGI("RegisterNatives: %d / %zu methods registered on class %s",
@@ -8177,14 +8261,14 @@ public:
     uint32_t new_primitive_array(char t) {
         const jsize len = static_cast<jsize>(arg(1));
         switch (t) {
-            case 'Z': return to_guest_ref(env_->NewBooleanArray(len));
-            case 'B': return to_guest_ref(env_->NewByteArray(len));
-            case 'C': return to_guest_ref(env_->NewCharArray(len));
-            case 'S': return to_guest_ref(env_->NewShortArray(len));
-            case 'I': return to_guest_ref(env_->NewIntArray(len));
-            case 'J': return to_guest_ref(env_->NewLongArray(len));
-            case 'F': return to_guest_ref(env_->NewFloatArray(len));
-            case 'D': return to_guest_ref(env_->NewDoubleArray(len));
+            case 'Z': return to_guest_ref(t_env->NewBooleanArray(len));
+            case 'B': return to_guest_ref(t_env->NewByteArray(len));
+            case 'C': return to_guest_ref(t_env->NewCharArray(len));
+            case 'S': return to_guest_ref(t_env->NewShortArray(len));
+            case 'I': return to_guest_ref(t_env->NewIntArray(len));
+            case 'J': return to_guest_ref(t_env->NewLongArray(len));
+            case 'F': return to_guest_ref(t_env->NewFloatArray(len));
+            case 'D': return to_guest_ref(t_env->NewDoubleArray(len));
             default:  return 0;
         }
     }
@@ -8204,36 +8288,36 @@ public:
 
         switch (t) {
             case 'Z':
-                if (set) env_->SetBooleanArrayRegion((jbooleanArray)arr, start, len, (jboolean*)tmp.data());
-                else     env_->GetBooleanArrayRegion((jbooleanArray)arr, start, len, (jboolean*)tmp.data());
+                if (set) t_env->SetBooleanArrayRegion((jbooleanArray)arr, start, len, (jboolean*)tmp.data());
+                else     t_env->GetBooleanArrayRegion((jbooleanArray)arr, start, len, (jboolean*)tmp.data());
                 break;
             case 'B':
-                if (set) env_->SetByteArrayRegion((jbyteArray)arr, start, len, (jbyte*)tmp.data());
-                else     env_->GetByteArrayRegion((jbyteArray)arr, start, len, (jbyte*)tmp.data());
+                if (set) t_env->SetByteArrayRegion((jbyteArray)arr, start, len, (jbyte*)tmp.data());
+                else     t_env->GetByteArrayRegion((jbyteArray)arr, start, len, (jbyte*)tmp.data());
                 break;
             case 'C':
-                if (set) env_->SetCharArrayRegion((jcharArray)arr, start, len, (jchar*)tmp.data());
-                else     env_->GetCharArrayRegion((jcharArray)arr, start, len, (jchar*)tmp.data());
+                if (set) t_env->SetCharArrayRegion((jcharArray)arr, start, len, (jchar*)tmp.data());
+                else     t_env->GetCharArrayRegion((jcharArray)arr, start, len, (jchar*)tmp.data());
                 break;
             case 'S':
-                if (set) env_->SetShortArrayRegion((jshortArray)arr, start, len, (jshort*)tmp.data());
-                else     env_->GetShortArrayRegion((jshortArray)arr, start, len, (jshort*)tmp.data());
+                if (set) t_env->SetShortArrayRegion((jshortArray)arr, start, len, (jshort*)tmp.data());
+                else     t_env->GetShortArrayRegion((jshortArray)arr, start, len, (jshort*)tmp.data());
                 break;
             case 'I':
-                if (set) env_->SetIntArrayRegion((jintArray)arr, start, len, (jint*)tmp.data());
-                else     env_->GetIntArrayRegion((jintArray)arr, start, len, (jint*)tmp.data());
+                if (set) t_env->SetIntArrayRegion((jintArray)arr, start, len, (jint*)tmp.data());
+                else     t_env->GetIntArrayRegion((jintArray)arr, start, len, (jint*)tmp.data());
                 break;
             case 'J':
-                if (set) env_->SetLongArrayRegion((jlongArray)arr, start, len, (jlong*)tmp.data());
-                else     env_->GetLongArrayRegion((jlongArray)arr, start, len, (jlong*)tmp.data());
+                if (set) t_env->SetLongArrayRegion((jlongArray)arr, start, len, (jlong*)tmp.data());
+                else     t_env->GetLongArrayRegion((jlongArray)arr, start, len, (jlong*)tmp.data());
                 break;
             case 'F':
-                if (set) env_->SetFloatArrayRegion((jfloatArray)arr, start, len, (jfloat*)tmp.data());
-                else     env_->GetFloatArrayRegion((jfloatArray)arr, start, len, (jfloat*)tmp.data());
+                if (set) t_env->SetFloatArrayRegion((jfloatArray)arr, start, len, (jfloat*)tmp.data());
+                else     t_env->GetFloatArrayRegion((jfloatArray)arr, start, len, (jfloat*)tmp.data());
                 break;
             case 'D':
-                if (set) env_->SetDoubleArrayRegion((jdoubleArray)arr, start, len, (jdouble*)tmp.data());
-                else     env_->GetDoubleArrayRegion((jdoubleArray)arr, start, len, (jdouble*)tmp.data());
+                if (set) t_env->SetDoubleArrayRegion((jdoubleArray)arr, start, len, (jdouble*)tmp.data());
+                else     t_env->GetDoubleArrayRegion((jdoubleArray)arr, start, len, (jdouble*)tmp.data());
                 break;
             default: break;
         }
@@ -8255,19 +8339,19 @@ public:
 
         void* host = nullptr;
         switch (t) {
-            case 'Z': host = env_->GetBooleanArrayElements((jbooleanArray)arr, nullptr); break;
-            case 'B': host = env_->GetByteArrayElements((jbyteArray)arr, nullptr); break;
-            case 'C': host = env_->GetCharArrayElements((jcharArray)arr, nullptr); break;
-            case 'S': host = env_->GetShortArrayElements((jshortArray)arr, nullptr); break;
-            case 'I': host = env_->GetIntArrayElements((jintArray)arr, nullptr); break;
-            case 'J': host = env_->GetLongArrayElements((jlongArray)arr, nullptr); break;
-            case 'F': host = env_->GetFloatArrayElements((jfloatArray)arr, nullptr); break;
-            case 'D': host = env_->GetDoubleArrayElements((jdoubleArray)arr, nullptr); break;
+            case 'Z': host = t_env->GetBooleanArrayElements((jbooleanArray)arr, nullptr); break;
+            case 'B': host = t_env->GetByteArrayElements((jbyteArray)arr, nullptr); break;
+            case 'C': host = t_env->GetCharArrayElements((jcharArray)arr, nullptr); break;
+            case 'S': host = t_env->GetShortArrayElements((jshortArray)arr, nullptr); break;
+            case 'I': host = t_env->GetIntArrayElements((jintArray)arr, nullptr); break;
+            case 'J': host = t_env->GetLongArrayElements((jlongArray)arr, nullptr); break;
+            case 'F': host = t_env->GetFloatArrayElements((jfloatArray)arr, nullptr); break;
+            case 'D': host = t_env->GetDoubleArrayElements((jdoubleArray)arr, nullptr); break;
             default: return 0;
         }
         if (!host) return 0;
 
-        const jsize len = env_->GetArrayLength(arr);
+        const jsize len = t_env->GetArrayLength(arr);
         const size_t bytes = static_cast<size_t>(len) * element_size(t);
         const uint32_t at = guest_alloc(bytes ? bytes : 1);
         if (!at) return 0;
@@ -8293,14 +8377,14 @@ public:
         emu_.release(at, bytes ? bytes : 1);
 
         switch (t) {
-            case 'Z': env_->ReleaseBooleanArrayElements((jbooleanArray)arr, (jboolean*)host, mode); break;
-            case 'B': env_->ReleaseByteArrayElements((jbyteArray)arr, (jbyte*)host, mode); break;
-            case 'C': env_->ReleaseCharArrayElements((jcharArray)arr, (jchar*)host, mode); break;
-            case 'S': env_->ReleaseShortArrayElements((jshortArray)arr, (jshort*)host, mode); break;
-            case 'I': env_->ReleaseIntArrayElements((jintArray)arr, (jint*)host, mode); break;
-            case 'J': env_->ReleaseLongArrayElements((jlongArray)arr, (jlong*)host, mode); break;
-            case 'F': env_->ReleaseFloatArrayElements((jfloatArray)arr, (jfloat*)host, mode); break;
-            case 'D': env_->ReleaseDoubleArrayElements((jdoubleArray)arr, (jdouble*)host, mode); break;
+            case 'Z': t_env->ReleaseBooleanArrayElements((jbooleanArray)arr, (jboolean*)host, mode); break;
+            case 'B': t_env->ReleaseByteArrayElements((jbyteArray)arr, (jbyte*)host, mode); break;
+            case 'C': t_env->ReleaseCharArrayElements((jcharArray)arr, (jchar*)host, mode); break;
+            case 'S': t_env->ReleaseShortArrayElements((jshortArray)arr, (jshort*)host, mode); break;
+            case 'I': t_env->ReleaseIntArrayElements((jintArray)arr, (jint*)host, mode); break;
+            case 'J': t_env->ReleaseLongArrayElements((jlongArray)arr, (jlong*)host, mode); break;
+            case 'F': t_env->ReleaseFloatArrayElements((jfloatArray)arr, (jfloat*)host, mode); break;
+            case 'D': t_env->ReleaseDoubleArrayElements((jdoubleArray)arr, (jdouble*)host, mode); break;
             default: break;
         }
         return 0;
@@ -8426,7 +8510,7 @@ public:
 
         {
             const auto nm = method_names_.find(static_cast<void*>(mid));
-            LOGI("Call%s%s v%d raw=%08x %08x %08x %08x (obj handles %u)",
+            ZAI_TRACE("Call%s%s v%d raw=%08x %08x %08x %08x (obj handles %u)",
                  is_static ? "Static" : "",
                  nm == method_names_.end() ? "?" : nm->second.c_str(), variant,
                  arg_word(3), arg_word(4), arg_word(5), arg_word(6),
@@ -8435,40 +8519,40 @@ public:
 
         switch (ret) {
             case 'V':
-                if (is_static) env_->CallStaticVoidMethodA(cls, mid, a);
-                else           env_->CallVoidMethodA(recv, mid, a);
+                if (is_static) t_env->CallStaticVoidMethodA(cls, mid, a);
+                else           t_env->CallVoidMethodA(recv, mid, a);
                 return 0;
             case 'L': {
-                jobject r = is_static ? env_->CallStaticObjectMethodA(cls, mid, a)
-                                      : env_->CallObjectMethodA(recv, mid, a);
+                jobject r = is_static ? t_env->CallStaticObjectMethodA(cls, mid, a)
+                                      : t_env->CallObjectMethodA(recv, mid, a);
                 return to_guest_ref(r);
             }
             case 'Z':
-                return (is_static ? env_->CallStaticBooleanMethodA(cls, mid, a)
-                                  : env_->CallBooleanMethodA(recv, mid, a)) ? JNI_TRUE : JNI_FALSE;
+                return (is_static ? t_env->CallStaticBooleanMethodA(cls, mid, a)
+                                  : t_env->CallBooleanMethodA(recv, mid, a)) ? JNI_TRUE : JNI_FALSE;
             case 'B':
                 return static_cast<uint32_t>(static_cast<int8_t>(
-                    is_static ? env_->CallStaticByteMethodA(cls, mid, a)
-                              : env_->CallByteMethodA(recv, mid, a)));
+                    is_static ? t_env->CallStaticByteMethodA(cls, mid, a)
+                              : t_env->CallByteMethodA(recv, mid, a)));
             case 'C':
-                return static_cast<uint32_t>(is_static ? env_->CallStaticCharMethodA(cls, mid, a)
-                                                       : env_->CallCharMethodA(recv, mid, a));
+                return static_cast<uint32_t>(is_static ? t_env->CallStaticCharMethodA(cls, mid, a)
+                                                       : t_env->CallCharMethodA(recv, mid, a));
             case 'S':
                 return static_cast<uint32_t>(static_cast<int16_t>(
-                    is_static ? env_->CallStaticShortMethodA(cls, mid, a)
-                              : env_->CallShortMethodA(recv, mid, a)));
+                    is_static ? t_env->CallStaticShortMethodA(cls, mid, a)
+                              : t_env->CallShortMethodA(recv, mid, a)));
             case 'I':
-                return static_cast<uint32_t>(is_static ? env_->CallStaticIntMethodA(cls, mid, a)
-                                                       : env_->CallIntMethodA(recv, mid, a));
+                return static_cast<uint32_t>(is_static ? t_env->CallStaticIntMethodA(cls, mid, a)
+                                                       : t_env->CallIntMethodA(recv, mid, a));
             case 'J':
-                return ret_i64(static_cast<int64_t>(is_static ? env_->CallStaticLongMethodA(cls, mid, a)
-                                                              : env_->CallLongMethodA(recv, mid, a)));
+                return ret_i64(static_cast<int64_t>(is_static ? t_env->CallStaticLongMethodA(cls, mid, a)
+                                                              : t_env->CallLongMethodA(recv, mid, a)));
             case 'F':
-                return ret_f(is_static ? env_->CallStaticFloatMethodA(cls, mid, a)
-                                       : env_->CallFloatMethodA(recv, mid, a));
+                return ret_f(is_static ? t_env->CallStaticFloatMethodA(cls, mid, a)
+                                       : t_env->CallFloatMethodA(recv, mid, a));
             case 'D':
-                return ret_d(is_static ? env_->CallStaticDoubleMethodA(cls, mid, a)
-                                       : env_->CallDoubleMethodA(recv, mid, a));
+                return ret_d(is_static ? t_env->CallStaticDoubleMethodA(cls, mid, a)
+                                       : t_env->CallDoubleMethodA(recv, mid, a));
             default:
                 return 0;
         }
@@ -8486,7 +8570,7 @@ public:
         }
         std::vector<jvalue> args;
         if (!read_args(sig, variant, args)) return 0;
-        return to_guest_ref(env_->NewObjectA(cls, mid, args.empty() ? nullptr : args.data()));
+        return to_guest_ref(t_env->NewObjectA(cls, mid, args.empty() ? nullptr : args.data()));
     }
 
     // Minimal JNI signature parser: enough to classify and count arguments.
@@ -8523,7 +8607,6 @@ public:
 
     Emulator&    emu_;
     StaticLinker linker_;
-    JNIEnv*      env_ = nullptr;
     JavaVM*      vm_ = nullptr;
 
     uint32_t env_shadow_ = 0, env_funcs_ = 0;
@@ -8684,6 +8767,74 @@ JavaVM*    g_vm = nullptr;
 // running" instead of silently corrupting the first session.
 bool g_session_active = false;
 
+namespace {
+
+// Returns the calling thread's JNIEnv, attaching it to the session VM the first
+// time that thread reaches the bridge. A thread-local environment is required:
+// a JNIEnv from one ART thread cannot be used on another.
+JNIEnv* thread_jni_env() {
+    if (t_env) return t_env;
+    if (!g_vm) return nullptr;
+    JNIEnv* env = nullptr;
+    if (g_vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
+        if (g_vm->AttachCurrentThread(&env, nullptr) != JNI_OK) return nullptr;
+    }
+    t_env = env;
+    return env;
+}
+
+}  // namespace
+
+// -----------------------------------------------------------------------------
+// Cross-namespace session handoff
+//
+// Android gives a DexClassLoader its own linker namespace. Loading the guest's
+// staged alias there maps libwrapper.so a SECOND time, at a different base: the
+// framework's ANativeActivity_onCreate then runs in a copy whose g_bridge and
+// g_emulator are still null, so a NativeActivity title never reaches its native
+// entry point. dlopen cannot bridge the two (bionic keeps one soinfo per
+// namespace), and no exported symbol would help either, because each mapping
+// resolves to itself.
+//
+// What the two mappings do share is libc, and with it the process environment.
+// The instance that owns the session publishes the pair of pointers there; a
+// duplicate that gets a NativeActivity callback adopts them. Both live in the
+// same address space, so the pointers stay valid across the mapping boundary.
+// -----------------------------------------------------------------------------
+namespace {
+
+constexpr const char* kSessionBinding = "ZAI_BRIDGE_SESSION_BINDING";
+
+void publish_session_binding() {
+    if (!g_bridge || !g_emulator) return;
+    char value[64];
+    snprintf(value, sizeof value, "%llx:%llx",
+             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(g_bridge)),
+             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(g_emulator)));
+    setenv(kSessionBinding, value, 1);
+}
+
+void clear_session_binding() {
+    unsetenv(kSessionBinding);
+}
+
+// Returns true when this mapping adopted the live session.
+bool adopt_session_binding() {
+    if (g_bridge && g_emulator) return true;
+    const char* value = getenv(kSessionBinding);
+    if (!value) return false;
+    unsigned long long bridge = 0, emulator = 0;
+    if (sscanf(value, "%llx:%llx", &bridge, &emulator) != 2) return false;
+    if (!bridge || !emulator) return false;
+    g_bridge = reinterpret_cast<JniBridge*>(static_cast<uintptr_t>(bridge));
+    g_emulator = reinterpret_cast<Emulator*>(static_cast<uintptr_t>(emulator));
+    LOGI("adopted the live guest session from %s (bridge=%p emulator=%p)",
+         kSessionBinding, static_cast<void*>(g_bridge), static_cast<void*>(g_emulator));
+    return true;
+}
+
+}  // namespace
+
 // The window behind GameHostActivity's SurfaceView. Set from the UI thread,
 // consumed by the guest's EGL calls, which run on the emulation thread.
 std::atomic<ANativeWindow*> g_host_window{nullptr};
@@ -8794,6 +8945,7 @@ std::vector<std::string> discover_payloads(const std::string& dir) {
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
     (void)reserved;
     g_vm = vm;
+    thread_jni_env();
     LOGI("==============================================================");    LOGI("Zai-Bridge translation core (Unicorn backend)");
 #if defined(__aarch64__)
     LOGI(" guest: ARM32 / Thumb-2     host: arm64-v8a");
@@ -8844,6 +8996,10 @@ Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeStartSession(
         g_emulator = nullptr;
         return -1;
     }
+
+    // The guest class loader's namespace maps this library again; publish the
+    // pair so the NativeActivity entry point in that copy reaches this session.
+    publish_session_binding();
 
     // Guest classes (Java_* exports, RegisterNatives targets) must resolve
     // through the DexClassLoader the host positioned on the ingested APK.
@@ -9053,6 +9209,7 @@ Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeEndSession(
         g_guest_loader = nullptr;
     }
     zai::GpuCompositor::instance().teardown();
+    clear_session_binding();
     delete g_bridge;
     g_bridge = nullptr;
     delete g_emulator;
@@ -9290,6 +9447,7 @@ static void init_host_callbacks() {
 }
 
 static void ANativeActivity_onCreate_impl(ANativeActivity* activity, void* savedState, size_t savedStateSize) {
+    thread_jni_env();
     LOGI("==============================================================");
     LOGI(" ANativeActivity_onCreate invoked by host framework (%p)", activity);
     LOGI("==============================================================");
@@ -9299,6 +9457,7 @@ static void ANativeActivity_onCreate_impl(ANativeActivity* activity, void* saved
     init_host_callbacks();
     activity->callbacks = &g_host_callbacks;
 
+    adopt_session_binding();
     if (!g_bridge || !g_emulator) {
         LOGE("ANativeActivity_onCreate: bridge or emulator not initialised");
         return;
@@ -9455,6 +9614,11 @@ extern "C" JNIEXPORT void android_main(
 // ---------------------------------------------------------------------------
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_unity3d_player_NativeLoader_load(JNIEnv* env, jclass clazz, jstring libName) {
+    // This export is reached on whatever ART thread asked for "main"; publish
+    // that thread's environment before any guest call resolves a class.
+    if (env) t_env = env;
+    thread_jni_env();
+
     std::string name;
     if (libName && env) {
         const char* str = env->GetStringUTFChars(libName, nullptr);
