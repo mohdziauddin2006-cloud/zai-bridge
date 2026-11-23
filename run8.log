@@ -1,0 +1,553 @@
+--------- beginning of main
+11-23 08:32:24.054  5975  5975 I ZaiBridge: BridgeApplication initialized cleanly; native hooks decoupled from startup.
+11-23 08:32:29.707  5975  5997 W ZaiBridge: hidden-API exemption unavailable: java.lang.NoSuchMethodException: dalvik.system.VMRuntime.setHiddenApiExemptions [class [Ljava.lang.String;]
+11-23 08:32:29.709  5975  5997 I ZaiBridge: ActivityThread.mInstrumentation -> BridgeInstrumentation (delegate=true)
+11-23 08:32:29.720  5975  5997 I ARM64_WRAPPER: ==============================================================
+11-23 08:32:29.720  5975  5997 I ARM64_WRAPPER: Zai-Bridge translation core (Unicorn backend)
+11-23 08:32:29.720  5975  5997 I ARM64_WRAPPER:  guest: ARM32 / Thumb-2     host: x86_64
+11-23 08:32:29.721  5975  5997 I ARM64_WRAPPER: ==============================================================
+11-23 08:32:29.723  5975  5997 I ARM64_WRAPPER: EGL swap hook: libEGL eglSwapBuffers=0x7890f9466b10 chooseConfig=0x7890f9466620 GLESv2 shaderSource=0x7890e2eab250
+11-23 08:32:29.732  5975  5997 I ARM64_WRAPPER: EGL/GL hooks: swap10=yes swap14=yes configFallback=no glslPatch=yes extensions=yes (Java GLSurfaceView and NDK swaps share one frame clock)
+11-23 08:32:29.745  5975  5997 I ARM64_WRAPPER: PLT hook: patched 5 slot(s) across 306 module(s), 60436 slot(s) inspected
+11-23 08:32:29.748  5975  5997 I ARM64_WRAPPER: Vulkan hook: vkQueuePresentKHR=0x7890e85e2380 instanceProc=0x7890e85e10b0 deviceProc=0x7890e85e0ef0
+11-23 08:32:29.752  5975  5997 I ARM64_WRAPPER: PLT hook: patched 0 slot(s) across 612 module(s), 120872 slot(s) inspected
+11-23 08:32:29.753  5975  5997 I ARM64_WRAPPER: Vulkan hook: queue-present passthrough armed for the next dlopen (0 slot(s) patched)
+11-23 08:32:29.753  5975  5997 I ZaiBridge: EGL swap hook installed
+11-23 08:32:29.759  5975  5997 I ZaiBridge: Unicorn core loaded for x86_64
+11-23 08:32:29.759  5975  5997 I ARM64_WRAPPER: runtime sysroot: /data/user/0/com.ziauddin.zaibridge/files/runtime/r2.1.1
+11-23 08:32:29.764  5975  5997 I ZaiBridge: legacy runtime available: android-support-v4-19.1.0.jar (238184 bytes)
+11-23 08:32:29.765  5975  5997 I ZaiBridge: legacy runtime available: android-support-v7-appcompat.jar (279425 bytes)
+11-23 08:32:29.765  5975  5997 I ZaiBridge: legacy runtime available: google-play-apk-expansion.jar (58452 bytes)
+11-23 08:32:29.766  5975  5997 I ZaiBridge: legacy runtime available: org.apache.http.legacy.jar (76351 bytes)
+11-23 08:32:29.867  5975  5997 I ARM64_WRAPPER: guest DexClassLoader registered with the core (loader=0x2e0a)
+11-23 08:32:29.870  5975  5997 I ARM64_WRAPPER: runtime sysroot: /data/user/0/com.ziauddin.zaibridge/files/runtime/r2.1.1
+11-23 08:32:29.871  5975  5997 I ARM64_WRAPPER: NativeActivity metadata registered: func_name='', lib_name=''
+11-23 08:32:29.872  5975  5997 I ARM64_WRAPPER: ==============================================================
+11-23 08:32:29.873  5975  5997 I ARM64_WRAPPER:  Zai-Bridge: opening guest session
+11-23 08:32:29.873  5975  5997 I ARM64_WRAPPER:    game dir : /data/user/0/com.ziauddin.zaibridge/files/games/com.feelingtouch.hellzombie
+11-23 08:32:29.873  5975  5997 I ARM64_WRAPPER:    expansion: <none>
+11-23 08:32:29.874  5975  5997 I ARM64_WRAPPER: ==============================================================
+11-23 08:32:29.880  5975  5997 I ARM64_WRAPPER: VFP bring-up: CPACR=00f00000 (cp10/11 granted), FPEXC=40000000 (EN set)
+11-23 08:32:29.881  5975  5997 I ARM64_WRAPPER: guest arena: 448 MB heap @ 50000000, 320 MB page arena @ 6c000000 (81920 pages)
+11-23 08:32:29.881  5975  5997 I ARM64_WRAPPER: ARM32 main thread TLS initialised at 50000000 (TPIDRURO)
+11-23 08:32:29.881  5975  5997 I ARM64_WRAPPER: uc_open(UC_ARCH_ARM, ARM|THUMB) ok - guest heap @ 50000000, stack @ ac000000
+11-23 08:32:29.881  5975  5997 I ARM64_WRAPPER: trampoline pool: 0x7890de274000 (256 KB, RWX)
+11-23 08:32:29.887  5975  5997 I ARM64_WRAPPER: host graphics: libEGL=0x2c6d6be4bde6b24b libGLESv1_CM=0xdf08678a56b9012f libGLESv2=0xde6bba932fb15feb
+11-23 08:32:29.908  5975  5997 I ARM64_WRAPPER: host platform: libandroid=0x940b0bbf26e45195 libOpenSLES=0x20d8498c01ff3f9f
+11-23 08:32:29.908  5975  5997 I ARM64_WRAPPER: asset bridge: process AssetManager 0x2e26
+11-23 08:32:29.908  5975  5997 I ARM64_WRAPPER: data imports: __sF @500001c0, environ @500004c0
+11-23 08:32:29.908  5975  5997 I ARM64_WRAPPER: data imports: _ctype_ table @500004d8, _tolower_tab_ @500005e0, _toupper_tab_ @500007e8
+11-23 08:32:29.909  5975  5997 I ARM64_WRAPPER: JNI bridge ready: env shadow 50000e10, vm shadow 50000e60, trap page 40000000
+11-23 08:32:29.909  5975  5997 I ARM64_WRAPPER: JNIEnv slot map: FindClass=6 GetObjectClass=31 GetMethodID=33 GetFieldID=94 GetStaticMethodID=113 NewStringUTF=167 GetJavaVM=219
+11-23 08:32:29.909  5975  5997 I ARM64_WRAPPER: CPU topology: cores=4 conf=4 clusters=2 soc=generic ARM perf=[2,3]
+11-23 08:32:29.912  5975  5997 I ARM64_WRAPPER: virtual /proc/cpuinfo published at /data/user/0/com.ziauddin.zaibridge/files/games/com.feelingtouch.hellzombie/data/.zai-cpuinfo
+11-23 08:32:29.917  5975  5997 I ARM64_WRAPPER: emulation thread pinned to performance cores (2 of 4)
+11-23 08:32:29.918  5975  5997 I ARM64_WRAPPER: cpu compatibility: cores=4/4 clusters=2 soc=generic ARM hwcap=0x7ffb0d7 perf=2,3
+11-23 08:32:29.933  5975  5997 I ARM64_WRAPPER: payload scan: skipping /data/user/0/com.ziauddin.zaibridge/files/games/com.feelingtouch.hellzombie/native/libc++_shared.so (not an ARM32 ELF)
+11-23 08:32:29.934  5975  5997 I ARM64_WRAPPER: discovered 4 ARM32 payloads in /data/user/0/com.ziauddin.zaibridge/files/games/com.feelingtouch.hellzombie/payload
+11-23 08:32:29.984  5975  5997 I ARM64_WRAPPER: /data/user/0/com.ziauddin.zaibridge/files/games/com.feelingtouch.hellzombie/payload/libmono32.so loaded: bias 20000000, 4009984 bytes, 8 segments
+11-23 08:32:29.992  5975  5997 I ARM64_WRAPPER: /data/user/0/com.ziauddin.zaibridge/files/games/com.feelingtouch.hellzombie/payload/libmono32.so: 950 dynamic symbols, soname=libmono.so
+11-23 08:32:30.145  5975  5997 I ARM64_WRAPPER: /data/user/0/com.ziauddin.zaibridge/files/games/com.feelingtouch.hellzombie/payload/libunity32.so loaded: bias 21000000, 12595200 bytes, 7 segments
+11-23 08:32:30.180  5975  5997 I ARM64_WRAPPER: /data/user/0/com.ziauddin.zaibridge/files/games/com.feelingtouch.hellzombie/payload/libunity32.so: 1399 dynamic symbols, soname=libunity.so
+11-23 08:32:30.183  5975  5997 I ARM64_WRAPPER: /data/user/0/com.ziauddin.zaibridge/files/games/com.feelingtouch.hellzombie/payload/libfXs132.so loaded: bias 22000000, 16384 bytes, 5 segments
+11-23 08:32:30.190  5975  5997 I ARM64_WRAPPER: /data/user/0/com.ziauddin.zaibridge/files/games/com.feelingtouch.hellzombie/payload/libfXs132.so: 61 dynamic symbols, soname=<none>
+11-23 08:32:30.191  5975  5997 I ARM64_WRAPPER: /data/user/0/com.ziauddin.zaibridge/files/games/com.feelingtouch.hellzombie/payload/libmain32.so loaded: bias 23000000, 32768 bytes, 7 segments
+11-23 08:32:30.191  5975  5997 I ARM64_WRAPPER: /data/user/0/com.ziauddin.zaibridge/files/games/com.feelingtouch.hellzombie/payload/libmain32.so: 72 dynamic symbols, soname=libmain.so
+11-23 08:32:30.193  5975  5997 I ARM64_WRAPPER: /data/user/0/com.ziauddin.zaibridge/files/games/com.feelingtouch.hellzombie/payload/libmono32.so: 3576 relocations applied, 0 unresolved slots
+11-23 08:32:30.208  5975  5997 I ARM64_WRAPPER: /data/user/0/com.ziauddin.zaibridge/files/games/com.feelingtouch.hellzombie/payload/libunity32.so: 28381 relocations applied, 0 unresolved slots
+11-23 08:32:30.216  5975  5997 I ARM64_WRAPPER: /data/user/0/com.ziauddin.zaibridge/files/games/com.feelingtouch.hellzombie/payload/libfXs132.so: 21 relocations applied, 0 unresolved slots
+11-23 08:32:30.217  5975  5997 I ARM64_WRAPPER: /data/user/0/com.ziauddin.zaibridge/files/games/com.feelingtouch.hellzombie/payload/libmain32.so: 100 relocations applied, 0 unresolved slots
+11-23 08:32:30.218  5975  5997 I ARM64_WRAPPER: emu call #1: constructor @21056224 (0 args, depth 0)
+11-23 08:32:30.218  5975  5997 I ARM64_WRAPPER: pthread_once: running init routine 21917734 in-guest
+11-23 08:32:30.219  5975  5997 I ARM64_WRAPPER: import memset(r0=21bfc459 r1=00000000 r2=00000100) ret_to=21944150
+11-23 08:32:30.219  5975  5997 I ARM64_WRAPPER: import memset(r0=21bfc559 r1=00000000 r2=00000100) ret_to=2194416c
+11-23 08:32:30.241  5975  5997 I ARM64_WRAPPER: emu call #2: constructor @21056388 (0 args, depth 0)
+11-23 08:32:30.243  5975  5997 I ARM64_WRAPPER: import __aeabi_memset(r0=21b93b3c r1=00000058 r2=00000000) ret_to=21056434
+11-23 08:32:30.254  5975  5997 I ARM64_WRAPPER: import __aeabi_memset(r0=21a92c48 r1=00000570 r2=00000000) ret_to=210b6c5c
+11-23 08:32:30.255  5975  5997 I ARM64_WRAPPER: import __aeabi_memset(r0=21a92b80 r1=000000c4 r2=00000000) ret_to=210b6c6c
+11-23 08:32:30.268  5975  5997 I ARM64_WRAPPER: emu call #3: constructor @21059cb4 (0 args, depth 0)
+11-23 08:32:30.269  5975  5997 I ARM64_WRAPPER: emu call #4: constructor @21059cfc (0 args, depth 0)
+11-23 08:32:30.269  5975  5997 I ARM64_WRAPPER: import __aeabi_memset(r0=21a94f80 r1=0000003c r2=00000000) ret_to=211f5350
+11-23 08:32:30.272  5975  5997 I ARM64_WRAPPER: import __aeabi_memset(r0=21a94fe0 r1=00000078 r2=00000000) ret_to=211f5510
+11-23 08:32:30.274  5975  5997 I ARM64_WRAPPER: import __aeabi_memset(r0=21a95070 r1=00000008 r2=00000000) ret_to=211f5510
+11-23 08:32:30.275  5975  5997 I ARM64_WRAPPER: import __aeabi_memset(r0=21a95090 r1=000003b0 r2=00000000) ret_to=211f5510
+11-23 08:32:30.285  5975  5997 I ARM64_WRAPPER: import __aeabi_memset(r0=21a95090 r1=00000078 r2=00000000) ret_to=211f5510
+11-23 08:32:30.287  5975  5997 I ARM64_WRAPPER: import __aeabi_memset(r0=21a95090 r1=00000070 r2=00000000) ret_to=211f5510
+11-23 08:32:30.292  5975  5997 I ARM64_WRAPPER: emu call #5: constructor @21059d70 (0 args, depth 0)
+11-23 08:32:30.302  5975  5997 I ARM64_WRAPPER: emu call #6: constructor @21059ff0 (0 args, depth 0)
+11-23 08:32:30.306  5975  5997 I ARM64_WRAPPER: emu call #7: constructor @2105a378 (0 args, depth 0)
+11-23 08:32:30.309  5975  5997 I ARM64_WRAPPER: emu call #8: constructor @2105aa60 (0 args, depth 0)
+11-23 08:32:30.309  5975  5997 I ARM64_WRAPPER: emu call #9: constructor @2105aacc (0 args, depth 0)
+11-23 08:32:30.310  5975  5997 I ARM64_WRAPPER: import __aeabi_memset(r0=21b94474 r1=000000c0 r2=00000000) ret_to=2105ab10
+11-23 08:32:30.310  5975  5997 I ARM64_WRAPPER: import __aeabi_memset(r0=21b94540 r1=00000054 r2=00000000) ret_to=2105ab24
+11-23 08:32:30.310  5975  5997 I ARM64_WRAPPER: emu call #10: constructor @2105ab3c (0 args, depth 0)
+11-23 08:32:30.310  5975  5997 I ARM64_WRAPPER: emu call #11: constructor @2105aba8 (0 args, depth 0)
+11-23 08:32:30.311  5975  5997 I ARM64_WRAPPER: emu call #12: constructor @2105ac38 (0 args, depth 0)
+11-23 08:32:30.315  5975  5997 I ARM64_WRAPPER: emu call #13: constructor @2105ae58 (0 args, depth 0)
+11-23 08:32:30.321  5975  5997 I ARM64_WRAPPER: emu call #14: constructor @2105b04c (0 args, depth 0)
+11-23 08:32:30.321  5975  5997 I ARM64_WRAPPER: emu call #15: constructor @2105b100 (0 args, depth 0)
+11-23 08:32:30.321  5975  5997 I ARM64_WRAPPER: emu call #16: constructor @2105b198 (0 args, depth 0)
+11-23 08:32:30.322  5975  5997 I ARM64_WRAPPER: emu call #17: constructor @2105b1e0 (0 args, depth 0)
+11-23 08:32:30.322  5975  5997 I ARM64_WRAPPER: emu call #18: constructor @2105b228 (0 args, depth 0)
+11-23 08:32:30.322  5975  5997 I ARM64_WRAPPER: emu call #19: constructor @2105b294 (0 args, depth 0)
+11-23 08:32:30.324  5975  5997 I ARM64_WRAPPER: emu call #20: constructor @2105b40c (0 args, depth 0)
+11-23 08:32:30.325  5975  5997 I ARM64_WRAPPER: emu call #21: constructor @2105b454 (0 args, depth 0)
+11-23 08:32:30.326  5975  5997 I ARM64_WRAPPER: emu call #22: constructor @2105b518 (0 args, depth 0)
+11-23 08:32:30.327  5975  5997 I ARM64_WRAPPER: emu call #23: constructor @2105b560 (0 args, depth 0)
+11-23 08:32:30.327  5975  5997 I ARM64_WRAPPER: emu call #24: constructor @2105b5a8 (0 args, depth 0)
+11-23 08:32:30.328  5975  5997 I ARM64_WRAPPER: emu call #25: constructor @2105b6c0 (0 args, depth 0)
+11-23 08:32:30.328  5975  5997 I ARM64_WRAPPER: emu call #26: constructor @2105b72c (0 args, depth 0)
+11-23 08:32:30.329  5975  5997 I ARM64_WRAPPER: emu call #27: constructor @2105b774 (0 args, depth 0)
+11-23 08:32:30.329  5975  5997 I ARM64_WRAPPER: emu call #28: constructor @2105b7f0 (0 args, depth 0)
+11-23 08:32:30.329  5975  5997 I ARM64_WRAPPER: emu call #29: constructor @2105b994 (0 args, depth 0)
+11-23 08:32:30.330  5975  5997 I ARM64_WRAPPER: emu call #30: constructor @2105ba38 (0 args, depth 0)
+11-23 08:32:30.331  5975  5997 I ARM64_WRAPPER: emu call #31: constructor @2105ba80 (0 args, depth 0)
+11-23 08:32:30.332  5975  5997 I ARM64_WRAPPER: emu call #32: constructor @2105baf0 (0 args, depth 0)
+11-23 08:32:30.333  5975  5997 I ARM64_WRAPPER: emu call #33: constructor @2105bb48 (0 args, depth 0)
+11-23 08:32:30.333  5975  5997 I ARM64_WRAPPER: emu call #34: constructor @2105bbf8 (0 args, depth 0)
+11-23 08:32:30.334  5975  5997 I ARM64_WRAPPER: emu call #35: constructor @2105bd7c (0 args, depth 0)
+11-23 08:32:30.334  5975  5997 I ARM64_WRAPPER: emu call #36: constructor @2105be2c (0 args, depth 0)
+11-23 08:32:30.335  5975  5997 I ARM64_WRAPPER: emu call #37: constructor @2105bf0c (0 args, depth 0)
+11-23 08:32:30.336  5975  5997 I ARM64_WRAPPER: emu call #38: constructor @2105bf90 (0 args, depth 0)
+11-23 08:32:30.337  5975  5997 I ARM64_WRAPPER: emu call #39: constructor @2105bffc (0 args, depth 0)
+11-23 08:32:30.338  5975  5997 I ARM64_WRAPPER: emu call #40: constructor @2105c044 (0 args, depth 0)
+11-23 08:32:30.338  5975  5997 I ARM64_WRAPPER: emu call #41: constructor @2105c08c (0 args, depth 0)
+11-23 08:32:30.339  5975  5997 I ARM64_WRAPPER: import __aeabi_memset(r0=21b95b88 r1=00000024 r2=00000000) ret_to=2105c110
+11-23 08:32:30.339  5975  5997 I ARM64_WRAPPER: emu call #42: constructor @2105c244 (0 args, depth 0)
+11-23 08:32:30.340  5975  5997 I ARM64_WRAPPER: emu call #43: constructor @2105c4f0 (0 args, depth 0)
+11-23 08:32:30.341  5975  5997 I ARM64_WRAPPER: emu call #44: constructor @2105c644 (0 args, depth 0)
+11-23 08:32:30.341  5975  5997 I ARM64_WRAPPER: emu call #45: constructor @2105c68c (0 args, depth 0)
+11-23 08:32:30.341  5975  5997 I ARM64_WRAPPER: emu call #46: constructor @2105c6d4 (0 args, depth 0)
+11-23 08:32:30.342  5975  5997 I ARM64_WRAPPER: emu call #47: constructor @2105c71c (0 args, depth 0)
+11-23 08:32:30.344  5975  5997 I ARM64_WRAPPER: emu call #48: constructor @2105c7b0 (0 args, depth 0)
+11-23 08:32:30.344  5975  5997 I ARM64_WRAPPER: emu call #49: constructor @2105c7f8 (0 args, depth 0)
+11-23 08:32:30.345  5975  5997 I ARM64_WRAPPER: emu call #50: constructor @2105c840 (0 args, depth 0)
+11-23 08:32:30.345  5975  5997 I ARM64_WRAPPER: emu call #51: constructor @2105c888 (0 args, depth 0)
+11-23 08:32:30.346  5975  5997 I ARM64_WRAPPER: emu call #52: constructor @2105c8f4 (0 args, depth 0)
+11-23 08:32:30.346  5975  5997 I ARM64_WRAPPER: emu call #53: constructor @2105c93c (0 args, depth 0)
+11-23 08:32:30.347  5975  5997 I ARM64_WRAPPER: emu call #54: constructor @2105c984 (0 args, depth 0)
+11-23 08:32:30.348  5975  5997 I ARM64_WRAPPER: emu call #55: constructor @2105c9f4 (0 args, depth 0)
+11-23 08:32:30.348  5975  5997 I ARM64_WRAPPER: import __aeabi_memset(r0=21b96020 r1=00000134 r2=00000000) ret_to=2105ca64
+11-23 08:32:30.350  5975  5997 I ARM64_WRAPPER: emu call #56: constructor @2105cbbc (0 args, depth 0)
+11-23 08:32:30.350  5975  5997 I ARM64_WRAPPER: emu call #57: constructor @2105cc04 (0 args, depth 0)
+11-23 08:32:30.351  5975  5997 I ARM64_WRAPPER: emu call #58: constructor @2105cc4c (0 args, depth 0)
+11-23 08:32:30.351  5975  5997 I ARM64_WRAPPER: emu call #59: constructor @2105cca4 (0 args, depth 0)
+11-23 08:32:30.352  5975  5997 I ARM64_WRAPPER: emu call #60: constructor @2105ccec (0 args, depth 0)
+11-23 08:32:30.355  5975  5997 I ARM64_WRAPPER: import __aeabi_memset(r0=afffefb0 r1=00000028 r2=00000000) ret_to=2105cfc0
+11-23 08:32:30.356  5975  5997 I ARM64_WRAPPER: import __aeabi_memset(r0=21b9663c r1=00000028 r2=00000000) ret_to=2105cfe4
+11-23 08:32:30.362  5975  5997 I ARM64_WRAPPER: import __aeabi_memset(r0=21bac724 r1=00000028 r2=00000000) ret_to=2105dba4
+11-23 08:32:30.373  5975  5997 I ARM64_WRAPPER: import malloc(r0=0000001c r1=00002525 r2=210ba590) ret_to=21575d88
+11-23 08:32:30.374  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000015 r1=0000252d r2=210ba590) ret_to=21575d88
+11-23 08:32:30.374  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000018 r1=00002535 r2=210ba590) ret_to=21575d88
+11-23 08:32:30.375  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000017 r1=0000253d r2=210ba590) ret_to=21575d88
+11-23 08:32:30.375  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000029 r1=00002545 r2=210ba590) ret_to=21575d88
+11-23 08:32:30.375  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000022 r1=0000254d r2=210ba590) ret_to=21575d88
+11-23 08:32:30.375  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000020 r1=00002555 r2=210ba590) ret_to=21575d88
+11-23 08:32:30.376  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000023 r1=0000255d r2=210ba590) ret_to=21575d88
+11-23 08:32:30.376  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000022 r1=00002565 r2=210ba590) ret_to=21575d88
+11-23 08:32:30.376  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000028 r1=0000256d r2=210ba590) ret_to=21575d88
+11-23 08:32:30.376  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000010 r1=00002575 r2=210ba590) ret_to=21575d88
+11-23 08:32:30.377  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000019 r1=0000257d r2=210ba590) ret_to=21575d88
+11-23 08:32:30.377  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000011 r1=00002585 r2=210ba590) ret_to=21575d88
+11-23 08:32:30.377  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000012 r1=0000258d r2=210ba590) ret_to=21575d88
+11-23 08:32:30.377  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000017 r1=00002595 r2=210ba590) ret_to=21575d88
+11-23 08:32:30.378  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000021 r1=0000259d r2=210ba590) ret_to=21575d88
+11-23 08:32:30.378  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000018 r1=000025a5 r2=210ba590) ret_to=21575d88
+11-23 08:32:30.378  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000014 r1=000025ad r2=210ba590) ret_to=21575d88
+11-23 08:32:30.378  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000021 r1=000025b5 r2=210ba590) ret_to=21575d88
+11-23 08:32:30.379  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000023 r1=000025bd r2=210ba590) ret_to=21575d88
+11-23 08:32:30.379  5975  5997 I ARM64_WRAPPER: import malloc(r0=0000001c r1=000025c5 r2=210ba590) ret_to=21575d88
+11-23 08:32:30.379  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000015 r1=000025cd r2=210ba590) ret_to=21575d88
+11-23 08:32:30.379  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000025 r1=000025d5 r2=210ba590) ret_to=21575d88
+11-23 08:32:30.380  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000019 r1=000025dd r2=210ba590) ret_to=21575d88
+11-23 08:32:30.380  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000018 r1=000025e5 r2=210ba590) ret_to=21575d88
+11-23 08:32:30.380  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000016 r1=000025ed r2=210ba590) ret_to=21575d88
+11-23 08:32:30.380  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000019 r1=000025f5 r2=210ba590) ret_to=21575d88
+11-23 08:32:30.381  5975  5997 I ARM64_WRAPPER: import malloc(r0=0000001b r1=000025fd r2=210ba590) ret_to=21575d88
+11-23 08:32:30.381  5975  5997 I ARM64_WRAPPER: import malloc(r0=0000001b r1=00002605 r2=210ba590) ret_to=21575d88
+11-23 08:32:30.381  5975  5997 I ARM64_WRAPPER: import malloc(r0=0000000d r1=0000260d r2=210ba590) ret_to=21575d88
+11-23 08:32:30.381  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000010 r1=00002615 r2=210ba590) ret_to=21575d88
+11-23 08:32:30.382  5975  5997 I ARM64_WRAPPER: import malloc(r0=0000001d r1=0000261d r2=210ba590) ret_to=21575d88
+11-23 08:32:30.382  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000016 r1=00002625 r2=210ba590) ret_to=21575d88
+11-23 08:32:30.382  5975  5997 I ARM64_WRAPPER: import malloc(r0=0000001c r1=0000262d r2=210ba590) ret_to=21575d88
+11-23 08:32:30.382  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000011 r1=00002635 r2=210ba590) ret_to=21575d88
+11-23 08:32:30.383  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000011 r1=0000263d r2=210ba590) ret_to=21575d88
+11-23 08:32:30.383  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000011 r1=00002645 r2=210ba590) ret_to=21575d88
+11-23 08:32:30.384  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000013 r1=0000264d r2=210ba590) ret_to=21575d88
+11-23 08:32:30.384  5975  5997 I ARM64_WRAPPER: import malloc(r0=0000000f r1=00002655 r2=210ba590) ret_to=21575d88
+11-23 08:32:30.384  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000011 r1=0000265d r2=210ba590) ret_to=21575d88
+11-23 08:32:30.387  5975  5997 I ARM64_WRAPPER: import memset(r0=21bf5604 r1=00000000 r2=00000190) ret_to=216bac38
+11-23 08:32:30.387  5975  5997 I ARM64_WRAPPER: import memset(r0=21bf5924 r1=00000000 r2=00000028) ret_to=216bac50
+11-23 08:32:30.388  5975  5997 I ARM64_WRAPPER: import memset(r0=21bf5794 r1=00000000 r2=00000190) ret_to=216bad04
+11-23 08:32:30.392  5975  5997 I ARM64_WRAPPER: /data/user/0/com.ziauddin.zaibridge/files/games/com.feelingtouch.hellzombie/payload/libunity32.so: 236 static constructors ran
+11-23 08:32:30.393  5975  5997 I ARM64_WRAPPER: binding 7 Java_* exports into the host runtime
+11-23 08:32:30.394  5975  5997 I ARM64_WRAPPER:   bound org/fmod/FMODAudioDevice.fmodProcess(Ljava/nio/ByteBuffer;)I -> guest 215e7548
+11-23 08:32:30.394  5975  5997 I ARM64_WRAPPER:   bound org/fmod/FMODAudioDevice.fmodBlockStreaming()I -> guest 215e75ec
+11-23 08:32:30.394  5975  5997 I ARM64_WRAPPER:   bound org/fmod/FMODAudioDevice.fmodUnblockStreaming()I -> guest 215e75a8
+11-23 08:32:30.395  5975  5997 I ARM64_WRAPPER:   bound org/fmod/FMODAudioDevice.fmodProcessMicData(Ljava/nio/ByteBuffer;I)I -> guest 215e7240
+11-23 08:32:30.395  5975  5997 I ARM64_WRAPPER:   bound org/fmod/FMODAudioDevice.fmodInitJni()I -> guest 215e7918
+11-23 08:32:30.395  5975  5997 I ARM64_WRAPPER:   bound org/fmod/FMODAudioDevice.fmodGetInfo(I)I -> guest 215e74b8
+11-23 08:32:30.396  5975  5997 I ARM64_WRAPPER:   bound com/feelingtouch/pay/PayUtil.jniEncodeToken(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String; -> guest 22000fe0
+11-23 08:32:30.396  5975  5997 I ARM64_WRAPPER: Java_* binding: 7/7 bound, 0 deferred (class not loaded yet)
+11-23 08:32:30.397  5975  5997 I ARM64_WRAPPER:   native initJni(Landroid/content/Context;)V -> guest 213de918 (trampoline 0x7890de274460)
+11-23 08:32:30.397  5975  5997 I ARM64_WRAPPER:   native nativeDeviceOrientation(I)V -> guest 213df0f4 (trampoline 0x7890de274500)
+11-23 08:32:30.397  5975  5997 I ARM64_WRAPPER:   native nativeDone()V -> guest 213deb84 (trampoline 0x7890de2745a0)
+11-23 08:32:30.398  5975  5997 I ARM64_WRAPPER:   native nativeFile(Ljava/lang/String;)V -> guest 213e0308 (trampoline 0x7890de274640)
+11-23 08:32:30.398  5975  5997 I ARM64_WRAPPER:   native nativeSetDefaultDisplay(I)V -> guest 213de7b8 (trampoline 0x7890de2746e0)
+11-23 08:32:30.398  5975  5997 I ARM64_WRAPPER:   native nativePause()Z -> guest 213dec60 (trampoline 0x7890de274780)
+11-23 08:32:30.398  5975  5997 I ARM64_WRAPPER:   native nativeRecreateGfxState(Landroid/view/Surface;)V -> guest 213def04 (trampoline 0x7890de274820)
+11-23 08:32:30.398  5975  5997 I ARM64_WRAPPER:   native nativeRender()Z -> guest 213df014 (trampoline 0x7890de2748c0)
+11-23 08:32:30.398  5975  5997 I ARM64_WRAPPER:   native nativeResize(IIII)V -> guest 213dea58 (trampoline 0x7890de274960)
+11-23 08:32:30.398  5975  5997 I ARM64_WRAPPER:   native nativeResume()V -> guest 213ded44 (trampoline 0x7890de274a00)
+11-23 08:32:30.399  5975  5997 I ARM64_WRAPPER:   native nativeFocusChanged(Z)V -> guest 213dee1c (trampoline 0x7890de274aa0)
+11-23 08:32:30.399  5975  5997 I ARM64_WRAPPER:   native nativeSetInputString(Ljava/lang/String;)V -> guest 213dfc88 (trampoline 0x7890de274b40)
+11-23 08:32:30.399  5975  5997 I ARM64_WRAPPER:   native nativeSoftInputClosed()V -> guest 213dfef4 (trampoline 0x7890de274be0)
+11-23 08:32:30.399  5975  5997 I ARM64_WRAPPER:   native nativeSetInputCanceled(Z)V -> guest 213dfdf8 (trampoline 0x7890de274c80)
+11-23 08:32:30.400  5975  5997 I ARM64_WRAPPER:   native nativeSetTouchDeltaY(F)V -> guest 213dfba8 (trampoline 0x7890de274d20)
+11-23 08:32:30.400  5975  5997 I ARM64_WRAPPER:   native nativeSetLocation(FFFFDF)V -> guest 213e00f0 (trampoline 0x7890de274dc0)
+11-23 08:32:30.400  5975  5997 I ARM64_WRAPPER:   native nativeSetLocationStatus(I)V -> guest 213dfff4 (trampoline 0x7890de274e60)
+11-23 08:32:30.400  5975  5997 I ARM64_WRAPPER:   native nativeInitWWW(Ljava/lang/Class;)V -> guest 213e022c (trampoline 0x7890de274f00)
+11-23 08:32:30.400  5975  5997 I ARM64_WRAPPER:   native nativeVideoFrameCallback(I[BII)V -> guest 213e0664 (trampoline 0x7890de274fa0)
+11-23 08:32:30.400  5975  5997 I ARM64_WRAPPER:   native nativeRequestedAA()I -> guest 213e0770 (trampoline 0x7890de275040)
+11-23 08:32:30.400  5975  5997 I ARM64_WRAPPER:   native nativeRequested32bitDisplayBuffer()Z -> guest 213e085c (trampoline 0x7890de2750e0)
+11-23 08:32:30.400  5975  5997 I ARM64_WRAPPER:   native nativeActivityIndicatorStyle()I -> guest 213e0944 (trampoline 0x7890de275180)
+11-23 08:32:30.401  5975  5997 I ARM64_WRAPPER:   native nativeForwardEventsToDalvik(Z)V -> guest 213e0a24 (trampoline 0x7890de275220)
+11-23 08:32:30.401  5975  5997 I ARM64_WRAPPER:   native nativeInjectEvent(Landroid/view/InputEvent;)Z -> guest 213df268 (trampoline 0x7890de2752c0)
+11-23 08:32:30.402  5975  5997 I ARM64_WRAPPER:   native UnitySendMessage(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V -> guest 213e04d0 (trampoline 0x7890de275360)
+11-23 08:32:30.402  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.initJni(Landroid/content/Context;)V -> 0x213de918
+11-23 08:32:30.403  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeDeviceOrientation(I)V -> 0x213df0f4
+11-23 08:32:30.403  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeDone()V -> 0x213deb84
+11-23 08:32:30.403  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeFile(Ljava/lang/String;)V -> 0x213e0308
+11-23 08:32:30.403  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeSetDefaultDisplay(I)V -> 0x213de7b8
+11-23 08:32:30.403  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativePause()Z -> 0x213dec60
+11-23 08:32:30.403  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeRecreateGfxState(Landroid/view/Surface;)V -> 0x213def04
+11-23 08:32:30.403  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeRender()Z -> 0x213df014
+11-23 08:32:30.404  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeResize(IIII)V -> 0x213dea58
+11-23 08:32:30.404  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeResume()V -> 0x213ded44
+11-23 08:32:30.404  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeFocusChanged(Z)V -> 0x213dee1c
+11-23 08:32:30.404  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeSetInputString(Ljava/lang/String;)V -> 0x213dfc88
+11-23 08:32:30.405  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeSoftInputClosed()V -> 0x213dfef4
+11-23 08:32:30.406  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeSetInputCanceled(Z)V -> 0x213dfdf8
+11-23 08:32:30.406  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeSetTouchDeltaY(F)V -> 0x213dfba8
+11-23 08:32:30.406  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeSetLocation(FFFFDF)V -> 0x213e00f0
+11-23 08:32:30.406  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeSetLocationStatus(I)V -> 0x213dfff4
+11-23 08:32:30.406  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeInitWWW(Ljava/lang/Class;)V -> 0x213e022c
+11-23 08:32:30.407  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeVideoFrameCallback(I[BII)V -> 0x213e0664
+11-23 08:32:30.407  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeRequestedAA()I -> 0x213e0770
+11-23 08:32:30.407  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeRequested32bitDisplayBuffer()Z -> 0x213e085c
+11-23 08:32:30.407  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeActivityIndicatorStyle()I -> 0x213e0944
+11-23 08:32:30.409  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeForwardEventsToDalvik(Z)V -> 0x213e0a24
+11-23 08:32:30.409  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeInjectEvent(Landroid/view/InputEvent;)Z -> 0x213df268
+11-23 08:32:30.409  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.UnitySendMessage(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V -> 0x213e04d0
+11-23 08:32:30.409  5975  5997 I ARM64_WRAPPER: RegisterNatives: 25 / 25 methods registered on class com/unity3d/player/UnityPlayer
+11-23 08:32:30.409  5975  5997 I ARM64_WRAPPER:   native fmodGetInfo(I)I -> guest 215e74b8 (trampoline 0x7890de275400)
+11-23 08:32:30.410  5975  5997 I ARM64_WRAPPER:   native fmodProcess(Ljava/nio/ByteBuffer;)I -> guest 215e7548 (trampoline 0x7890de2754a0)
+11-23 08:32:30.410  5975  5997 I ARM64_WRAPPER:   native fmodInitJni()I -> guest 215e7918 (trampoline 0x7890de275540)
+11-23 08:32:30.410  5975  5997 I ARM64_WRAPPER:   native fmodProcessMicData(Ljava/nio/ByteBuffer;I)I -> guest 215e7240 (trampoline 0x7890de2755e0)
+11-23 08:32:30.410  5975  5997 I ARM64_WRAPPER:   native fmodUnblockStreaming()I -> guest 215e75a8 (trampoline 0x7890de275680)
+11-23 08:32:30.410  5975  5997 I ARM64_WRAPPER:   native fmodBlockStreaming()I -> guest 215e75ec (trampoline 0x7890de275720)
+11-23 08:32:30.410  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound org/fmod/FMODAudioDevice.fmodGetInfo(I)I -> 0x215e74b8
+11-23 08:32:30.410  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound org/fmod/FMODAudioDevice.fmodProcess(Ljava/nio/ByteBuffer;)I -> 0x215e7548
+11-23 08:32:30.410  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound org/fmod/FMODAudioDevice.fmodInitJni()I -> 0x215e7918
+11-23 08:32:30.410  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound org/fmod/FMODAudioDevice.fmodProcessMicData(Ljava/nio/ByteBuffer;I)I -> 0x215e7240
+11-23 08:32:30.410  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound org/fmod/FMODAudioDevice.fmodUnblockStreaming()I -> 0x215e75a8
+11-23 08:32:30.410  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound org/fmod/FMODAudioDevice.fmodBlockStreaming()I -> 0x215e75ec
+11-23 08:32:30.411  5975  5997 I ARM64_WRAPPER: RegisterNatives: 6 / 6 methods registered on class org/fmod/FMODAudioDevice
+11-23 08:32:30.412  5975  5997 I ARM64_WRAPPER:   native nativeProxyInvoke(ILjava/lang/String;[Ljava/lang/Object;)Ljava/lang/Object; -> guest 21443b18 (trampoline 0x7890de2757c0)
+11-23 08:32:30.412  5975  5997 I ARM64_WRAPPER:   native nativeProxyFinalize(I)V -> guest 21443be8 (trampoline 0x7890de275860)
+11-23 08:32:30.412  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/ReflectionHelper.nativeProxyInvoke(ILjava/lang/String;[Ljava/lang/Object;)Ljava/lang/Object; -> 0x21443b18
+11-23 08:32:30.413  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/ReflectionHelper.nativeProxyFinalize(I)V -> 0x21443be8
+11-23 08:32:30.414  5975  5997 I ARM64_WRAPPER: RegisterNatives: 2 / 2 methods registered on class com/unity3d/player/ReflectionHelper
+11-23 08:32:30.416  5975  5997 I ARM64_WRAPPER: pthread_once: running init routine 210b46b0 in-guest
+11-23 08:32:30.417  5975  5997 I ARM64_WRAPPER: import malloc(r0=0000041c r1=afffee9c r2=00000100) ret_to=210b4764
+11-23 08:32:30.418  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000002 r1=0000000a r2=0000035e) ret_to=210b586c
+11-23 08:32:30.419  5975  5997 I ARM64_WRAPPER: import free(r0=50001748 r1=00000000 r2=00000009) ret_to=210b4994
+11-23 08:32:30.421  5975  5997 W ARM64_WRAPPER: dlopen(libc.so): not found in payload/, native/, or bundled sysroot
+11-23 08:32:30.423  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000002 r1=0000000a r2=0000035e) ret_to=210b586c
+11-23 08:32:30.424  5975  5997 I ARM64_WRAPPER: import free(r0=50001748 r1=00000000 r2=0000000a) ret_to=210b4b04
+11-23 08:32:30.424  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000042 r1=0000000a r2=000003c9) ret_to=210b586c
+11-23 08:32:30.425  5975  5997 I ARM64_WRAPPER: import free(r0=50001750 r1=00000005 r2=50001791) ret_to=210b5014
+11-23 08:32:30.426  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000005 r1=0000000a r2=00000375) ret_to=210b586c
+11-23 08:32:30.427  5975  5997 I ARM64_WRAPPER: import free(r0=50001748 r1=00000018 r2=21a92b50) ret_to=210b53c8
+11-23 08:32:30.427  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000004 r1=0000000a r2=0000034e) ret_to=210b586c
+11-23 08:32:30.427  5975  5997 I ARM64_WRAPPER: import free(r0=50001748 r1=00000014 r2=21a92b50) ret_to=210b53c8
+11-23 08:32:30.429  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000006 r1=0000000a r2=0000033f) ret_to=210b586c
+11-23 08:32:30.429  5975  5997 I ARM64_WRAPPER: import free(r0=50001748 r1=00000004 r2=21a92b50) ret_to=210b53c8
+11-23 08:32:30.430  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000002 r1=0000000a r2=0000032a) ret_to=210b586c
+11-23 08:32:30.431  5975  5997 I ARM64_WRAPPER: import free(r0=50001748 r1=00000000 r2=21a92b50) ret_to=210b53c8
+11-23 08:32:30.431  5975  5997 I ARM64_WRAPPER: import malloc(r0=00000012 r1=0000000a r2=0000003d) ret_to=210b586c
+11-23 08:32:30.432  5975  5997 I ARM64_WRAPPER: import free(r0=50001748 r1=21970bdc r2=00000011) ret_to=210b54e4
+11-23 08:32:30.432  5975  5997 I ARM64_WRAPPER: import free(r0=50001328 r1=21970bdc r2=00000011) ret_to=210b54ec
+11-23 08:32:30.433  5975  5997 I ARM64_WRAPPER: /data/user/0/com.ziauddin.zaibridge/files/games/com.feelingtouch.hellzombie/payload/libunity32.so: JNI_OnLoad -> 65542 (0x00010006)
+11-23 08:32:30.434  5975  5997 I ARM64_WRAPPER:   native load(Ljava/lang/String;)Z -> guest 2300334c (trampoline 0x7890de275900)
+11-23 08:32:30.435  5975  5997 I ARM64_WRAPPER:   native unload()Z -> guest 2300344c (trampoline 0x7890de2759a0)
+11-23 08:32:30.436  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/NativeLoader.load(Ljava/lang/String;)Z -> 0x2300334c
+11-23 08:32:30.436  5975  5997 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/NativeLoader.unload()Z -> 0x2300344c
+11-23 08:32:30.436  5975  5997 I ARM64_WRAPPER: RegisterNatives: 2 / 2 methods registered on class com/unity3d/player/NativeLoader
+11-23 08:32:30.436  5975  5997 I ARM64_WRAPPER: /data/user/0/com.ziauddin.zaibridge/files/games/com.feelingtouch.hellzombie/payload/libmain32.so: JNI_OnLoad -> 65542 (0x00010006)
+11-23 08:32:30.436  5975  5997 I ARM64_WRAPPER: called JNI_OnLoad on 2 payload(s)
+11-23 08:32:30.437  5975  5997 I ARM64_WRAPPER: IMPORT COVERAGE: 370/520 imports bridged, 150 unresolved
+11-23 08:32:30.437  5975  5997 I ARM64_WRAPPER: IMPORT UNRESOLVED: AMotionEvent_getFlags AMotionEvent_getHistoricalPressure AMotionEvent_getTouchMinor AMotionEvent_getTouchMajor AMotionEvent_getToolMinor AMotionEvent_getOrientation writev AMotionEvent_getHistoricalSize AMotionEvent_getHistoricalEventTime AMotionEvent_getHistoricalY ASensor_getName ASensor_getType ASensorManager_destroyEventQueue ASensorEventQueue_getEvents ASensorEventQueue_hasEvents ASensorEventQueue_setEventRate ASensor_getMinDelay AMotionEvent_getXPrecision ASensorEventQueue_disableSensor ASensorManager_getSensorList ASensorManager_createEventQueue ASensorManager_getInstance inet_ntop glCompressedTexSubImage2D AMotionEvent_getHistorySize AMotionEvent_getEdgeFlags getpeername connect inet_addr SHA1Update AMotionEvent_getYPrecision getpwuid gai_strerror gethostbyaddr glCopyTexSubImage2D getresuid __system_property_get _ZSt7nothrow _ctype_ ASensor_getVendor getpriority tkill ASensor_getResolution popen glGetActiveUniform strlcpy wmemmove ASensorManager_getDefaultSensor inet_ntoa clock_get
+11-23 08:32:30.437  5975  5997 I ARM64_WRAPPER: Zai-Bridge session ready (engine-agnostic: the guest drives its own frame loop)
+11-23 08:32:30.438  5975  5997 I ZaiBridge: native session start -> 0
+11-23 08:32:30.439  5975  5975 I ZaiBridge: launching Hell Zombie via ProxyGameActivity (Instrumentation)
+11-23 08:32:30.471  5975  5975 I ZaiBridge: lifecycle onPause com.ziauddin.zaibridge.MainActivity
+11-23 08:32:30.517  5975  5975 I ARM64_WRAPPER: Zai-Scale: preset=5 up=3 scale=125% sharp=100% neural=100% gen=-1x temporal=1 auto=0
+11-23 08:32:30.552  5975  5975 I ZaiBridge: native session already live for com.feelingtouch.hellzombie
+11-23 08:32:30.556  5975  5975 I ZaiBridge: guest Activity com.feelingtouch.hellzombie.UnityPlayerActivity instantiated from game.apk (payload=true)
+11-23 08:32:30.556  5975  5975 I ZaiBridge: newActivity(com.ziauddin.zaibridge.proxy.ProxyGameActivity) -> guest com.feelingtouch.hellzombie.UnityPlayerActivity
+11-23 08:32:30.562  5975  5975 I ZaiBridge: guest resources merged from game.apk into android.content.res.AssetManager@6d092f8
+11-23 08:32:30.563  5975  5975 I ZaiBridge: guest base context installed (files=/data/user/0/com.ziauddin.zaibridge/files/games/com.feelingtouch.hellzombie/data, obb=/data/user/0/com.ziauddin.zaibridge/files/games/com.feelingtouch.hellzombie/obb)
+11-23 08:32:30.574  5975  5975 I ZaiBridge: guest resources merged from game.apk into android.content.res.AssetManager@76653d1
+11-23 08:32:30.580  5975  5975 I ZaiBridge: guest theme fallback: Material (targetSdk=35)
+11-23 08:32:30.669  5975  5975 I ZaiBridge: guest orientation: manifest sensorLandscape -> setRequestedOrientation(6) on com.feelingtouch.hellzombie.UnityPlayerActivity (Hell Zombie)
+11-23 08:32:30.723  5975  5975 I ZaiBridge: guest System.loadLibrary("main") served by the bridge runtime (libmain.so)
+11-23 08:32:30.733  5975  5975 I ARM64_WRAPPER: ==============================================================
+11-23 08:32:30.734  5975  5975 I ARM64_WRAPPER:  ANativeActivity_onCreate invoked by host framework (0x788e6e976d90)
+11-23 08:32:30.734  5975  5975 I ARM64_WRAPPER: ==============================================================
+11-23 08:32:30.735  5975  5975 I ARM64_WRAPPER: adopted the live guest session from ZAI_BRIDGE_SESSION_BINDING (bridge=0x788f6e9c0390 emulator=0x788f1e9785b0)
+11-23 08:32:30.735  5975  5975 I ARM64_WRAPPER: Found guest entry point 'ANativeActivity_onCreate' in /data/user/0/com.ziauddin.zaibridge/files/games/com.feelingtouch.hellzombie/payload/libmain32.so @ 0x23002bd4
+11-23 08:32:30.735  5975  5975 I ARM64_WRAPPER: Calling guest entry point @ 0x23002bd4 with shadow_activity=0x50001328
+11-23 08:32:30.899  5975  5975 W ARM64_WRAPPER: dlopen(/system/lib/libandroid.so): not found in payload/, native/, or bundled sysroot
+11-23 08:32:30.900  5975  5975 W ARM64_WRAPPER: dlsym(handle 00000000, _Z30AMotionEvent_getHistoricalRawXP11AInputEventjj) not found in any mapped payload
+11-23 08:32:30.901  5975  5975 W ARM64_WRAPPER: dlsym(handle 00000000, AMotionEvent_getHistoricalRawX) not found in any mapped payload
+11-23 08:32:30.905  5975  5975 W ARM64_WRAPPER: dlsym(handle 00000000, _Z30AMotionEvent_getHistoricalRawYP11AInputEventjj) not found in any mapped payload
+11-23 08:32:30.906  5975  5975 W ARM64_WRAPPER: dlsym(handle 00000000, AMotionEvent_getHistoricalRawY) not found in any mapped payload
+11-23 08:32:30.906  5975  5975 W ARM64_WRAPPER: dlsym(handle 00000000, _Z36AMotionEvent_getHistoricalTouchMajorP11AInputEventjj) not found in any mapped payload
+11-23 08:32:30.913  5975  5975 W ARM64_WRAPPER: dlsym(handle 00000000, AMotionEvent_getHistoricalTouchMajor) not found in any mapped payload
+11-23 08:32:30.918  5975  5975 W ARM64_WRAPPER: dlsym(handle 00000000, _Z36AMotionEvent_getHistoricalTouchMinorP11AInputEventjj) not found in any mapped payload
+11-23 08:32:30.918  5975  5975 W ARM64_WRAPPER: dlsym(handle 00000000, AMotionEvent_getHistoricalTouchMinor) not found in any mapped payload
+11-23 08:32:30.923  5975  5975 W ARM64_WRAPPER: dlsym(handle 00000000, _Z35AMotionEvent_getHistoricalToolMajorP11AInputEventjj) not found in any mapped payload
+11-23 08:32:30.924  5975  5975 W ARM64_WRAPPER: dlsym(handle 00000000, AMotionEvent_getHistoricalToolMajor) not found in any mapped payload
+11-23 08:32:30.924  5975  5975 W ARM64_WRAPPER: dlsym(handle 00000000, _Z35AMotionEvent_getHistoricalToolMinorP11AInputEventjj) not found in any mapped payload
+11-23 08:32:30.924  5975  5975 W ARM64_WRAPPER: dlsym(handle 00000000, AMotionEvent_getHistoricalToolMinor) not found in any mapped payload
+11-23 08:32:30.925  5975  5975 W ARM64_WRAPPER: dlsym(handle 00000000, _Z37AMotionEvent_getHistoricalOrientationP11AInputEventjj) not found in any mapped payload
+11-23 08:32:30.938  5975  5975 W ARM64_WRAPPER: dlsym(handle 00000000, AMotionEvent_getHistoricalOrientation) not found in any mapped payload
+11-23 08:32:30.943  5975  5975 W ARM64_WRAPPER: dlsym(handle 00000000, AMotionEvent_getAxisValue) not found in any mapped payload
+11-23 08:32:30.943  5975  5975 W ARM64_WRAPPER: dlsym(handle 00000000, AMotionEvent_getButtonState) not found in any mapped payload
+11-23 08:32:30.949  5975  5975 W ARM64_WRAPPER: dlsym(handle 00000000, AMotionEvent_getToolType) not found in any mapped payload
+11-23 08:32:30.951  5975  5975 I ARM64_WRAPPER: import malloc(r0=00000830 r1=23007574 r2=ffffecde) ret_to=23003008
+11-23 08:32:30.951  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=50001798 r1=00000830 r2=00000000) ret_to=23003018
+11-23 08:32:30.952  5975  5975 I ARM64_WRAPPER: alloc site 23003084: 2097152 bytes via pthread_create, frames 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+11-23 08:32:30.955  5975  5975 I ARM64_WRAPPER: pthread_create: spawned thread tid=100 routine=23003778 arg=50001798 sp=50201fc0 tls=50001498
+11-23 08:32:30.996  5975  6026 I ARM64_WRAPPER: guest thread 100 running at pc=23003778 (Thumb=0)
+11-23 08:32:31.000  5975  5975 I ARM64_WRAPPER: guest entry returned 587232560 (0x23007530)
+11-23 08:32:31.000  5975  5975 I ARM64_WRAPPER: ANativeActivity struct bridge installed: onStart=0x00000000 onResume=0x00000000 onWindowCreated=0x00000000 instance=0x0
+11-23 08:32:31.076  5975  5975 I ZaiBridge: guest System.loadLibrary("main") served by the bridge runtime (libmain.so)
+11-23 08:32:31.079  5975  5975 I ARM64_WRAPPER: ==============================================================
+11-23 08:32:31.080  5975  5975 I ARM64_WRAPPER: Zai-Bridge translation core (Unicorn backend)
+11-23 08:32:31.080  5975  5975 I ARM64_WRAPPER:  guest: ARM32 / Thumb-2     host: x86_64
+11-23 08:32:31.081  5975  5975 I ARM64_WRAPPER: ==============================================================
+11-23 08:32:31.102  5975  5975 I ARM64_WRAPPER: native load(Ljava/lang/String;)Z <- ART (call #1)
+11-23 08:32:31.102  5975  5975 I ARM64_WRAPPER: import malloc(r0=00000053 r1=00010009 r2=40000540) ret_to=23003378
+11-23 08:32:31.103  5975  5975 I ARM64_WRAPPER: path handed to the guest: /data/user/0/com.ziauddin.zaibridge/files/games/com.feelingtouch.hellzombie/native
+11-23 08:32:31.103  5975  5975 I ARM64_WRAPPER: dlopen(/data/user/0/com.ziauddin.zaibridge/files/games/com.feelingtouch.hellzombie/native/libmono.so): already mapped as /data/user/0/com.ziauddin.zaibridge/files/games/com.feelingtouch.hellzombie/payload/libmono32.so @ 20000000 (handle 0001000a)
+11-23 08:32:31.104  5975  5975 W ARM64_WRAPPER: dlsym(handle 0001000a [/data/user/0/com.ziauddin.zaibridge/files/games/com.feelingtouch.hellzombie/payload/libmono32.so], JNI_OnLoad) not found in targeted library or its dependencies
+11-23 08:32:31.105  5975  5975 I ARM64_WRAPPER: dlopen(/data/user/0/com.ziauddin.zaibridge/files/games/com.feelingtouch.hellzombie/native/libunity.so): already mapped as /data/user/0/com.ziauddin.zaibridge/files/games/com.feelingtouch.hellzombie/payload/libunity32.so @ 21000000 (handle 0001000b)
+11-23 08:32:31.105  5975  5975 I ARM64_WRAPPER: dlsym(handle 0001000b [/data/user/0/com.ziauddin.zaibridge/files/games/com.feelingtouch.hellzombie/payload/libunity32.so], JNI_OnLoad) -> 213e0b14
+11-23 08:32:31.106  5975  5975 I ARM64_WRAPPER:   native initJni(Landroid/content/Context;)V -> guest 213de918 (trampoline 0x7890de275a40)
+11-23 08:32:31.106  5975  5975 I ARM64_WRAPPER:   native nativeDeviceOrientation(I)V -> guest 213df0f4 (trampoline 0x7890de275ae0)
+11-23 08:32:31.106  5975  5975 I ARM64_WRAPPER:   native nativeDone()V -> guest 213deb84 (trampoline 0x7890de275b80)
+11-23 08:32:31.106  5975  5975 I ARM64_WRAPPER:   native nativeFile(Ljava/lang/String;)V -> guest 213e0308 (trampoline 0x7890de275c20)
+11-23 08:32:31.106  5975  5975 I ARM64_WRAPPER:   native nativeSetDefaultDisplay(I)V -> guest 213de7b8 (trampoline 0x7890de275cc0)
+11-23 08:32:31.106  5975  5975 I ARM64_WRAPPER:   native nativePause()Z -> guest 213dec60 (trampoline 0x7890de275d60)
+11-23 08:32:31.106  5975  5975 I ARM64_WRAPPER:   native nativeRecreateGfxState(Landroid/view/Surface;)V -> guest 213def04 (trampoline 0x7890de275e00)
+11-23 08:32:31.107  5975  5975 I ARM64_WRAPPER:   native nativeRender()Z -> guest 213df014 (trampoline 0x7890de275ea0)
+11-23 08:32:31.107  5975  5975 I ARM64_WRAPPER:   native nativeResize(IIII)V -> guest 213dea58 (trampoline 0x7890de275f40)
+11-23 08:32:31.107  5975  5975 I ARM64_WRAPPER:   native nativeResume()V -> guest 213ded44 (trampoline 0x7890de275fe0)
+11-23 08:32:31.107  5975  5975 I ARM64_WRAPPER:   native nativeFocusChanged(Z)V -> guest 213dee1c (trampoline 0x7890de276080)
+11-23 08:32:31.107  5975  5975 I ARM64_WRAPPER:   native nativeSetInputString(Ljava/lang/String;)V -> guest 213dfc88 (trampoline 0x7890de276120)
+11-23 08:32:31.108  5975  5975 I ARM64_WRAPPER:   native nativeSoftInputClosed()V -> guest 213dfef4 (trampoline 0x7890de2761c0)
+11-23 08:32:31.108  5975  5975 I ARM64_WRAPPER:   native nativeSetInputCanceled(Z)V -> guest 213dfdf8 (trampoline 0x7890de276260)
+11-23 08:32:31.108  5975  5975 I ARM64_WRAPPER:   native nativeSetTouchDeltaY(F)V -> guest 213dfba8 (trampoline 0x7890de276300)
+11-23 08:32:31.108  5975  5975 I ARM64_WRAPPER:   native nativeSetLocation(FFFFDF)V -> guest 213e00f0 (trampoline 0x7890de2763a0)
+11-23 08:32:31.109  5975  5975 I ARM64_WRAPPER:   native nativeSetLocationStatus(I)V -> guest 213dfff4 (trampoline 0x7890de276440)
+11-23 08:32:31.109  5975  5975 I ARM64_WRAPPER:   native nativeInitWWW(Ljava/lang/Class;)V -> guest 213e022c (trampoline 0x7890de2764e0)
+11-23 08:32:31.111  5975  5975 I ARM64_WRAPPER:   native nativeVideoFrameCallback(I[BII)V -> guest 213e0664 (trampoline 0x7890de276580)
+11-23 08:32:31.114  5975  5975 I ARM64_WRAPPER:   native nativeRequestedAA()I -> guest 213e0770 (trampoline 0x7890de276620)
+11-23 08:32:31.115  5975  5975 I ARM64_WRAPPER:   native nativeRequested32bitDisplayBuffer()Z -> guest 213e085c (trampoline 0x7890de2766c0)
+11-23 08:32:31.115  5975  5975 I ARM64_WRAPPER:   native nativeActivityIndicatorStyle()I -> guest 213e0944 (trampoline 0x7890de276760)
+11-23 08:32:31.115  5975  5975 I ARM64_WRAPPER:   native nativeForwardEventsToDalvik(Z)V -> guest 213e0a24 (trampoline 0x7890de276800)
+11-23 08:32:31.116  5975  5975 I ARM64_WRAPPER:   native nativeInjectEvent(Landroid/view/InputEvent;)Z -> guest 213df268 (trampoline 0x7890de2768a0)
+11-23 08:32:31.116  5975  5975 I ARM64_WRAPPER:   native UnitySendMessage(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V -> guest 213e04d0 (trampoline 0x7890de276940)
+11-23 08:32:31.116  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.initJni(Landroid/content/Context;)V -> 0x213de918
+11-23 08:32:31.116  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeDeviceOrientation(I)V -> 0x213df0f4
+11-23 08:32:31.116  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeDone()V -> 0x213deb84
+11-23 08:32:31.116  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeFile(Ljava/lang/String;)V -> 0x213e0308
+11-23 08:32:31.117  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeSetDefaultDisplay(I)V -> 0x213de7b8
+11-23 08:32:31.117  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativePause()Z -> 0x213dec60
+11-23 08:32:31.118  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeRecreateGfxState(Landroid/view/Surface;)V -> 0x213def04
+11-23 08:32:31.118  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeRender()Z -> 0x213df014
+11-23 08:32:31.118  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeResize(IIII)V -> 0x213dea58
+11-23 08:32:31.119  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeResume()V -> 0x213ded44
+11-23 08:32:31.119  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeFocusChanged(Z)V -> 0x213dee1c
+11-23 08:32:31.119  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeSetInputString(Ljava/lang/String;)V -> 0x213dfc88
+11-23 08:32:31.122  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeSoftInputClosed()V -> 0x213dfef4
+11-23 08:32:31.123  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeSetInputCanceled(Z)V -> 0x213dfdf8
+11-23 08:32:31.123  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeSetTouchDeltaY(F)V -> 0x213dfba8
+11-23 08:32:31.123  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeSetLocation(FFFFDF)V -> 0x213e00f0
+11-23 08:32:31.129  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeSetLocationStatus(I)V -> 0x213dfff4
+11-23 08:32:31.129  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeInitWWW(Ljava/lang/Class;)V -> 0x213e022c
+11-23 08:32:31.129  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeVideoFrameCallback(I[BII)V -> 0x213e0664
+11-23 08:32:31.129  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeRequestedAA()I -> 0x213e0770
+11-23 08:32:31.130  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeRequested32bitDisplayBuffer()Z -> 0x213e085c
+11-23 08:32:31.130  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeActivityIndicatorStyle()I -> 0x213e0944
+11-23 08:32:31.130  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeForwardEventsToDalvik(Z)V -> 0x213e0a24
+11-23 08:32:31.130  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.nativeInjectEvent(Landroid/view/InputEvent;)Z -> 0x213df268
+11-23 08:32:31.131  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/UnityPlayer.UnitySendMessage(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V -> 0x213e04d0
+11-23 08:32:31.135  5975  5975 I ARM64_WRAPPER: RegisterNatives: 25 / 25 methods registered on class com/unity3d/player/UnityPlayer
+11-23 08:32:31.136  5975  5975 I ARM64_WRAPPER:   native fmodGetInfo(I)I -> guest 215e74b8 (trampoline 0x7890de2769e0)
+11-23 08:32:31.137  5975  5975 I ARM64_WRAPPER:   native fmodProcess(Ljava/nio/ByteBuffer;)I -> guest 215e7548 (trampoline 0x7890de276a80)
+11-23 08:32:31.137  5975  5975 I ARM64_WRAPPER:   native fmodInitJni()I -> guest 215e7918 (trampoline 0x7890de276b20)
+11-23 08:32:31.138  5975  5975 I ARM64_WRAPPER:   native fmodProcessMicData(Ljava/nio/ByteBuffer;I)I -> guest 215e7240 (trampoline 0x7890de276bc0)
+11-23 08:32:31.138  5975  5975 I ARM64_WRAPPER:   native fmodUnblockStreaming()I -> guest 215e75a8 (trampoline 0x7890de276c60)
+11-23 08:32:31.139  5975  5975 I ARM64_WRAPPER:   native fmodBlockStreaming()I -> guest 215e75ec (trampoline 0x7890de276d00)
+11-23 08:32:31.139  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound org/fmod/FMODAudioDevice.fmodGetInfo(I)I -> 0x215e74b8
+11-23 08:32:31.139  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound org/fmod/FMODAudioDevice.fmodProcess(Ljava/nio/ByteBuffer;)I -> 0x215e7548
+11-23 08:32:31.139  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound org/fmod/FMODAudioDevice.fmodInitJni()I -> 0x215e7918
+11-23 08:32:31.139  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound org/fmod/FMODAudioDevice.fmodProcessMicData(Ljava/nio/ByteBuffer;I)I -> 0x215e7240
+11-23 08:32:31.140  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound org/fmod/FMODAudioDevice.fmodUnblockStreaming()I -> 0x215e75a8
+11-23 08:32:31.140  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound org/fmod/FMODAudioDevice.fmodBlockStreaming()I -> 0x215e75ec
+11-23 08:32:31.140  5975  5975 I ARM64_WRAPPER: RegisterNatives: 6 / 6 methods registered on class org/fmod/FMODAudioDevice
+11-23 08:32:31.140  5975  5975 I ARM64_WRAPPER:   native nativeProxyInvoke(ILjava/lang/String;[Ljava/lang/Object;)Ljava/lang/Object; -> guest 21443b18 (trampoline 0x7890de276da0)
+11-23 08:32:31.140  5975  5975 I ARM64_WRAPPER:   native nativeProxyFinalize(I)V -> guest 21443be8 (trampoline 0x7890de276e40)
+11-23 08:32:31.140  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/ReflectionHelper.nativeProxyInvoke(ILjava/lang/String;[Ljava/lang/Object;)Ljava/lang/Object; -> 0x21443b18
+11-23 08:32:31.140  5975  5975 I ARM64_WRAPPER: RegisterNatives: bound com/unity3d/player/ReflectionHelper.nativeProxyFinalize(I)V -> 0x21443be8
+11-23 08:32:31.141  5975  5975 I ARM64_WRAPPER: RegisterNatives: 2 / 2 methods registered on class com/unity3d/player/ReflectionHelper
+11-23 08:32:31.141  5975  5975 I ARM64_WRAPPER: import free(r0=50001598 r1=00a5a5a5 r2=000008bc) ret_to=2300340c
+11-23 08:32:31.141  5975  5975 I ARM64_WRAPPER: native  -> returned (ret=1)
+11-23 08:32:31.141  5975  5975 I ARM64_WRAPPER: native nativeFile(Ljava/lang/String;)V <- ART (call #1)
+11-23 08:32:31.149  5975  5975 I ARM64_WRAPPER: path handed to the guest: /data/user/0/com.ziauddin.zaibridge/files/games/com.feelingtouch.hellzombie/game.apk
+11-23 08:32:31.150  5975  5975 I ARM64_WRAPPER: fopen(/data/user/0/com.ziauddin.zaibridge/files/games/com.feelingtouch.hellzombie/game.apk)
+11-23 08:32:31.150  5975  5975 I ARM64_WRAPPER: pthread_once: running init routine 213cdebc in-guest
+11-23 08:32:31.150  5975  5975 I ARM64_WRAPPER: alloc site 213cdf10: 2097152 bytes via pthread_create, frames 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+11-23 08:32:31.150  5975  5975 I ARM64_WRAPPER: pthread_create: spawned thread tid=101 routine=213cdf2c arg=00000000 sp=50401fc0 tls=50001648
+11-23 08:32:31.152  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21a98920 r1=00000016 r2=00000000) ret_to=213ee0b4
+11-23 08:32:31.153  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21a98920 r1=00010016 r2=00000000) ret_to=213ee0b4
+11-23 08:32:31.153  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21a98920 r1=0001421b r2=00000000) ret_to=2113c3b0
+11-23 08:32:31.154  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad130 r1=00010000 r2=00000000) ret_to=213ee2f0
+11-23 08:32:31.155  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad143 r1=0000001d r2=00000000) ret_to=2134ba24
+11-23 08:32:31.158  5975  6027 I ARM64_WRAPPER: guest thread 101 running at pc=213cdf2c (Thumb=0)
+11-23 08:32:31.561  5975  5975 I ARM64_WRAPPER: call(nativeFile): suspended at pc=213ee648 after 419ms (budget 250ms); the next native entry resumes it
+11-23 08:32:31.561  5975  5975 I ARM64_WRAPPER: call(nativeFile) @213e0308 suspended at pc=213ee648 after 250ms: ART thread released, continuing on the next native entry
+11-23 08:32:31.562  5975  5975 I ARM64_WRAPPER: native nativeFile -> FAILED (ret=0)
+11-23 08:32:31.571  5975  5975 I ARM64_WRAPPER: native nativeForwardEventsToDalvik(Z)V <- ART (call #1)
+11-23 08:32:31.654  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad160 r1=00000005 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.677  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad160 r1=00000005 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.700  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21ac33f0 r1=00000614 r2=00000000) ret_to=213ef478
+11-23 08:32:31.734  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad160 r1=00000005 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.735  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad15b r1=00000005 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.741  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad153 r1=00000003 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.744  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad156 r1=00000003 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.745  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad159 r1=00000007 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.750  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad157 r1=00000004 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.760  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad152 r1=00000008 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.775  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad157 r1=00000005 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.780  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad154 r1=00000006 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.783  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad15a r1=00000003 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.783  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad15d r1=00000003 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.788  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad160 r1=00000005 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.810  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21ac92a0 r1=00000c04 r2=00000000) ret_to=213ef478
+11-23 08:32:31.823  5975  5975 I ARM64_WRAPPER: call(nativeFile): suspended at pc=213ee6fc after 251ms (budget 250ms); the next native entry resumes it
+11-23 08:32:31.823  5975  5975 I ARM64_WRAPPER: native nativeForwardEventsToDalvik(Z)V deferred: guest engine still initialising
+11-23 08:32:31.824  5975  5975 I ARM64_WRAPPER: native initJni(Landroid/content/Context;)V <- ART (call #1)
+11-23 08:32:31.855  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad146 r1=00000002 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.856  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad148 r1=00000004 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.859  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad14c r1=00000008 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.861  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad154 r1=00000007 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.915  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad15b r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.950  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad154 r1=00000007 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.959  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad14a r1=0000000d r2=00000000) ret_to=2134ba24
+11-23 08:32:31.965  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad157 r1=00000009 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.969  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad160 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.973  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad15e r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.974  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad15c r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.974  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad151 r1=0000000e r2=00000000) ret_to=2134ba24
+11-23 08:32:31.978  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad15f r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.978  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad160 r1=00000002 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.979  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad162 r1=00000014 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.980  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad174 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.980  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad175 r1=00000002 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.982  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad175 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.983  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad174 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.983  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad175 r1=00000002 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.984  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad175 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.985  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad165 r1=0000000f r2=00000000) ret_to=2134ba24
+11-23 08:32:31.987  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad172 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.988  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad173 r1=00000002 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.990  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad173 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.991  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad172 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.992  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad173 r1=00000002 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.993  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad173 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.994  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad164 r1=00000003 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.995  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad158 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.995  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad159 r1=00000006 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.995  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad15f r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:31.996  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad151 r1=0000000e r2=00000000) ret_to=2134ba24
+11-23 08:32:31.997  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad15f r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.000  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad160 r1=00000002 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.000  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad162 r1=00000014 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.001  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad174 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.003  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad175 r1=00000002 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.003  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad175 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.004  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad174 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.004  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad175 r1=00000002 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.006  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad175 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.007  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad172 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.009  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad173 r1=00000002 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.011  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad173 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.012  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad172 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.012  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad173 r1=00000002 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.013  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad173 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.014  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad164 r1=00000003 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.017  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad158 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.017  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad159 r1=00000006 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.018  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad15f r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.018  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad160 r1=00000003 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.020  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad163 r1=00000014 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.023  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad175 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.023  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad176 r1=00000002 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.025  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad176 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.028  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad175 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.029  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad176 r1=00000002 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.030  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad176 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.033  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad173 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.033  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad174 r1=00000002 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.035  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad174 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.036  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad173 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.037  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad174 r1=00000002 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.037  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad174 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.038  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad165 r1=00000003 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.039  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad152 r1=0000000e r2=00000000) ret_to=2134ba24
+11-23 08:32:32.039  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad160 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.040  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad161 r1=00000002 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.040  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad163 r1=00000014 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.041  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad175 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.042  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad176 r1=00000002 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.043  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad176 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.046  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad175 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.046  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad176 r1=00000002 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.047  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad176 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.049  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad173 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.052  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad174 r1=00000002 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.054  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad174 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.056  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad173 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.057  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad174 r1=00000002 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.058  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad174 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.059  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad165 r1=00000003 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.059  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad159 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.059  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad15a r1=00000006 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.060  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad160 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.061  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad153 r1=0000000e r2=00000000) ret_to=2134ba24
+11-23 08:32:32.062  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad161 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.064  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad162 r1=00000002 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.064  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad164 r1=00000014 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.065  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad176 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.065  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad177 r1=00000002 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.068  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad177 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.071  5975  5975 I ARM64_WRAPPER: import __aeabi_memset(r0=21aad176 r1=00000001 r2=00000000) ret_to=2134ba24
+11-23 08:32:32.080  5975  5975 I ARM64_WRAPPER: call(nativeFile): suspended at pc=213ef4e4 after 255ms (budget 250ms); the next native entry resumes it
+11-23 08:32:32.080  5975  5975 I ARM64_WRAPPER: native initJni(Landroid/content/Context;)V deferred: guest engine still initialising
+11-23 08:32:32.080  5975  5975 I ARM64_WRAPPER: native nativeInitWWW(Ljava/lang/Class;)V <- ART (call #1)
+11-23 08:32:32.118  5975  5975 I ARM64_WRAPPER: call(nativeFile): resumed and completed (ret=564757424)
+11-23 08:32:32.119  5975  5975 I ARM64_WRAPPER: native initJni(Ljava/lang/Class;)V replayed after the suspended call completed
