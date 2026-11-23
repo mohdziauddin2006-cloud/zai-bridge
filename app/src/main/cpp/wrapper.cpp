@@ -196,28 +196,40 @@ std::string g_last_import;
 // ---------------------------------------------------------------------------
 // Guest address space
 // ---------------------------------------------------------------------------
-constexpr uint32_t kHeapBase   = 0x30000000u;
-// Unity's mono start-up (mscorlib + every assembly, textures and reflection
-// metadata) lives in this arena and had exhausted 64 MB before the first frame
-// was ever drawn. It fills the 256 MB between the heap base and the first
-// library slot; pages are only committed as they are touched.
-constexpr size_t   kHeapSize   = 256u * 1024u * 1024u;
+// 768 MB guest arena: 0x50000000 - 0x80000000. Unity 4.x's Boehm GC keeps a
+// 160 MB max heap, but its chunk allocator does `mmap`/`munmap` for every
+// collected block. A 256 MB bump arena leaked that address space until
+// `guest heap exhausted` was hit ~22k log lines into managed initialisation,
+// so the arena is split in two:
+//   * a coalescing malloc heap (bottom, grows up), and
+//   * a 4 KB page-granular mmap arena (top, grows down via a free-page bitmap)
+// `munmap` returns pages to the bitmap and the next `mmap` reuses them zeroed.
+constexpr uint32_t kHeapBase   = 0x50000000u;
+constexpr size_t   kHeapSize   = 768u * 1024u * 1024u;
+constexpr size_t   kMallocArenaSize = 448u * 1024u * 1024u;
+constexpr uint32_t kPageArenaBase   = kHeapBase + static_cast<uint32_t>(kMallocArenaSize);
+constexpr size_t   kPageArenaSize   = kHeapSize - kMallocArenaSize;
 
-constexpr uint32_t kImageBase0 = 0x40000000u;
+// Library images sit below the arena in a dedicated 512 MB window.
+constexpr uint32_t kImageBase0 = 0x20000000u;
+constexpr uint32_t kImageLimit = 0x40000000u;
 constexpr uint32_t kImageStride = 0x01000000u;  // 16 MB per library slot
 
-constexpr uint32_t kStubBase     = 0x50000000u;
+constexpr uint32_t kStubBase     = 0x40000000u;
 constexpr size_t   kStubStride   = 8;           // bytes per stub
 constexpr size_t   kStubCount    = 1024;
 constexpr size_t   kStubRegionSz = kStubCount * kStubStride;
 
-constexpr uint32_t kReturnSentinel = 0x500F0000u;
+constexpr uint32_t kReturnSentinel = 0x400F0000u;
 
-constexpr uint32_t kStackTop  = 0x7FF00000u;
+constexpr uint32_t kStackTop  = 0xB0000000u;
 // Mono's start-up recurses deeply enough (GC init + reflection over every
 // managed assembly) to need more than 1 MB; a 1 MB stack put SP below the
-// mapped region and the next store became UC_ERR_MAP at boot.
-constexpr size_t   kStackSize = 8u * 1024u * 1024u;
+// mapped region and the next store became UC_ERR_MAP at boot. Unity 4.6 then
+// ate the whole 8 MB during resource initialisation -- the frame chain ran
+// from 0x9fffef14 down to 0x9f800114 and the next push faulted at
+// 0x9f7ffff4 -- so the guest stack is 64 MB now.
+constexpr size_t   kStackSize = 64u * 1024u * 1024u;
 
 // Guard against runaway guest code (a broken import bridge shows up as a hang).
 // This is deliberately generous: a level-load legitimately burns hundreds of
@@ -230,7 +242,7 @@ constexpr uint64_t kMaxInstructions = 4000ull * 1000ull * 1000ull;
 // at this unmapped word instead: the guest's own `bx lr` / `pop {pc}` preserves
 // the instruction set, the fetch faults, and the run loop applies the saved
 // context and continues at the real target.
-constexpr uint32_t kLongjmpSentinel = 0x500F0010u;
+constexpr uint32_t kLongjmpSentinel = 0x400F0010u;
 
 // Guest signal disposition table (SIGSEGV is what Boehm's stack-bound probes
 // need). One guest VM per process, so a file-static table is enough.
@@ -535,6 +547,16 @@ public:
             return false;
         }
 
+        // Page bitmap for the mmap half of the arena. 320 MB is 81,920 pages,
+        // i.e. a 10 KB bitmap.
+        page_count_ = kPageArenaSize / kPageSize;
+        page_bitmap_.assign((page_count_ + 63) / 64, 0);
+        page_prot_.assign(page_count_, 0);
+        page_hint_ = 0;
+        LOGI("guest arena: %zu MB heap @ %08x, %zu MB page arena @ %08x (%zu pages)",
+             kMallocArenaSize >> 20, kHeapBase, kPageArenaSize >> 20,
+             kPageArenaBase, page_count_);
+
         // Every stub starts as `bx lr`; the code hook intercepts before it runs,
         // so this is only a safety net if a hook is ever missed.
         g_guest_stack_base = kStackTop - static_cast<uint32_t>(kStackSize);
@@ -600,6 +622,13 @@ public:
         const char* kind = type == UC_MEM_READ_UNMAPPED ? "read"
                          : type == UC_MEM_WRITE_UNMAPPED ? "write"
                          : type == UC_MEM_FETCH_UNMAPPED ? "fetch" : "access";
+        const uint32_t stack_base = kStackTop - static_cast<uint32_t>(kStackSize);
+        if (address >= stack_base - 0x10000u && address < stack_base) {
+            LOGE("guest STACK OVERFLOW: %s at %08llx just below the %zu MB stack base "
+                 "(%08x); sp=%08x fp=%08x",
+                 kind, static_cast<unsigned long long>(address), kStackSize >> 20,
+                 stack_base, sp, r[11]);
+        }
         LOGE("guest %s UNMAPPED addr=%08llx size=%d pc=%08x lr=%08x sp=%08x "
              "r0-r3=%08x %08x %08x %08x r4-r7=%08x %08x %08x %08x "
              "r8-r11=%08x %08x %08x %08x r12=%08x last_import=%s",
@@ -630,6 +659,12 @@ public:
         }
 
         {
+            // Keep the host pointer of the main arena: recycled mmap pages are
+            // zeroed and discarded through it instead of one 4 KB
+            // uc_mem_write() at a time.
+            if (aligned_addr == kHeapBase && aligned_size >= kHeapSize) {
+                heap_host_ = static_cast<uint8_t*>(host_ptr);
+            }
             std::lock_guard<std::mutex> lk(regions_mtx_);
             regions_.push_back({aligned_addr, aligned_size, host_ptr, perms, what});
             std::lock_guard<std::mutex> alk(s_active_engines_mtx);
@@ -645,10 +680,80 @@ public:
     const std::vector<MemoryRegion>& regions() const { return regions_; }
     std::mutex& regions_mutex() { return regions_mtx_; }
 
-    // Guest heap: a bump allocator over a fixed arena with a first-fit free
-    // list. A pure bump allocator survives startup but dies a few thousand
-    // frames into a render loop, because games churn the allocator constantly
-    // and a host pointer can never be handed back to 32-bit code.
+    void account_alloc_locked(size_t n) {
+        heap_active_bytes_ += n;
+        if (heap_active_bytes_ > heap_peak_bytes_) heap_peak_bytes_ = heap_active_bytes_;
+        // Rough size-class census, only read when the arena runs out.
+        size_t bucket = n <= 64 ? 0 : n <= 256 ? 1 : n <= 1024 ? 2
+                      : n <= 4096 ? 3 : n <= 65536 ? 4 : n <= 1048576 ? 5 : 6;
+        ++class_allocs_[bucket];
+        class_bytes_[bucket] += n;
+
+        const size_t watermark = heap_active_bytes_ / (64u * 1024u * 1024u);
+        if (watermark > last_watermark_) {
+            last_watermark_ = watermark;
+            LOGI("guest heap watermark: %zu MB live (peak %zu MB, %zu mmap pages, "
+                 "%zu free blocks)",
+                 watermark * 64, heap_peak_bytes_ >> 20, page_pages_used_, free_list_.size());
+        }
+    }
+
+    // Which guest return address allocated what. Only >=4 KB conforms an entry,
+    // and it is only read when the arena runs out; this is how the leak (or the
+    // retry loop) that filled 448 MB during Unity start-up was located.
+    struct AllocSite { unsigned long long bytes = 0; unsigned long long count = 0; };
+
+    void record_alloc_site_locked(size_t n) {
+        if (n < 4096) return;
+        uint32_t lr = 0;
+        uc_engine* uc = t_current_uc ? t_current_uc : uc_;
+        if (uc && uc_reg_read(uc, UC_ARM_REG_LR, &lr) != UC_ERR_OK) lr = 0;
+        if (!record_alloc_site(lr, n)) return;   // already reported
+        // libmono/libunity are compiled without frame pointers, so the R11
+        // chain is empty. Scan the words above SP instead and keep the ones that
+        // fall inside a mapped payload image: those are the return addresses of
+        // the live call chain.
+        uint32_t sp = 0;
+        if (uc) uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+        uint32_t found[10] = {0};
+        int nfound = 0;
+        for (uint32_t off = 0; off < 2048 && nfound < 10; off += 4) {
+            const uint32_t w = read_u32(sp + off);
+            if (w >= kImageBase0 && w < kImageLimit) {
+                found[nfound++] = w;
+            }
+        }
+        LOGI("alloc site %08x: %zu bytes via %s, stack %08x: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x",
+             lr, n, g_last_import.c_str(), sp,
+             found[0], found[1], found[2], found[3], found[4],
+             found[5], found[6], found[7], found[8], found[9]);
+    }
+
+    bool record_alloc_site(uint32_t lr, size_t n) {
+        if (n < 4096 || lr == 0) return false;
+        std::lock_guard<std::mutex> lk(site_mtx_);
+        AllocSite& s = alloc_sites_[lr];
+        s.bytes += n;
+        return ++s.count == 1;   // true only the first time this site is seen
+    }
+
+    void dump_alloc_sites() {
+        std::lock_guard<std::mutex> lk(site_mtx_);
+        std::vector<std::pair<uint32_t, AllocSite>> v(alloc_sites_.begin(), alloc_sites_.end());
+        std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) {
+            return a.second.bytes > b.second.bytes;
+        });
+        for (size_t i = 0; i < v.size() && i < 8; ++i) {
+            LOGE("heap site %zu: lr=%08x bytes=%llu KB allocs=%llu", i + 1, v[i].first,
+                 v[i].second.bytes / 1024, v[i].second.count);
+        }
+    }
+
+    // Guest malloc heap: 448 MB at the bottom of the arena, a bump cursor plus
+    // a first-fit free list that coalesces in both directions. A pure bump
+    // allocator survives startup but dies a few thousand frames into a render
+    // loop, because games churn the allocator constantly and a host pointer can
+    // never be handed back to 32-bit code.
     uint32_t alloc(size_t bytes, size_t alignment = 8) {
         std::lock_guard<std::mutex> lk(alloc_mtx_);
         if (bytes == 0) bytes = 1;
@@ -667,6 +772,7 @@ public:
             const uint32_t rest = it->second - want;
             free_list_.erase(it);
             if (rest >= 8) free_list_[at + want] = rest;
+            account_alloc_locked(want);
             return at;
         }
 
@@ -675,25 +781,82 @@ public:
         // arena base and hand the guest unmapped addresses (Mono's first JIT
         // mmap asks for a size read from a failed config load, so this is not
         // hypothetical).
-        if (want > kHeapSize) {
-            LOGE("guest heap: refusing %zu-byte allocation (arena is %zu bytes)",
-                 bytes, kHeapSize);
+        if (want > kMallocArenaSize) {
+            LOGE("guest heap: refusing %zu-byte allocation (malloc arena is %zu bytes)",
+                 bytes, kMallocArenaSize);
             return 0;
         }
         const uint32_t at = align_up(heap_cursor_, static_cast<uint32_t>(alignment));
-        if (at < kHeapBase || at - kHeapBase > kHeapSize - want) {
-            LOGE("guest heap exhausted (want %zu bytes, %zu bytes live)", bytes,
-                 static_cast<size_t>(heap_cursor_ - kHeapBase));
+        if (at < kHeapBase || at - kHeapBase > kMallocArenaSize - want) {
+            LOGE("guest heap exhausted (want %zu bytes, live %zu KB, peak %zu KB, "
+                 "free blocks %zu, mmap pages %zu, reclaimed %llu KB, classes "
+                 "<=64:%llu <=256:%llu <=1K:%llu <=4K:%llu <=64K:%llu <=1M:%llu >1M:%llu)",
+                 bytes, heap_active_bytes_ / 1024, heap_peak_bytes_ / 1024,
+                 free_list_.size(), page_pages_used_,
+                 static_cast<unsigned long long>(reclaimed_bytes_ / 1024),
+                 static_cast<unsigned long long>(class_allocs_[0]),
+                 static_cast<unsigned long long>(class_allocs_[1]),
+                 static_cast<unsigned long long>(class_allocs_[2]),
+                 static_cast<unsigned long long>(class_allocs_[3]),
+                 static_cast<unsigned long long>(class_allocs_[4]),
+                 static_cast<unsigned long long>(class_allocs_[5]),
+                 static_cast<unsigned long long>(class_allocs_[6]));
+            size_t free_total = 0, free_largest = 0;
+            for (const auto& blk : free_list_) {
+                free_total += blk.second;
+                free_largest = std::max(free_largest, static_cast<size_t>(blk.second));
+            }
+            LOGE("heap free list: %zu KB in %zu blocks, largest %zu KB (requests of "
+                 "%u bytes cannot be served)",
+                 free_total / 1024, free_list_.size(), free_largest / 1024, want);
+            dump_alloc_sites();
+            LOGE("heap class bytes: <=64:%lluK <=256:%lluK <=1K:%lluK <=4K:%lluK "
+                 "<=64K:%lluK <=1M:%lluK >1M:%lluK",
+                 static_cast<unsigned long long>(class_bytes_[0] / 1024),
+                 static_cast<unsigned long long>(class_bytes_[1] / 1024),
+                 static_cast<unsigned long long>(class_bytes_[2] / 1024),
+                 static_cast<unsigned long long>(class_bytes_[3] / 1024),
+                 static_cast<unsigned long long>(class_bytes_[4] / 1024),
+                 static_cast<unsigned long long>(class_bytes_[5] / 1024),
+                 static_cast<unsigned long long>(class_bytes_[6] / 1024));
             return 0;
         }
         heap_cursor_ = at + want;
+        account_alloc_locked(want);
+        record_alloc_site_locked(want);
         return at;
+    }
+
+    // Grow a live block in place when the arena tail or the next free block can
+    // absorb the difference. Unity's string builder and Mono's dynamic arrays
+    // grow by small increments, and a copy-every-time realloc doubles the
+    // churn on a heap the collector is already trying to keep opaque.
+    bool try_extend(uint32_t p, size_t old_bytes, size_t new_bytes) {
+        std::lock_guard<std::mutex> lk(alloc_mtx_);
+        if (!p || p < kHeapBase || new_bytes <= old_bytes) return false;
+        const uint32_t old_want = align_up(static_cast<uint32_t>(old_bytes), 8);
+        const uint32_t want = align_up(static_cast<uint32_t>(new_bytes), 8);
+        if (want - old_want == 0) return true;
+        const uint32_t end = p + old_want;
+        if (end == heap_cursor_) {
+            if (want - old_want > kMallocArenaSize - (heap_cursor_ - kHeapBase)) return false;
+            heap_cursor_ = p + want;
+            account_alloc_locked(want - old_want);
+            return true;
+        }
+        auto next = free_list_.find(end);
+        if (next == free_list_.end() || next->second < want - old_want) return false;
+        const uint32_t rest = old_want + next->second - want;
+        free_list_.erase(next);
+        if (rest >= 8) free_list_[p + want] = rest;
+        account_alloc_locked(want - old_want);
+        return true;
     }
 
     // Return a guest block to the free list and coalesce with its neighbours.
     void release(uint32_t p, size_t bytes) {
         std::lock_guard<std::mutex> lk(alloc_mtx_);
-        if (p < kHeapBase || p >= kHeapBase + kHeapSize || bytes == 0) return;
+        if (p < kHeapBase || p >= kHeapBase + kMallocArenaSize || bytes == 0) return;
         const uint32_t want = align_up(static_cast<uint32_t>(bytes), 8);
         auto ins = free_list_.emplace(p, want).first;
 
@@ -709,9 +872,191 @@ public:
                 free_list_.erase(ins);
             }
         }
+        heap_active_bytes_ = heap_active_bytes_ > want ? heap_active_bytes_ - want : 0;
+    }
+
+    // ---- 4 KB page-granular mmap arena ---------------------------------
+    // Boehm GC (and every Mono chunk allocator) allocates its heap in
+    // mmap()/munmap() rounds. A munmap that only forgets the bytes leaks the
+    // address space; here the pages go straight back into the free bitmap and
+    // the next mmap reuses them zeroed.
+    uint8_t* host_ptr_at(uint32_t addr) const {
+        if (!heap_host_ || addr < kHeapBase ||
+            addr >= kHeapBase + static_cast<uint32_t>(kHeapSize)) {
+            return nullptr;
+        }
+        return heap_host_ + (addr - kHeapBase);
+    }
+
+    bool in_page_arena(uint32_t addr, uint32_t len) const {
+        if (len == 0 || addr < kPageArenaBase) return false;
+        return static_cast<uint64_t>(addr) + len <=
+               static_cast<uint64_t>(kPageArenaBase) + kPageArenaSize;
+    }
+
+    bool page_bit(size_t i) const {
+        return (page_bitmap_[i >> 6] >> (i & 63u)) & 1ull;
+    }
+
+    void page_set(size_t i, bool used) {
+        const uint64_t mask = 1ull << (i & 63u);
+        if (used) page_bitmap_[i >> 6] |= mask;
+        else      page_bitmap_[i >> 6] &= ~mask;
+    }
+
+    // Direct host zeroing: the arena is a single uc_mem_map_ptr() region, so
+    // its pages are the host pages. Re-zeroing a recycled Boehm chunk through
+    // uc_mem_write() would be an order of magnitude slower.
+    void zero_host_range(uint32_t addr, size_t len) {
+        uint8_t* hp = host_ptr_at(addr);
+        if (hp) { std::memset(hp, 0, len); return; }
+        static const std::vector<uint8_t> zeros(64 * 1024, 0);
+        size_t done = 0;
+        while (done < len) {
+            const size_t chunk = std::min(len - done, zeros.size());
+            uc_mem_write(uc_, addr + static_cast<uint32_t>(done), zeros.data(), chunk);
+            done += chunk;
+        }
+    }
+
+    uint32_t page_map(uint32_t len, bool zero) {
+        std::lock_guard<std::mutex> lk(page_mtx_);
+        if (len == 0) return 0;
+        const size_t pages = (static_cast<size_t>(len) + kPageSize - 1) / kPageSize;
+        if (pages > page_count_) {
+            LOGE("mmap: %u bytes exceeds the %zu MB page arena", len, kPageArenaSize >> 20);
+            return 0;
+        }
+        size_t found = SIZE_MAX;
+        for (int pass = 0; pass < 2 && found == SIZE_MAX; ++pass) {
+            const size_t begin = pass == 0 ? page_hint_ : 0;
+            const size_t end   = pass == 0 ? page_count_ : page_hint_;
+            size_t run = 0, run_start = 0;
+            for (size_t i = begin; i < end; ++i) {
+                if (page_bit(i)) { run = 0; continue; }
+                if (run == 0) run_start = i;
+                if (++run == pages) { found = run_start; break; }
+            }
+        }
+        if (found == SIZE_MAX) return 0;
+        for (size_t i = 0; i < pages; ++i) page_set(found + i, true);
+        page_pages_used_ += pages;
+        if (page_pages_used_ > page_peak_pages_) page_peak_pages_ = page_pages_used_;
+        page_hint_ = (found + pages) % page_count_;
+        const uint32_t addr = kPageArenaBase + static_cast<uint32_t>(found * kPageSize);
+        if (zero) zero_host_range(addr, pages * kPageSize);
+        return addr;
+    }
+
+    void page_unmap(uint32_t addr, uint32_t len) {
+        if (!in_page_arena(addr, len)) return;
+        std::lock_guard<std::mutex> lk(page_mtx_);
+        const size_t first = (addr - kPageArenaBase) / kPageSize;
+        const size_t pages = (static_cast<size_t>(len) + kPageSize - 1) / kPageSize;
+        for (size_t i = 0; i < pages && first + i < page_count_; ++i) {
+            if (page_bit(first + i)) {
+                page_set(first + i, false);
+                if (page_pages_used_) --page_pages_used_;
+            }
+        }
+        reclaimed_bytes_ += pages * kPageSize;
+        // Hand the physical pages back to the kernel as well; the guest's
+        // 768 MB arena is reserved virtual space, not committed RAM.
+        uint8_t* hp = host_ptr_at(addr);
+        if (hp) ::madvise(hp, pages * kPageSize, MADV_DONTNEED);
+        if (first < page_hint_) page_hint_ = first;
+    }
+
+    // MADV_DONTNEED semantics: the range is still mapped but reads back zero.
+    void page_discard(uint32_t addr, uint32_t len) {
+        uint32_t start = align_down(addr, kPageSize);
+        uint32_t end = align_up(addr + len, kPageSize);
+        if (end <= start) return;
+        if (in_page_arena(start, end - start)) {
+            std::lock_guard<std::mutex> lk(page_mtx_);
+            const size_t first = (start - kPageArenaBase) / kPageSize;
+            const size_t pages = (end - start) / kPageSize;
+            uint8_t* hp = host_ptr_at(start);
+            if (hp) ::madvise(hp, pages * kPageSize, MADV_DONTNEED);
+            reclaimed_bytes_ += static_cast<uint64_t>(pages) * kPageSize;
+            if (first < page_hint_) page_hint_ = first;
+            return;
+        }
+        zero_host_range(start, end - start);
+    }
+
+    void page_protect(uint32_t addr, uint32_t len, uint32_t prot) {
+        if (!in_page_arena(addr, len) || page_prot_.empty()) return;
+        std::lock_guard<std::mutex> lk(page_mtx_);
+        const size_t first = (addr - kPageArenaBase) / kPageSize;
+        const size_t pages = (static_cast<size_t>(len) + kPageSize - 1) / kPageSize;
+        for (size_t i = 0; i < pages && first + i < page_count_; ++i) {
+            page_prot_[first + i] = static_cast<uint8_t>(prot & 7u);
+        }
+    }
+
+    // ---- call-site watches ------------------------------------------------
+    // Temporary instrumentation: counts how often an exported guest function is
+    // entered and who called it. Used to pin a runaway mono_jit_init() /
+    // mono_domain_create() loop that leaked 8 KB mempools per call.
+    struct Watch { std::string name; unsigned count = 0; };
+    std::unordered_map<uint32_t, Watch> watches_;
+
+    void watch_symbol(uint32_t addr, const std::string& name) {
+        if (!addr) return;
+        {
+            std::lock_guard<std::mutex> lk(watch_mtx_);
+            watches_[addr].name = name;
+        }
+        uc_hook h = 0;
+        uc_hook_add(uc_, &h, UC_HOOK_CODE,
+                    reinterpret_cast<void*>(&Emulator::watch_thunk), this,
+                    static_cast<uint64_t>(addr), static_cast<uint64_t>(addr));
+        LOGI("watching %s @ %08x", name.c_str(), addr);
+    }
+
+    static void watch_thunk(uc_engine* uc, uint64_t address, uint32_t size, void* user) {
+        (void)size;
+        Emulator* self = static_cast<Emulator*>(user);
+        if (!self) return;
+        std::lock_guard<std::mutex> lk(self->watch_mtx_);
+        auto it = self->watches_.find(static_cast<uint32_t>(address));
+        if (it == self->watches_.end()) return;
+        const unsigned n = ++it->second.count;
+        if (n > 5 && (n % 5000) != 0) return;
+        uint32_t lr = 0;
+        uc_reg_read(uc, UC_ARM_REG_LR, &lr);
+        LOGE("watch %s hit #%u from lr=%08x", it->second.name.c_str(), n, lr);
+    }
+
+    std::mutex watch_mtx_;
+
+    // Guest thread stacks live in the malloc arena; Mono's GC needs the exact
+    // block for every active thread (stack scanning + bound assertions).
+    struct GuestStack { uint32_t base; uint32_t size; };
+
+    void register_guest_stack(uint32_t base, uint32_t size) {
+        std::lock_guard<std::mutex> lk(guest_stacks_mtx_);
+        guest_stacks_.push_back({base, size});
+    }
+
+    bool find_guest_stack(uint32_t sp, uint32_t& base, uint32_t& size) {
+        std::lock_guard<std::mutex> lk(guest_stacks_mtx_);
+        for (const auto& s : guest_stacks_) {
+            if (sp >= s.base && sp < s.base + s.size) {
+                base = s.base;
+                size = s.size;
+                return true;
+            }
+        }
+        return false;
     }
 
     size_t heap_live() const { return static_cast<size_t>(heap_cursor_ - kHeapBase); }
+    size_t heap_active() const { return heap_active_bytes_; }
+    size_t heap_peak() const { return heap_peak_bytes_; }
+    size_t mmap_active_pages() const { return page_pages_used_; }
+    uint64_t reclaimed_bytes() const { return reclaimed_bytes_; }
 
     bool write(uint32_t addr, const void* data, size_t len) {
         uc_err err = uc_mem_write(uc_, addr, data, len);
@@ -1250,6 +1595,24 @@ private:
     std::vector<MemoryRegion> regions_;
     uc_hook    mem_hook_ = 0;
     uint32_t   heap_cursor_ = kHeapBase;
+    size_t     heap_active_bytes_ = 0;   // live malloc payload (free list excluded)
+    size_t     heap_peak_bytes_ = 0;
+    unsigned long long class_allocs_[7] = {0, 0, 0, 0, 0, 0, 0};
+    unsigned long long class_bytes_[7] = {0, 0, 0, 0, 0, 0, 0};
+    uint8_t*   heap_host_ = nullptr;     // host base of the 768 MB arena
+    std::vector<GuestStack> guest_stacks_;
+    std::mutex guest_stacks_mtx_;
+    std::vector<uint64_t> page_bitmap_;  // 1 bit per 4 KB page of the mmap arena
+    std::vector<uint8_t>  page_prot_;    // per-page mprotect tracking
+    size_t     page_count_ = 0;
+    size_t     page_hint_ = 0;
+    size_t     last_watermark_ = 0;
+    std::unordered_map<uint32_t, AllocSite> alloc_sites_;
+    std::mutex site_mtx_;
+    size_t     page_pages_used_ = 0;
+    size_t     page_peak_pages_ = 0;
+    uint64_t   reclaimed_bytes_ = 0;     // returned by munmap/madvise
+    std::mutex page_mtx_;
     uint32_t   depth_ = 0;                   // nested call depth
     bool       emu_ok_ = true;               // last call made progress
     int        call_trace_ = 0;              // bounded entry logging for uc calls
@@ -1268,6 +1631,12 @@ struct LoadedLibrary {
     uint32_t    bias = 0;
     uint32_t    map_addr = 0;
     uint32_t    map_size = 0;
+
+    // PT_LOAD ranges, kept so the synthetic /proc/self/maps can describe the
+    // real segment layout instead of one anonymous image block. Boehm GC's
+    // GC_register_dynamic_libraries() walks these to find static roots.
+    struct GuestSegment { uint32_t addr = 0; uint32_t size = 0; uint32_t flags = 0; };
+    std::vector<GuestSegment> segments;
     std::unordered_map<std::string, uint32_t> exports;
     std::vector<uint32_t> init_array;
     uint32_t    init_fn = 0;
@@ -1353,6 +1722,10 @@ public:
 
         for (const auto& ph : phdrs) {
             if (ph.p_type != PT_LOAD) continue;
+            lib->segments.push_back({lib->bias + align_down(ph.p_vaddr, kPageSize),
+                                     static_cast<uint32_t>(align_up(ph.p_vaddr + ph.p_memsz, kPageSize) -
+                                                           align_down(ph.p_vaddr, kPageSize)),
+                                     ph.p_flags});
             if (ph.p_filesz == 0) continue;   // pure .bss: already zero from uc_mem_map
             if (ph.p_offset + ph.p_filesz > buf.size()) {
                 LOGE("%s: PT_LOAD outside file bounds", path.c_str());
@@ -2047,6 +2420,13 @@ public:
         ::mkdir(obb_dir_.c_str(), 0700);
         ::mkdir(data_dir_.c_str(), 0700);
         ::mkdir((game_root_ + "/cache").c_str(), 0700);
+        // Boehm GC asks /proc/meminfo how much RAM it may use and
+        // /proc/self/maps where the static roots are. The sandboxed Android
+        // process cannot read either one for the guest's virtual layout, so
+        // both are staged as synthetic files here.
+        virtual_meminfo_ = data_dir_ + "/.zai-meminfo";
+        publish_virtual(virtual_meminfo_, meminfo_text());
+        virtual_proc_maps_ = data_dir_ + "/.zai-proc-maps";
         translate_log_.clear();
     }
 
@@ -2977,7 +3357,7 @@ public:
                         continue;
                     }
 
-                    if (next_runtime_slot_ >= (kStackTop - kImageBase0) / kImageStride) {
+                    if (next_runtime_slot_ >= (kImageLimit - kImageBase0) / kImageStride) {
                         LOGE("DT_NEEDED(%s): no free guest image slots", dep.c_str());
                         break;
                     }
@@ -3072,7 +3452,7 @@ public:
             return 0;
         }
 
-        if (next_runtime_slot_ >= (kStackTop - kImageBase0) / kImageStride) {
+        if (next_runtime_slot_ >= (kImageLimit - kImageBase0) / kImageStride) {
             LOGE("dlopen(%s): no free guest image slots", name.c_str());
             return 0;
         }
@@ -3215,7 +3595,7 @@ public:
         // A length the arena cannot possibly satisfy is a bad call, not a
         // request to wrap the heap cursor. Report it with the register file so
         // the next investigation sees the caller rather than a later fault.
-        if (len > kHeapSize) {
+        if (len > kPageArenaSize) {
             uint32_t pc = 0, lr = 0, fp = 0, sp = 0;
             emu_.reg_read(UC_ARM_REG_PC, pc);
             emu_.reg_read(UC_ARM_REG_LR, lr);
@@ -3229,18 +3609,25 @@ public:
                 chain[i] = emu_.read_u32(f);
                 f = emu_.read_u32(f - 4);
             }
-            LOGE("mmap: rejecting %u-byte request (arena %zu bytes, addr=%08x prot=%u "
+            LOGE("mmap: rejecting %u-byte request (page arena %zu bytes, addr=%08x prot=%u "
                  "flags=%u pc=%08x lr=%08x fp=%08x sp=%08x backtrace=%08x %08x %08x "
-                 "%08x %08x)", len, kHeapSize, arg(0), arg(2), arg(3), pc, lr, fp, sp,
+                 "%08x %08x)", len, kPageArenaSize, arg(0), arg(2), arg(3), pc, lr, fp, sp,
                  chain[0], chain[1], chain[2], chain[3], chain[4]);
             return kMapFailed;
         }
 
         const int fd = static_cast<int>(stacked_arg(4));
         const uint32_t off = stacked_arg(5);
-        const uint32_t p = emu_.alloc(len, kPageSize);
+        // Page-tracked allocation: a recycled run is re-zeroed before it is
+        // handed back, so a collector chunk never inherits a stale object
+        // graph from the block it replaced.
+        const uint32_t p = emu_.page_map(len, true);
         if (!p) {
-            LOGE("mmap(%u) failed: guest heap exhausted", len);
+            LOGE("mmap(%u) failed: page arena exhausted (%zu of %zu pages live, "
+                 "%llu KB reclaimed, %zu KB malloc live)", len, emu_.mmap_active_pages(),
+                 kPageArenaSize / kPageSize,
+                 static_cast<unsigned long long>(emu_.reclaimed_bytes() / 1024),
+                 emu_.heap_active() / 1024);
             return kMapFailed;
         }
 
@@ -3266,7 +3653,29 @@ public:
     }
 
     uint32_t imp_munmap() {
-        emu_.release(arg(0), arg(1));
+        const uint32_t addr = arg(0), len = arg(1);
+        if (emu_.in_page_arena(addr, len)) {
+            emu_.page_unmap(addr, len);
+        } else {
+            // A malloc-backed block released through munmap (sbrk arenas use
+            // this): return it to the coalescing free list instead of leaking.
+            emu_.release(addr, len);
+        }
+        return 0u;
+    }
+
+    // MADV_DONTNEED zeroes the range in place and keeps the mapping valid; the
+    // collector uses it to drop a chunk's contents without giving the address
+    // range back.
+    uint32_t imp_madvise() {
+        emu_.page_discard(arg(0), arg(1));
+        return 0u;
+    }
+
+    // The guest tracks its own guard pages; the arena stays uniformly RWX, but
+    // the requested protection is recorded per page for diagnostics.
+    uint32_t imp_mprotect() {
+        emu_.page_protect(arg(0), arg(1), arg(2));
         return 0u;
     }
 
@@ -4357,18 +4766,31 @@ public:
         return 0;
     }
 
+    // The bounds must describe the *whole* mapped stack, not just the part
+    // above the current SP. Mono's mono_thread_info_get_stack_bounds() asserts
+    // `current > *staddr && current < *staddr + *stsize` against the address of
+    // a local variable, i.e. an address a few bytes BELOW SP; truncating the
+    // range at SP failed that assertion (threads.c:897) and aborted start-up.
+    // The GC also scans this range for roots, so it has to be the real block.
     void thread_stack_bounds(uint32_t attr, uint32_t& base, uint32_t& size) {
-        base = g_guest_stack_base;
-        uint32_t top = kStackTop;
         uint32_t sp = 0;
         if (attr && emu_.read_u32(attr) == kGuestAttrMagic) {
             sp = emu_.read_u32(attr + 4);
-            if (sp > base && sp <= kStackTop) top = sp;
-        } else {
-            emu_.reg_read(UC_ARM_REG_SP, sp);
-            if (sp > base && sp <= kStackTop) top = sp;
         }
-        size = top - base;
+        if (!sp) emu_.reg_read(UC_ARM_REG_SP, sp);
+
+        if (sp >= g_guest_stack_base && sp < kStackTop) {
+            base = g_guest_stack_base;
+            size = static_cast<uint32_t>(kStackSize);
+            return;
+        }
+        // A guest pthread's stack was allocated from the arena by
+        // pthread_create(); report that exact block.
+        if (emu_.find_guest_stack(sp, base, size)) return;
+
+        // Unknown thread: a window that provably contains SP.
+        base = sp > 0x40000u ? sp - 0x20000u : 0u;
+        size = 0x40000u;
     }
 
     uint32_t imp_pthread_attr_getstack() {
@@ -4395,7 +4817,7 @@ public:
         if (!out) return 22u;                                  // EINVAL
         uint64_t cur = ~0ull, max = ~0ull;                     // RLIM_INFINITY
         if (resource == 3) {                                   // RLIMIT_STACK
-            cur = max = 8ull * 1024ull * 1024ull;
+            cur = max = kStackSize;
         } else if (resource == 7) {                            // RLIMIT_NOFILE
             cur = max = 1024ull;
         }
@@ -4429,11 +4851,12 @@ public:
             case 30: return 4096;    // _SC_PAGE_SIZE
             case 96: return static_cast<uint32_t>(zai::cpu::topology().cores_conf);
             case 97: return static_cast<uint32_t>(zai::cpu::topology().cores_online);
-            // Mono sizes its GC heap from these; a hard-coded 1 page told the
-            // collector the device had 4 KB of RAM.
-            case 85: return host_total_pages();                       // _SC_PHYS_PAGES
-            case 86: return host_total_pages() / 2;                   // _SC_AVPHYS_PAGES
-            case 84: return 65536;                                    // _SC_STREAM_MAX
+            // Must agree with the synthetic /proc/meminfo: 512 MB total and
+            // 256 MB available. A mismatch makes Boehm GC pick a heap limit
+            // from sysconf and then collect against a different number.
+            case 85: return 524288 / 4;    // _SC_PHYS_PAGES  (131072 x 4 KB)
+            case 86: return 262144 / 4;    // _SC_AVPHYS_PAGES (65536 x 4 KB)
+            case 84: return 65536;         // _SC_STREAM_MAX
             default: return 1;
         }
     }
@@ -4447,9 +4870,108 @@ public:
                path == "/proc/self/statm";
     }
 
+    bool is_proc_meminfo(const std::string& path) const {
+        return path == "/proc/meminfo";
+    }
+
+    bool is_proc_maps(const std::string& path) const {
+        return path == "/proc/self/maps" || path == "/proc/maps" ||
+               path == "/proc/self/smaps";
+    }
+
+    static bool publish_virtual(const std::string& path, const std::string& text) {
+        if (path.empty()) return false;
+        FILE* f = ::fopen(path.c_str(), "we");
+        if (!f) return false;
+        ::fwrite(text.data(), 1, text.size(), f);
+        ::fclose(f);
+        return true;
+    }
+
+    // 512 MB / 192 MB free / 256 MB available: a phone-sized budget that makes
+    // Boehm GC collect at its 160 MB ceiling instead of believing the whole
+    // 32-bit address space is available.
+    static std::string meminfo_text() {
+        return
+            "MemTotal:         524288 kB\n"
+            "MemFree:          196608 kB\n"
+            "MemAvailable:     262144 kB\n"
+            "Buffers:               0 kB\n"
+            "Cached:            32768 kB\n"
+            "SwapCached:            0 kB\n"
+            "Active:            65536 kB\n"
+            "Inactive:          32768 kB\n"
+            "Active(anon):      49152 kB\n"
+            "Inactive(anon):    16384 kB\n"
+            "Unevictable:           0 kB\n"
+            "Mlocked:               0 kB\n"
+            "SwapTotal:             0 kB\n"
+            "SwapFree:              0 kB\n"
+            "Dirty:                 0 kB\n"
+            "Writeback:             0 kB\n"
+            "AnonPages:         65536 kB\n"
+            "Mapped:            32768 kB\n"
+            "Shmem:              2048 kB\n"
+            "Slab:                  0 kB\n"
+            "SReclaimable:          0 kB\n"
+            "SUnreclaim:            0 kB\n"
+            "PageTables:         2048 kB\n"
+            "CommitLimit:      524288 kB\n"
+            "Committed_AS:     131072 kB\n"
+            "VmallocTotal:    1048576 kB\n"
+            "VmallocUsed:           0 kB\n";
+    }
+
+    // GC_register_dynamic_libraries() walks this to find the data segments
+    // that can hold object pointers. It must list every mapped PT_LOAD range,
+    // plus the guest stacks and the live heap, or the collector either misses
+    // roots (freeing live objects) or scans unmapped addresses (crashing).
+    std::string proc_maps_text() const {
+        std::string out;
+        char line[640];
+        auto emit = [&](uint32_t start, uint32_t end, const char* perms, const std::string& name) {
+            if (end <= start) return;
+            std::snprintf(line, sizeof line, "%08x-%08x %s 00000000 00:00 0 %s\n",
+                          start, end, perms, name.c_str());
+            out += line;
+        };
+
+        for (const auto& r : emu_.regions()) {
+            const uint32_t end = r.guest_addr + static_cast<uint32_t>(r.size);
+            if (r.what == "heap") {
+                emit(r.guest_addr, r.guest_addr + static_cast<uint32_t>(emu_.heap_live()),
+                     "rw-p", "[heap]");
+                emit(kPageArenaBase,
+                     kPageArenaBase + static_cast<uint32_t>(emu_.mmap_active_pages() * kPageSize),
+                     "rw-p", "[anon:zai-mmap]");
+            } else if (r.what == "stack") {
+                emit(r.guest_addr, end, "rw-p", "[stack]");
+            } else {
+                emit(r.guest_addr, end, "rwxp", r.what);
+            }
+        }
+
+        for (const auto* lib : linker_.libs()) {
+            std::string base = lib->path;
+            const size_t slash = base.find_last_of('/');
+            if (slash != std::string::npos) base = base.substr(slash + 1);
+            for (const auto& seg : lib->segments) {
+                const char* perms = (seg.flags & 1u)
+                                        ? ((seg.flags & 2u) ? "rwxp" : "r-xp")
+                                        : ((seg.flags & 2u) ? "rw-p" : "r--p");
+                const char* part = (seg.flags & 1u) ? "[.text]"
+                                 : ((seg.flags & 2u) ? "[.data]" : "[.rodata]");
+                emit(seg.addr, seg.addr + seg.size, perms, base + " " + part);
+            }
+        }
+
+        emit(g_guest_stack_base, kStackTop, "rw-p", "[stack]");
+        return out;
+    }
+
     // Redirects guest pseudo-files the app process may not read to the
     // synthetic copies staged in the data directory.
-    bool redirect_proc_file(const std::string& path, std::string& out) const {
+    bool redirect_proc_file(const std::string& path, std::string& out) {
         if (is_proc_cpuinfo(path) && !virtual_cpuinfo_.empty()) {
             out = virtual_cpuinfo_;
             return true;
@@ -4457,6 +4979,18 @@ public:
         if (is_proc_stat(path) && !virtual_proc_stat_.empty()) {
             out = virtual_proc_stat_;
             return true;
+        }
+        if (is_proc_meminfo(path) && !virtual_meminfo_.empty()) {
+            out = virtual_meminfo_;
+            return true;
+        }
+        if (is_proc_maps(path)) {
+            // Regenerated on every open: a library mapped by a later dlopen()
+            // only appears in the maps after it exists.
+            if (publish_virtual(virtual_proc_maps_, proc_maps_text())) {
+                out = virtual_proc_maps_;
+                return true;
+            }
         }
         return false;
     }
@@ -7305,13 +7839,16 @@ public:
                 emu_.write_u32(thread_out, tid);
             }
 
-            // Allocate 1 MB dedicated stack in guest heap for the child thread
-            const size_t stack_sz = 1024u * 1024u;
+            // 2 MB dedicated stack in the guest arena for the child thread.
+            // Mono asserts that the SP is inside the block that
+            // pthread_attr_getstack() reports, so the block is registered.
+            const size_t stack_sz = 2u * 1024u * 1024u;
             const uint32_t stack_base = emu_.alloc(stack_sz, 4096);
             if (!stack_base) {
                 LOGE("pthread_create: failed to allocate guest stack");
                 return 11u; // EAGAIN
             }
+            emu_.register_guest_stack(stack_base, static_cast<uint32_t>(stack_sz));
             const uint32_t child_sp = align_down(stack_base + static_cast<uint32_t>(stack_sz) - 64, 8);
 
             // Allocate per-thread ARM32 TLS block
@@ -8104,8 +8641,21 @@ public:
                 default: return 0u;                          // AT_PAGESZ etc.
             }
         };
+        // Mono's Boehm GC reads these during gc_init(). With both unset it
+        // treats the whole 32-bit address space as available and never runs a
+        // stop-the-world collection before the arena is full -- which is
+        // exactly the `guest heap exhausted` at ~22k log lines.
         import_handlers_["getenv"] = [this] {
-            LOGI("getenv(%s) -> (unset)", safe_guest_string(arg(0), "getenv").c_str());
+            const std::string name = safe_guest_string(arg(0), "getenv");
+            const uint32_t value = guest_env(name);
+            if (value) {
+                LOGI("getenv(%s) -> %s", name.c_str(),
+                     safe_guest_string(value, "getenv").c_str());
+                return value;
+            }
+            // Mono's verbose-method probe polls this thousands of times per
+            // second; a LOGI here drowned logcat and slowed the guest down.
+            ZAI_TRACE("getenv(%s) -> (unset)", name.c_str());
             return 0u;
         };
         import_handlers_["setlocale"] = [this] {
@@ -8429,9 +8979,9 @@ public:
         import_handlers_["mmap"]   = [this] { return imp_mmap(false); };
         import_handlers_["mmap64"] = [this] { return imp_mmap(true); };
         import_handlers_["munmap"] = [this] { return imp_munmap(); };
-        import_handlers_["mprotect"] = [] { return 0u; };
+        import_handlers_["mprotect"] = [this] { return imp_mprotect(); };
         import_handlers_["msync"] = [] { return 0u; };
-        import_handlers_["madvise"] = [] { return 0u; };
+        import_handlers_["madvise"] = [this] { return imp_madvise(); };
 
         // ---------------- Android NDK surface glue ----------------------
         import_handlers_["ANativeWindow_fromSurface"] = [this] {
@@ -8526,8 +9076,49 @@ public:
     uint32_t guest_alloc(size_t n) {
         if (n == 0) n = 1;
         const uint32_t p = emu_.alloc(n, 8);
-        if (p) guest_allocs_[p] = n;
+        if (p) {
+            std::lock_guard<std::mutex> lk(allocs_mtx_);
+            guest_allocs_[p] = n;
+        }
         return p;
+    }
+
+    size_t tracked_size(uint32_t p) {
+        std::lock_guard<std::mutex> lk(allocs_mtx_);
+        auto it = guest_allocs_.find(p);
+        return it == guest_allocs_.end() ? 0 : it->second;
+    }
+
+    void track_alloc(uint32_t p, size_t n) {
+        if (!p) return;
+        std::lock_guard<std::mutex> lk(allocs_mtx_);
+        guest_allocs_[p] = n;
+    }
+
+    void untrack_alloc(uint32_t p) {
+        std::lock_guard<std::mutex> lk(allocs_mtx_);
+        guest_allocs_.erase(p);
+    }
+
+    // Stable guest copy of a getenv() value. Allocated once per name so a
+    // collector that polls the environment every cycle cannot grow the heap.
+    uint32_t guest_env(const std::string& name) {
+        std::lock_guard<std::mutex> lk(env_mtx_);
+        auto it = env_guest_.find(name);
+        if (it != env_guest_.end()) return it->second;
+        const char* value = nullptr;
+        if (name == "MONO_GC_PARAMS") {
+            value = "max-heap-size=160m,initial-heap-size=32m";
+        } else if (name == "GC_MAXIMUM_HEAP_SIZE") {
+            value = "167772160";
+        }
+        if (!value) return 0;
+        const std::string v(value);
+        const uint32_t at = guest_alloc(v.size() + 1);
+        if (!at || !emu_.write(at, v.c_str(), v.size() + 1)) return 0;
+        env_guest_[name] = at;
+        LOGI("getenv table: %s=%s @ %08x", name.c_str(), value, at);
+        return at;
     }
 
     void copy_guest(uint32_t src, uint32_t dst, uint32_t n) {
@@ -8577,7 +9168,7 @@ public:
         if (alignment == 0 || (alignment & (alignment - 1)) != 0) return 0;
         const size_t effective = alignment < sizeof(void*) ? sizeof(void*) : alignment;
         const uint32_t p = emu_.alloc(size, effective);
-        if (p) guest_allocs_[p] = size;
+        if (p) track_alloc(p, size);
         return p;
     }
 
@@ -8606,7 +9197,7 @@ public:
     uint32_t imp_memalign_value(size_t alignment, size_t size) {
         const size_t effective = alignment < sizeof(void*) ? sizeof(void*) : alignment;
         const uint32_t p = emu_.alloc(size, effective);
-        if (p) guest_allocs_[p] = size;
+        if (p) track_alloc(p, size);
         return p;
     }
 
@@ -8657,24 +9248,30 @@ public:
         const uint32_t size = arg(1);
         if (!old_p) return guest_alloc(size);
 
-        auto it = guest_allocs_.find(old_p);
-        const size_t old_size = it == guest_allocs_.end() ? 0 : it->second;
+        const size_t old_size = tracked_size(old_p);
+
+        // Grow in place when the next block is free (or this block is at the
+        // arena tail). Unity's dynamic arrays grow often enough that the copy
+        // dominated the allocator during level load.
+        if (size > old_size && old_size != 0 && emu_.try_extend(old_p, old_size, size)) {
+            track_alloc(old_p, size);
+            return old_p;
+        }
+
         const uint32_t new_p = guest_alloc(size);
         if (!new_p) return 0;
         copy_guest(old_p, new_p, static_cast<uint32_t>(std::min<size_t>(old_size, size)));
-        if (it != guest_allocs_.end()) {
-            emu_.release(old_p, it->second);
-            guest_allocs_.erase(it);
-        }
+        if (old_size != 0) emu_.release(old_p, old_size);
+        untrack_alloc(old_p);
         return new_p;
     }
 
     uint32_t imp_free() {
         const uint32_t p = arg(0);
-        auto it = guest_allocs_.find(p);
-        if (it == guest_allocs_.end()) return 0;   // not ours: ignore
-        emu_.release(it->first, it->second);
-        guest_allocs_.erase(it);
+        const size_t size = tracked_size(p);
+        if (size == 0) return 0;   // not ours: ignore
+        emu_.release(p, size);
+        untrack_alloc(p);
         return 0;
     }
 
@@ -9269,12 +9866,47 @@ public:
         return true;
     }
 
+    // Unity 4.6's nativeInitWWW(Class) reaches Context.getSystemService with the
+    // WWW Class object as the receiver. That is invalid Java: ART's CheckJNI
+    // aborts the process with "can't call ... on instance of Class". The intent
+    // is unambiguous -- the engine wants the host Activity's Context -- so the
+    // receiver is repaired once and the repair is logged.
+    bool repair_class_receiver(jobject& recv, const std::string& method) {
+        if (!recv || !guest_thiz_) return false;
+        if (!class_class_) {
+            jclass c = t_env->FindClass("java/lang/Class");
+            if (!c) return false;
+            class_class_ = static_cast<jclass>(t_env->NewGlobalRef(c));
+            t_env->DeleteLocalRef(c);
+            if (!class_class_) return false;
+        }
+        if (!t_env->IsInstanceOf(recv, class_class_)) return false;
+        static const char* kContextMethods[] = {
+            "getSystemService", "getApplicationContext", "getPackageManager",
+            "getContentResolver", "getAssets", "getResources", "getCacheDir",
+            "getFilesDir", "getSharedPreferences", "getMainLooper",
+        };
+        bool context_method = false;
+        for (const char* m : kContextMethods) {
+            if (method == m) { context_method = true; break; }
+        }
+        if (!context_method) return false;
+        LOGW("JNI repair: %s was called on a Class receiver; using the session Activity",
+             method.c_str());
+        recv = guest_thiz_;
+        return true;
+    }
+
     uint32_t call_java(char ret, bool is_static, int variant) {
         jobject recv = is_static ? nullptr : static_cast<jobject>(from_guest_ref(arg(1)));
         jclass  cls  = is_static ? static_cast<jclass>(from_guest_ref(arg(1))) : nullptr;
         jmethodID mid = static_cast<jmethodID>(from_guest_ref(arg(2)));
         if (!mid) { LOGW("Call*Method: null methodID"); return 0; }
         if (!recv && !cls) { LOGW("Call*Method: null receiver"); return 0; }
+        if (!is_static) {
+            const auto nm = method_names_.find(static_cast<void*>(mid));
+            repair_class_receiver(recv, nm == method_names_.end() ? std::string() : nm->second);
+        }
 
         const std::string sig = signature_of(mid);
         if (sig.empty()) {
@@ -9444,6 +10076,9 @@ public:
 
     std::unordered_map<std::string, ImportHandler> import_handlers_;
     std::unordered_map<uint32_t, size_t> guest_allocs_;
+    std::mutex allocs_mtx_;
+    std::unordered_map<std::string, uint32_t> env_guest_;
+    std::mutex env_mtx_;
     std::unordered_map<std::string, uint32_t> data_slots_;
     std::unordered_set<int> logged_;
     uc_hook hook_ = 0;
@@ -9502,9 +10137,12 @@ public:
     int      gles_major_ = 0;
     std::string virtual_cpuinfo_;
     std::string virtual_proc_stat_;
+    std::string virtual_meminfo_;
+    std::string virtual_proc_maps_;
     std::map<std::string, uint32_t> entry_points_;
     jobject guest_thiz_ = nullptr;
 
+    jclass class_class_ = nullptr;                         // java/lang/Class global ref
     std::unordered_map<void*, std::string> method_sigs_;   // jmethodID -> descriptor
     std::unordered_map<void*, std::string> method_names_;  // jmethodID -> method name
     std::mutex cxa_guard_mtx_;
@@ -9868,6 +10506,17 @@ Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeStartSession(
         }
     }
     LOGI("called JNI_OnLoad on %zu payload(s)", onloads);
+
+    // Temporary: watch the mono start-up entry points that were observed in a
+    // runaway loop while pinning the 448 MB heap exhaustion.
+    for (const auto* lib : g_bridge->libraries()) {
+        for (const char* name : {"mono_jit_init", "mono_jit_init_version",
+                                 "mono_domain_create", "mono_domain_create_appdomain",
+                                 "mono_runtime_init"}) {
+            const uint32_t at = JniBridge::export_of(lib, name);
+            if (at) g_emulator->watch_symbol(at, name);
+        }
+    }
 
     g_bridge->report_imports();
     g_session_active = true;

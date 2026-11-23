@@ -1,124 +1,148 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="360" viewBox="0 0 1280 360" role="img" aria-labelledby="title desc">
-  <title id="title">Zai-Bridge v3.0.0 — Universal 32-to-64-Bit Android Translation Container</title>
-  <desc id="desc">Dark obsidian (#07090E) banner with an electric cyan (#00E5FF) and warm amber (#FFB300) infinity-bridge emblem, the ZAI-BRIDGE wordmark, subtitle, and architecture badges.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 360" width="1280" height="360" role="img" aria-labelledby="title desc">
+  <title id="title">Zai-Bridge v3.1.0 — Universal 32-bit to 64-bit Android translation container</title>
+  <desc id="desc">An obsidian hero banner with an animated cyan-to-amber infinity bridge, a v3.1.0 pill and architecture highlights.</desc>
 
   <defs>
-    <style>
-      @keyframes emblemGlow {
-        0%, 100% {
-          filter: drop-shadow(0 0 10px rgba(0, 229, 255, 0.45)) drop-shadow(0 0 20px rgba(0, 229, 255, 0.25));
-        }
-        50% {
-          filter: drop-shadow(0 0 22px rgba(0, 229, 255, 0.85)) drop-shadow(0 0 35px rgba(255, 179, 0, 0.45));
-        }
-      }
-      @keyframes dashMove {
-        to { stroke-dashoffset: -60; }
-      }
-      .glow-emblem {
-        animation: emblemGlow 3.5s ease-in-out infinite;
-      }
-      .anim-cable {
-        stroke-dasharray: 6 4;
-        animation: dashMove 2s linear infinite;
-      }
-    </style>
-
-    <linearGradient id="canvas" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#07090E"/>
-      <stop offset="0.55" stop-color="#0C111C"/>
-      <stop offset="1" stop-color="#07090E"/>
+    <linearGradient id="bridge" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#00E5FF"/>
+      <stop offset="55%" stop-color="#38D9E8"/>
+      <stop offset="100%" stop-color="#FFB300"/>
     </linearGradient>
-    <linearGradient id="infinity" x1="0" y1="0" x2="1" y2="0.2">
-      <stop offset="0" stop-color="#00E5FF"/>
-      <stop offset="0.5" stop-color="#7CEBFF"/>
-      <stop offset="1" stop-color="#FFB300"/>
+    <linearGradient id="wordmark" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="60%" stop-color="#B8F6FF"/>
+      <stop offset="100%" stop-color="#FFD27A"/>
     </linearGradient>
-    <linearGradient id="wordmark" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#FFFFFF"/>
-      <stop offset="1" stop-color="#C7D4E6"/>
+    <linearGradient id="panel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0E1420" stop-opacity="0.95"/>
+      <stop offset="100%" stop-color="#080B12" stop-opacity="0.95"/>
     </linearGradient>
-    <linearGradient id="rule" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0" stop-color="#00E5FF"/>
-      <stop offset="1" stop-color="#FFB300" stop-opacity="0"/>
-    </linearGradient>
-    <radialGradient id="cyanGlow" cx="0.5" cy="0.5" r="0.5">
-      <stop offset="0" stop-color="#00E5FF" stop-opacity="0.28"/>
-      <stop offset="1" stop-color="#00E5FF" stop-opacity="0"/>
+    <radialGradient id="glowCyan" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#00E5FF" stop-opacity="0.34"/>
+      <stop offset="100%" stop-color="#00E5FF" stop-opacity="0"/>
     </radialGradient>
-    <radialGradient id="amberGlow" cx="0.5" cy="0.5" r="0.5">
-      <stop offset="0" stop-color="#FFB300" stop-opacity="0.22"/>
-      <stop offset="1" stop-color="#FFB300" stop-opacity="0"/>
+    <radialGradient id="glowAmber" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#FFB300" stop-opacity="0.30"/>
+      <stop offset="100%" stop-color="#FFB300" stop-opacity="0"/>
     </radialGradient>
-    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
-      <path d="M40 0H0V40" fill="none" stroke="#1F293D" stroke-width="1" stroke-opacity="0.26"/>
-    </pattern>
     <filter id="soft" x="-40%" y="-40%" width="180%" height="180%">
-      <feGaussianBlur stdDeviation="10"/>
+      <feGaussianBlur stdDeviation="9"/>
     </filter>
-    <clipPath id="frame">
-      <rect width="1280" height="360" rx="22"/>
-    </clipPath>
+    <filter id="bloom" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="4" result="b"/>
+      <feMerge>
+        <feMergeNode in="b"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" fill="none" stroke="#7C8CA6" stroke-opacity="0.055" stroke-width="1"/>
+    </pattern>
+    <linearGradient id="edge" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#00E5FF" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#FFB300" stop-opacity="0.18"/>
+    </linearGradient>
   </defs>
 
-  <g clip-path="url(#frame)">
-    <rect width="1280" height="360" fill="url(#canvas)"/>
-    <rect width="1280" height="360" fill="url(#grid)"/>
-    <circle cx="250" cy="150" r="230" fill="url(#cyanGlow)"/>
-    <circle cx="1030" cy="250" r="240" fill="url(#amberGlow)"/>
-    <rect x="0.5" y="0.5" width="1279" height="359" rx="22" fill="none" stroke="#1F293D"/>
+  <!-- obsidian canvas -->
+  <rect width="1280" height="360" fill="#07090E"/>
+  <rect width="1280" height="360" fill="url(#grid)"/>
+  <rect width="1280" height="360" fill="none" stroke="url(#edge)" stroke-width="2"/>
 
-    <!-- Emblem: two interlocking loops forming an infinity bridge with CSS glow animation -->
-    <g class="glow-emblem">
-      <g filter="url(#soft)" opacity="0.6">
-        <path d="M150 176C150 122 214 118 252 158c34 36 58 44 76 44 34 0 58-26 58-58s-24-58-58-58c-18 0-42 8-76 44-38 40-102 36-102-18"
-              fill="none" stroke="url(#infinity)" stroke-width="14" stroke-linecap="round"/>
-      </g>
-      <path d="M150 176C150 122 214 118 252 158c34 36 58 44 76 44 34 0 58-26 58-58s-24-58-58-58c-18 0-42 8-76 44-38 40-102 36-102-18"
-            fill="none" stroke="url(#infinity)" stroke-width="7" stroke-linecap="round"/>
+  <!-- ambient light -->
+  <ellipse cx="930" cy="170" rx="330" ry="230" fill="url(#glowAmber)"/>
+  <ellipse cx="250" cy="250" rx="300" ry="200" fill="url(#glowCyan)"/>
+
+  <!-- ===================== brand block ===================== -->
+  <g>
+    <rect x="52" y="58" width="58" height="58" rx="15" fill="#0A1119" stroke="#1E3244" stroke-width="1.5"/>
+    <path d="M66 96c0-13 10-24 23-24s23 11 23 24" fill="none" stroke="url(#bridge)" stroke-width="3" stroke-linecap="round"/>
+    <path d="M70 96h38" stroke="#263F55" stroke-width="2" stroke-linecap="round"/>
+    <circle cx="85" cy="72" r="3.5" fill="#00E5FF"/>
+    <circle cx="104" cy="72" r="3.5" fill="#FFB300"/>
+
+    <text x="126" y="86" font-family="Inter, Segoe UI, system-ui, sans-serif" font-size="13" letter-spacing="4.6" fill="#69E8F6" font-weight="600">UNIVERSAL TRANSLATION CONTAINER</text>
+    <text x="126" y="106" font-family="Inter, Segoe UI, system-ui, sans-serif" font-size="11" letter-spacing="2.4" fill="#5E7288">ANDROID 8.0 — 16  ·  ARM64 / x86_64 HOST  ·  ARM32 GUEST</text>
+
+    <text x="52" y="196" font-family="Inter, Segoe UI, system-ui, sans-serif" font-size="58" font-weight="800" letter-spacing="1.5" fill="url(#wordmark)">ZAI-BRIDGE</text>
+    <text x="54" y="232" font-family="Inter, Segoe UI, system-ui, sans-serif" font-size="16" fill="#93A6BC">Runs 32-bit Unity &amp; native games on 64-bit Android —</text>
+    <text x="54" y="256" font-family="Inter, Segoe UI, system-ui, sans-serif" font-size="16" fill="#93A6BC">with a page-tracked guest arena and Zai-Scale Ultra graphics.</text>
+
+    <!-- version pill -->
+    <g>
+      <rect x="54" y="278" width="104" height="30" rx="15" fill="#00E5FF" fill-opacity="0.10" stroke="#00E5FF" stroke-opacity="0.55"/>
+      <circle cx="73" cy="293" r="3.5" fill="#00E5FF">
+        <animate attributeName="opacity" values="1;0.25;1" dur="2.6s" repeatCount="indefinite"/>
+      </circle>
+      <text x="86" y="298" font-family="Inter, Segoe UI, system-ui, sans-serif" font-size="13" font-weight="700" letter-spacing="1.2" fill="#B9F7FF">v3.1.0</text>
+    </g>
+    <g>
+      <rect x="170" y="278" width="196" height="30" rx="15" fill="#FFB300" fill-opacity="0.08" stroke="#FFB300" stroke-opacity="0.45"/>
+      <text x="188" y="298" font-family="Inter, Segoe UI, system-ui, sans-serif" font-size="12" font-weight="600" letter-spacing="0.9" fill="#FFD27A">768 MB GUEST ARENA ACTIVE</text>
+    </g>
+  </g>
+
+  <!-- ===================== infinity bridge ===================== -->
+  <g transform="translate(0,0)">
+    <!-- labels -->
+    <g font-family="Inter, Segoe UI, system-ui, sans-serif" text-anchor="middle">
+      <text x="792" y="112" font-size="11" letter-spacing="3.2" fill="#69E8F6" font-weight="700">32-BIT GUEST</text>
+      <text x="1064" y="112" font-size="11" letter-spacing="3.2" fill="#FFC766" font-weight="700">64-BIT HOST</text>
+      <text x="928" y="292" font-size="10.5" letter-spacing="2.6" fill="#5E7288">UNICORN ARM32 · JNI TRAMPOLINES · EGL FORWARDING</text>
     </g>
 
-    <!-- Bridge deck and pylons -->
-    <path d="M132 214H496" stroke="#1F293D" stroke-width="2"/>
-    <path d="M214 214V190M290 214V178M366 214V190" stroke="#FFB300" stroke-opacity="0.85" stroke-width="2.5" stroke-linecap="round"/>
-    <path d="M214 190L252 158M290 178L316 160M366 190L332 162" stroke="#00E5FF" stroke-opacity="0.65" stroke-width="1.8" class="anim-cable"/>
+    <!-- glow stroke -->
+    <path d="M716 196 C716 132 812 132 856 196 C900 260 996 260 996 196 C996 132 900 132 856 196 C812 260 716 260 716 196 Z"
+          fill="none" stroke="url(#bridge)" stroke-width="16" stroke-opacity="0.22" filter="url(#soft)"/>
 
-    <!-- Wordmark -->
-    <text x="556" y="146" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="66" font-weight="700" letter-spacing="1.5" fill="url(#wordmark)">ZAI-BRIDGE</text>
-    <rect x="558" y="164" width="360" height="3" rx="1.5" fill="url(#rule)"/>
+    <!-- main infinity -->
+    <path id="infinity"
+          d="M716 196 C716 132 812 132 856 196 C900 260 996 260 996 196 C996 132 900 132 856 196 C812 260 716 260 716 196 Z"
+          fill="none" stroke="url(#bridge)" stroke-width="3.2" stroke-linejoin="round" filter="url(#bloom)">
+      <animate attributeName="stroke-opacity" values="1;0.72;1" dur="4.2s" repeatCount="indefinite"/>
+    </path>
 
-    <text x="558" y="206" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="18" fill="#C7D4E6">Universal 32-to-64-Bit Android Translation Container</text>
-    <text x="558" y="234" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="18" fill="#8A99AD">&amp; Zai-Scale Ultra™ Neural Graphics Engine (DLSS-5 + 120 Hz MFG)</text>
+    <!-- flowing dash overlay -->
+    <path d="M716 196 C716 132 812 132 856 196 C900 260 996 260 996 196 C996 132 900 132 856 196 C812 260 716 260 716 196 Z"
+          fill="none" stroke="#EAFDFF" stroke-width="1.6" stroke-linecap="round"
+          stroke-dasharray="26 210" stroke-opacity="0.85">
+      <animate attributeName="stroke-dashoffset" from="236" to="0" dur="5.4s" repeatCount="indefinite"/>
+    </path>
 
-    <!-- Architecture badges -->
-    <g font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12" font-weight="600" letter-spacing="0.6">
-      <g>
-        <rect x="558" y="266" width="152" height="30" rx="15" fill="#111622" stroke="#1F293D"/>
-        <circle cx="576" cy="281" r="3.5" fill="#00E5FF"/>
-        <text x="588" y="286" fill="#C7D4E6">UNICORN ARM32</text>
-      </g>
-      <g>
-        <rect x="720" y="266" width="140" height="30" rx="15" fill="#111622" stroke="#1F293D"/>
-        <circle cx="738" cy="281" r="3.5" fill="#FFB300"/>
-        <text x="750" y="286" fill="#C7D4E6">DLSS-5 / FSR</text>
-      </g>
-      <g>
-        <rect x="870" y="266" width="112" height="30" rx="15" fill="#111622" stroke="#1F293D"/>
-        <circle cx="888" cy="281" r="3.5" fill="#00E5FF"/>
-        <text x="900" y="286" fill="#C7D4E6">4 ABIs</text>
-      </g>
-      <g>
-        <rect x="992" y="266" width="130" height="30" rx="15" fill="#111622" stroke="#1F293D"/>
-        <circle cx="1010" cy="281" r="3.5" fill="#FFB300"/>
-        <text x="1022" y="286" fill="#C7D4E6">120 Hz MFG</text>
-      </g>
+    <!-- packets travelling the bridge -->
+    <circle r="4.6" fill="#00E5FF" filter="url(#bloom)">
+      <animateMotion dur="6.4s" repeatCount="indefinite" rotate="auto">
+        <mpath href="#infinity"/>
+      </animateMotion>
+    </circle>
+    <circle r="3.4" fill="#FFB300" fill-opacity="0.95">
+      <animateMotion dur="6.4s" begin="3.2s" repeatCount="indefinite" rotate="auto">
+        <mpath href="#infinity"/>
+      </animateMotion>
+    </circle>
+
+    <!-- nodes -->
+    <g>
+      <circle cx="716" cy="196" r="7" fill="#07090E" stroke="#00E5FF" stroke-width="2.5"/>
+      <circle cx="716" cy="196" r="2.4" fill="#00E5FF"/>
+      <circle cx="996" cy="196" r="7" fill="#07090E" stroke="#FFB300" stroke-width="2.5"/>
+      <circle cx="996" cy="196" r="2.4" fill="#FFB300"/>
     </g>
 
-    <!-- Version chip -->
-    <g font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif">
-      <rect x="1124" y="42" width="104" height="30" rx="15" fill="#111622" stroke="#00E5FF" stroke-opacity="0.5"/>
-      <text x="1176" y="62" font-size="12" font-weight="700" fill="#00E5FF" text-anchor="middle" letter-spacing="1">v3.0.0</text>
+    <!-- stat chips -->
+    <g font-family="Inter, Segoe UI, system-ui, sans-serif">
+      <g>
+        <rect x="676" y="308" width="150" height="30" rx="9" fill="url(#panel)" stroke="#1B2C3C"/>
+        <text x="692" y="327" font-size="11" fill="#8FA5BB">768 MB <tspan fill="#69E8F6">page arena</tspan></text>
+      </g>
+      <g>
+        <rect x="838" y="308" width="150" height="30" rx="9" fill="url(#panel)" stroke="#1B2C3C"/>
+        <text x="854" y="327" font-size="11" fill="#8FA5BB">4 KB <tspan fill="#FFC766">reclaimable</tspan></text>
+      </g>
+      <g>
+        <rect x="1000" y="308" width="176" height="30" rx="9" fill="url(#panel)" stroke="#1B2C3C"/>
+        <text x="1016" y="327" font-size="11" fill="#8FA5BB">Unlimited <tspan fill="#69E8F6">MFG</tspan></text>
+      </g>
     </g>
   </g>
 </svg>
