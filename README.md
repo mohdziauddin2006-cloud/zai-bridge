@@ -14,7 +14,7 @@
 [![License](https://img.shields.io/badge/License-MIT-00E5FF?style=for-the-badge&labelColor=07090E)](LICENSE)
 
 <p align="center">
-  <a href="#screenshot-gallery"><b>📸 Screenshots</b></a> •
+  <a href="#interface-preview"><b>📸 Interface</b></a> •
   <a href="#architecture"><b>🏛️ Architecture</b></a> •
   <a href="#guest-memory-model"><b>🧠 Memory Model</b></a> •
   <a href="#zai-scale-ultra-preset-comparison"><b>⚡ Zai-Scale Ultra</b></a> •
@@ -36,26 +36,30 @@
 
 ---
 
-## Screenshot Gallery
+## Interface Preview
 
 <div align="center">
 
-| **Launcher Home & Real GPU Detection** | **Guided 32-Bit APK + OBB Ingestion** |
+| **Launcher (design preview)** | **Import sheet (design preview)** |
 |:---:|:---:|
 | <img src="docs/screenshots/launcher_home.png" width="420" alt="Zai-Bridge Launcher Home" /> | <img src="docs/screenshots/import_sheet.png" width="420" alt="Zai-Bridge Import Sheet" /> |
-| *Material 3 Obsidian & Neon Glass home with the live EGL14 GPU pill (here: SwiftShader on x86_64)* | *APK & OBB analysis, ELF symbol staging & read-only DEX hardening* |
+| *Obsidian/neon home: GPU pill, game cards, 120 FPS MFG chip, Import Game action* | *APK + OBB selection with the Unicorn engine breakdown and staging bar* |
 
-| **Zai-Scale Ultra Graphics Presets** | **In-Game HUD & Split-Screen Wipe** |
+| **Zai-Scale Ultra settings sheet** | **HUD + telemetry overlay (design preview)** |
 |:---:|:---:|
 | <img src="docs/screenshots/graphics_presets.png" width="420" alt="Zai-Scale Ultra Presets" /> | <img src="docs/screenshots/ingame_hud.png" width="480" alt="Zai-Bridge In-Game HUD" /> |
-| *Optical-flow frame generation, DLSS-5 12-tap TSR, Neural PBR specular and Uncapped MFG* | *Real-time present pacing with the interactive Before/After wipe* |
+| *MFG, TSR, PBR, HDR, micro-pacing and VSync-lock toggles with ULTRA / PERF / BATTERY tiers* | *Layout of the in-game HUD, speed readout and the Before/After wipe* |
 
 </div>
 
-There is deliberately **no "Hell Zombie running" screenshot** in this gallery
-yet: no guest `eglSwapBuffers` frame has been presented, so there is no live
-frame to show. The in-game HUD capture comes from the compositor's own present
-path, not from a translated guest frame.
+> **These are interface design previews, not device captures.** The GPU string
+> (`PowerVR BXM-8-256`), the installed-games list, the `.apk` size and the
+> telemetry counters in them — including "384 MB Allocated / Zero Leaks" — are
+> illustrative artwork, not measurements. The real numbers from the v3.1.0 run
+> are in [Verification and Telemetry](#verification-and-telemetry).
+>
+> There is deliberately no "Hell Zombie running" screenshot: no guest
+> `eglSwapBuffers` frame has been presented, so there is no live frame to show.
 
 ---
 
@@ -161,16 +165,18 @@ the guest keeps presenting.
 
 ## SoC Tiers
 
-`assets/soc_database.json` classifies 184 SoCs, then live `GL_RENDERER`, core
-count and RAM refine the result into a tier that seeds the default preset.
+`app/src/main/assets/soc_database.json` holds **184 SoC families** plus 19 GPU
+groups (74 GPU match tokens). Each entry is matched against
+`Build.SOC_MODEL` / `HARDWARE` / `BOARD` and the live `GL_RENDERER` string —
+the longest matching token wins — and the resulting tier seeds the default preset.
 
 | Tier | Representative SoCs | Default Preset |
 |---|---|---|
-| **Entry** | Snapdragon 200–450, MT65xx, Unisoc SC98xx, Exynos 850 | Vanilla Off / FSR Perf 2x |
-| **Balanced** | Helio G85–G99, Snapdragon 6xx, Exynos 1280, Unisoc T6xx–T7xx | FSR Quality 2x |
-| **Performance** | Dimensity 700–8100, Snapdragon 7xx, Exynos 1380/1480, Tensor G1 | DLSS-5 Ultra 3x |
-| **High** | Snapdragon 8 Gen 1/2, Dimensity 9000–9200, Tensor G2/G3, Kirin 9000s | DLSS-5 Overdrive 4x |
-| **Ultra-Flagship** | Snapdragon 8 Gen 3 / 8 Elite (Gen 5/6), Dimensity 9400 / 9600 Pro, Tensor G4/G5, XRING O1 | DLSS-5 Overdrive 4x + Uncapped |
+| **Tier 1: Entry** | Snapdragon 200–450, MT65xx, Unisoc SC98xx, Exynos 850 | FSR 1.0 EASU · 67% scale · 50% RCAS · 10% neural · no MFG |
+| **Tier 2: Mainstream** | Helio G85–G99, Snapdragon 6xx/7xx, Exynos 1280, Unisoc T6xx–T7xx, Tensor G1 | FSR 1.0 EASU · 75% · 45% · 20% · 2x MFG |
+| **Tier 3: Performance** | Dimensity 700–8100, Snapdragon 7+ Gen 2/3, Exynos 1380/1480 | FSR temporal · 75% · 45% · 35% · 2x MFG |
+| **Tier 4: Flagship** | Snapdragon 8 Gen 1/2/3, Dimensity 9000–9200, Tensor G2/G3, Kirin 9000s | DLSS-5 + TSR · 85% · 45% · 55% · 3x MFG |
+| **Tier 5: Ultra-Flagship** | Snapdragon 8 Elite (Gen 5/6), Dimensity 9400 / 9600 Pro, Tensor G4/G5, XRING O1 | DLSS-5 + TSR · 100% · 50% · 70% · 4x MFG |
 
 **BERSERK MODE** ignores the tier entirely: 125% DLAA, maximum neural lighting
 and RCAS, unlimited frame generation, on any device.

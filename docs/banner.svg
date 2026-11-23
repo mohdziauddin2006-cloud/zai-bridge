@@ -77,8 +77,8 @@
       <text x="86" y="298" font-family="Inter, Segoe UI, system-ui, sans-serif" font-size="13" font-weight="700" letter-spacing="1.2" fill="#B9F7FF">v3.1.0</text>
     </g>
     <g>
-      <rect x="170" y="278" width="196" height="30" rx="15" fill="#FFB300" fill-opacity="0.08" stroke="#FFB300" stroke-opacity="0.45"/>
-      <text x="188" y="298" font-family="Inter, Segoe UI, system-ui, sans-serif" font-size="12" font-weight="600" letter-spacing="0.9" fill="#FFD27A">768 MB GUEST ARENA ACTIVE</text>
+      <rect x="170" y="278" width="242" height="30" rx="15" fill="#FFB300" fill-opacity="0.08" stroke="#FFB300" stroke-opacity="0.45"/>
+      <text x="188" y="298" font-family="Inter, Segoe UI, system-ui, sans-serif" font-size="11.5" font-weight="600" letter-spacing="0.8" fill="#FFD27A">768 MB GUEST ARENA ACTIVE</text>
     </g>
   </g>
 
