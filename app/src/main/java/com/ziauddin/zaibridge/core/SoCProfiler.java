@@ -92,7 +92,7 @@ public final class SoCProfiler {
             s.frameGen = recFrameGen;
             s.temporal = recTemporal;
             s.autoMfg = recAutoMfg;
-            s.berserkMode = 0;
+            s.berserk = 0;
             if (tier >= 5) {
                 s.preset = GraphicsSettings.PRESET_DLSS_OVERDRIVE;
             } else if (tier == 4) {

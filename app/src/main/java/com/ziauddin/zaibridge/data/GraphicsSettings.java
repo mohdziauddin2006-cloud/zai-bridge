@@ -48,6 +48,7 @@ public final class GraphicsSettings {
     public static final int SCALE_NATIVE = 100;
     /** DLAA-style super-sampling: render above panel resolution, then downsample. */
     public static final int SCALE_DLAA_125 = 125;
+    public static final int SCALE_SUPER_SAMPLE = SCALE_DLAA_125;
 
     public static final int FRAME_GEN_UNLIMITED = -1;
     public static final int FRAME_GEN_OFF = 0;
@@ -206,6 +207,11 @@ public final class GraphicsSettings {
     /** True when the configuration bypasses the SoC recommendation. */
     public boolean isBerserk() {
         return berserk != 0;
+    }
+
+    /** True when uncapped frame generation or Berserk Mode is enabled. */
+    public boolean isUncapped() {
+        return frameGen == FRAME_GEN_UNLIMITED || berserk != 0;
     }
 
     /**

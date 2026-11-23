@@ -223,7 +223,7 @@ public final class InGameOverlay {
         int guestFps = (int) Math.round(extractNumber(stats, "guestFps"));
         int outputFps = (int) Math.round(extractNumber(stats, "outputFps"));
         int vkFps = (int) Math.round(extractNumber(stats, "vk_fps"));
-        String prefix = graphics.berserkMode != 0 ? "BERSERK · " : "";
+        String prefix = graphics.berserk != 0 ? "BERSERK · " : "";
         String text;
         if (guestFps > 0) {
             text = String.format(Locale.US, "%s%d→%d FPS · %s · %s %d%%",
@@ -326,9 +326,9 @@ public final class InGameOverlay {
         berserkRow.setGravity(Gravity.CENTER_VERTICAL);
         berserkRow.setPadding(dp(10), dp(8), dp(10), dp(8));
         GradientDrawable berserkBg = new GradientDrawable();
-        berserkBg.setColor(graphics.berserkMode != 0 ? 0x33FF3D00 : 0x1AFFFFFF);
+        berserkBg.setColor(graphics.berserk != 0 ? 0x33FF3D00 : 0x1AFFFFFF);
         berserkBg.setCornerRadius(dp(12));
-        berserkBg.setStroke(dp(1), graphics.berserkMode != 0 ? 0xCCFF3D00 : 0x33FFFFFF);
+        berserkBg.setStroke(dp(1), graphics.berserk != 0 ? 0xCCFF3D00 : 0x33FFFFFF);
         berserkRow.setBackground(berserkBg);
         LinearLayout.LayoutParams brLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -337,7 +337,7 @@ public final class InGameOverlay {
 
         TextView berserkLabel = new TextView(hostContext);
         berserkLabel.setText("BERSERK MODE (Bypass Limits · 125% · Uncapped)");
-        berserkLabel.setTextColor(graphics.berserkMode != 0 ? 0xFFFFAB91 : 0xFFD0DCEB);
+        berserkLabel.setTextColor(graphics.berserk != 0 ? 0xFFFFAB91 : 0xFFD0DCEB);
         berserkLabel.setTextSize(10.5f);
         berserkLabel.setTypeface(null, Typeface.BOLD);
         berserkLabel.setLayoutParams(new LinearLayout.LayoutParams(
@@ -345,9 +345,9 @@ public final class InGameOverlay {
         berserkRow.addView(berserkLabel);
 
         Switch berserkSwitch = new Switch(hostContext);
-        berserkSwitch.setChecked(graphics.berserkMode != 0);
+        berserkSwitch.setChecked(graphics.berserk != 0);
         berserkSwitch.setOnCheckedChangeListener((btn, checked) -> {
-            graphics.berserkMode = checked ? 1 : 0;
+            graphics.berserk = checked ? 1 : 0;
             if (!checked && graphics.scalePercent > GraphicsSettings.SCALE_NATIVE) {
                 graphics.scalePercent = GraphicsSettings.SCALE_NATIVE;
             }
@@ -377,7 +377,7 @@ public final class InGameOverlay {
         }));
 
         // Scale slider (50..100 or 50..125 in Berserk Mode)
-        int maxScale = graphics.berserkMode != 0
+        int maxScale = graphics.berserk != 0
                 ? GraphicsSettings.SCALE_SUPER_SAMPLE : GraphicsSettings.SCALE_NATIVE;
         body.addView(sliderRow("RENDER SCALE", 50, maxScale,
                 clamp(graphics.scalePercent, 50, maxScale), v -> {
@@ -407,7 +407,7 @@ public final class InGameOverlay {
                 {"4x", "4"},
                 {"5x", "5"},
                 {"8x", "8"},
-                {"UNLIMITED", "99"}
+                {"UNLIMITED", String.valueOf(GraphicsSettings.FRAME_GEN_UNLIMITED)}
         }, String.valueOf(graphics.frameGen), val -> {
             graphics.frameGen = Integer.parseInt(val);
             if (graphics.frameGen != GraphicsSettings.FRAME_GEN_OFF

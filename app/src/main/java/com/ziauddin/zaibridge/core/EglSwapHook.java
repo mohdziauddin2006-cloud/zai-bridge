@@ -100,6 +100,11 @@ public final class EglSwapHook {
         }
     }
 
+    /** Convenience void wrapper for Handler.postDelayed / lifecycle callbacks. */
+    public static void refreshNativeHooks() {
+        refreshHooks();
+    }
+
     /** GOT counter line: modules, slots patched, redirects, swaps, fps. */
     public static String pltStats() {
         if (!sLoaded) return "unavailable";
