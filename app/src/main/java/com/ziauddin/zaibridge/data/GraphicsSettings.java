@@ -65,6 +65,8 @@ public final class GraphicsSettings {
     public static final int PRESET_DLSS_OVERDRIVE = 4;
     /** Bypasses the SoC recommendation: maximum quality on any hardware. */
     public static final int PRESET_BERSERK = 5;
+    /** Lightweight mobile edge-aware SGSR upscaling for thermal/battery savings. */
+    public static final int PRESET_SGSR_BATTERY = 6;
 
     public int preset = PRESET_OFF;
     public int upscaler;
@@ -171,6 +173,16 @@ public final class GraphicsSettings {
                 s.temporal = 1;
                 s.autoMfg = 0;
                 s.berserk = 1;
+                break;
+            case PRESET_SGSR_BATTERY:
+                s.upscaler = UPSCALER_SGSR;
+                s.scalePercent = SCALE_QUALITY;
+                s.sharpnessPercent = 35;
+                s.neuralPercent = 10;
+                s.frameGen = FRAME_GEN_OFF;
+                s.temporal = 0;
+                s.autoMfg = 0;
+                s.berserk = 0;
                 break;
             case PRESET_OFF:
             default:

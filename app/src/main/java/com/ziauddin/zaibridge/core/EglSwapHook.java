@@ -120,34 +120,29 @@ public final class EglSwapHook {
         }
     }
 
-    /** Applies a full configuration, including the one-tap preset id. */
+    /** Applies a full configuration, including the one-tap preset id and Berserk flag. */
     public static void configure(GraphicsSettings settings) {
         if (settings == null) return;
         configure(settings.upscaler, settings.scalePercent, settings.sharpnessPercent,
                 settings.neuralPercent, settings.frameGen, settings.temporal,
-                settings.autoMfg, settings.preset);
+                settings.autoMfg, settings.preset, settings.berserk);
     }
 
-    /**
-     * Applies the effective graphics configuration to the compositor.
-     *
-     * @param upscaler         0 off, 1 mobile SGSR, 2 FSR temporal, 3 DLSS-5
-     * @param scalePercent     50 / 67 / 75 / 85 / 100 native, 125 DLAA super-sampling
-     * @param sharpnessPercent 0-100 RCAS strength
-     * @param neuralPercent    0-100 local contrast / specular / micro-detail
-     * @param frameGen         0 off, 2/3/4/5/8 synthetic frames per real frame,
-     *                         or -1 for uncapped (bounded by the frame budget)
-     * @param temporal         0 or 1, temporal history accumulation
-     * @param autoMfg          0 or 1, dynamic multiplier from measured headroom
-     * @param preset           preset id recorded for telemetry / restore
-     */
     public static void configure(int upscaler, int scalePercent, int sharpnessPercent,
                                  int neuralPercent, int frameGen, int temporal,
                                  int autoMfg, int preset) {
+        configure(upscaler, scalePercent, sharpnessPercent, neuralPercent,
+                frameGen, temporal, autoMfg, preset,
+                preset == GraphicsSettings.PRESET_BERSERK ? 1 : 0);
+    }
+
+    public static void configure(int upscaler, int scalePercent, int sharpnessPercent,
+                                 int neuralPercent, int frameGen, int temporal,
+                                 int autoMfg, int preset, int berserk) {
         if (!sLoaded) return;
         try {
             nativeConfigure(upscaler, scalePercent, sharpnessPercent, neuralPercent,
-                    frameGen, temporal, autoMfg, preset);
+                    frameGen, temporal, autoMfg, preset, berserk);
         } catch (Throwable t) {
             Log.w(TAG, "graphics configuration rejected: " + t);
         }
@@ -205,7 +200,7 @@ public final class EglSwapHook {
     private static native void nativeConfigure(int upscaler, int scalePercent,
                                                int sharpnessPercent, int neuralPercent,
                                                int frameGen, int temporal,
-                                               int autoMfg, int preset);
+                                               int autoMfg, int preset, int berserk);
 
     private static native void nativeSetCompare(float split);
 

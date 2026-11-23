@@ -1,6 +1,5 @@
 package com.ziauddin.zaibridge.ui;
 
-import android.app.Activity;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
@@ -17,14 +16,17 @@ import androidx.appcompat.app.AppCompatActivity;
 
 import com.ziauddin.zaibridge.MainActivity;
 import com.ziauddin.zaibridge.R;
+import com.ziauddin.zaibridge.core.SoCProfiler;
 
 import java.io.File;
 import java.io.FileInputStream;
 import java.nio.charset.StandardCharsets;
 
 /**
- * Clean dark diagnostic screen presented if any unhandled Java/JNI exception occurs.
- * Replaces the dreaded OEM "Zai-Bridge has stopped" crash dialog.
+ * Obsidian Glass Crash Diagnostic Guard presented if any unhandled Java/JNI
+ * exception occurs. Displays Android API, detected SoC/GPU, ABI, exception
+ * summary, selectable monospace stack trace, Copy Diagnostic Report, and
+ * Restart App actions.
  */
 public class CrashActivity extends AppCompatActivity {
 
@@ -54,23 +56,32 @@ public class CrashActivity extends AppCompatActivity {
             crashInfo = readLastCrashFile();
         }
 
-        String deviceInfo = "Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")\n"
-                + "Hardware: " + Build.MANUFACTURER + " " + Build.MODEL + " (" + Build.DEVICE + ")\n"
+        String socLine = Build.HARDWARE;
+        try {
+            SoCProfiler.Profile profile = SoCProfiler.get(this);
+            socLine = profile.socName + " · " + profile.gpuName + " (" + profile.tierLabel + ")";
+        } catch (Throwable ignored) {
+        }
+
+        String deviceInfo = "Zai-Bridge v3.2.0 · Android " + Build.VERSION.RELEASE
+                + " (API " + Build.VERSION.SDK_INT + ")\n"
+                + "Device: " + Build.MANUFACTURER + " " + Build.MODEL + " (" + Build.DEVICE + ")\n"
+                + "SoC / GPU: " + socLine + "\n"
                 + "ABI: " + (Build.SUPPORTED_ABIS.length > 0 ? Build.SUPPORTED_ABIS[0] : "unknown");
 
         tvDevice.setText(deviceInfo);
         tvError.setText(errorMessage != null && !errorMessage.isEmpty()
-                ? "Error: " + errorMessage : "Fatal unhandled exception detected");
+                ? errorMessage : "Fatal unhandled runtime exception");
         tvStack.setText(crashInfo != null && !crashInfo.isEmpty()
-                ? crashInfo : "No stack trace available.");
+                ? crashInfo : "No stack trace recorded.");
 
         final String fullReport = deviceInfo + "\n\n" + (crashInfo != null ? crashInfo : errorMessage);
 
         btnCopy.setOnClickListener(v -> {
             ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
             if (cm != null) {
-                cm.setPrimaryClip(ClipData.newPlainText("ZaiBridge Crash Report", fullReport));
-                Toast.makeText(this, "Diagnostics copied to clipboard", Toast.LENGTH_SHORT).show();
+                cm.setPrimaryClip(ClipData.newPlainText("Zai-Bridge Diagnostic Report", fullReport));
+                Toast.makeText(this, "Diagnostic report copied to clipboard", Toast.LENGTH_SHORT).show();
             }
         });
 
@@ -86,11 +97,11 @@ public class CrashActivity extends AppCompatActivity {
         try {
             File f = new File(getFilesDir(), "last_crash.txt");
             if (f.isFile() && f.length() > 0) {
-                byte[] b = new byte[(int) f.length()];
+                byte[] b = new byte[(int) Math.min(f.length(), 131072)];
                 try (FileInputStream fis = new FileInputStream(f)) {
-                    fis.read(b);
+                    int n = fis.read(b);
+                    if (n > 0) return new String(b, 0, n, StandardCharsets.UTF_8);
                 }
-                return new String(b, StandardCharsets.UTF_8);
             }
         } catch (Throwable ignored) {
         }

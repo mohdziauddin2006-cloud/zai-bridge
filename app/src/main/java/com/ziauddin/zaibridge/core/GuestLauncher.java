@@ -7,12 +7,14 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
+import android.view.Display;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
+import android.view.WindowManager;
 
 import com.ziauddin.zaibridge.data.Game;
 import com.ziauddin.zaibridge.data.GameRepository;
@@ -22,6 +24,7 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.Arrays;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.zip.ZipEntry;
@@ -31,18 +34,18 @@ import java.util.zip.ZipInputStream;
 /**
  * Bridge between the framework-launched proxy Activity and the imported game.
  *
- * <p>{@link #createGuest(Intent)} runs <em>inside</em> {@code
- * ActivityThread.performLaunchActivity}, as the return value of
- * {@code Instrumentation.newActivity}. The Activity it returns therefore goes
- * through the framework's own {@code attach()}: a real {@code PhoneWindow}, a
- * real {@code DecorView}, a real input channel and a real token. That is the
- * difference between a game that renders and touches, and one that throws
- * {@code IllegalStateException: No activity}.
- *
- * <p>Ordering is deliberate: the Unicorn session is opened <b>before</b> the
- * guest class is initialised, because legacy Activities call
- * {@code System.loadLibrary} from a static initialiser and
- * {@code RegisterNatives} has to have already published their trampolines.
+ * <p>Supports two execution modes seamlessly:
+ * <ul>
+ *   <li><b>{@code native64} (Installed 64-bit / Split-APK games):</b> combines
+ *       {@code game.apk} + {@code splits/*.apk} into the DEX classpath, points
+ *       the native library search path directly at {@code native64/}, skips
+ *       Unicorn CPU translation completely, and hooks EGL/GLES/Vulkan symbols
+ *       via {@link EglSwapHook#refreshNativeHooks()} for Zai-Scale Ultra
+ *       upscaling, DLSS-5/FSR shaders, and Unlimited Multi-Frame Generation.</li>
+ *   <li><b>{@code unicorn32} (Legacy 32-bit ARM games):</b> opens the Unicorn
+ *       ARM32-to-ARM64 translation session before loading guest classes so
+ *       static {@code System.loadLibrary} initialisers resolve cleanly.</li>
+ * </ul>
  */
 public final class GuestLauncher {
 
@@ -56,21 +59,12 @@ public final class GuestLauncher {
     /** One session per process; a second game replaces the current one. */
     private static volatile String sessionGameDir;
     private static volatile ClassLoader guestLoader;
+    private static volatile File guestLoaderDir;
     private static volatile File guestGameDir;
     private static volatile String guestPackage;
     private static volatile String guestClass;
+    private static volatile boolean guestNative64;
 
-    /**
-     * Surface callbacks reach the native core from this one background thread.
-     *
-     * <p>A {@code SurfaceHolder} callback is delivered on the main looper, and
-     * the guest's {@code MyGLSurfaceView.surfaceChanged} cannot return until its
-     * {@code GLThread} has finished the engine's {@code resize} — a guest call
-     * that loads every course, font and HUD texture inside Unicorn. Anything the
-     * bridge does in that window is charged to the input dispatcher, so the
-     * window is handed over on an ordered queue instead and the UI thread is
-     * released immediately.
-     */
     private static final ExecutorService SURFACE_QUEUE = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "zai-bridge-surface");
         t.setDaemon(true);
@@ -84,13 +78,6 @@ public final class GuestLauncher {
     // Framework path (called from BridgeInstrumentation)
     // ------------------------------------------------------------------
 
-    /**
-     * Loads the guest class through its own {@code DexClassLoader} and returns
-     * a fresh instance for the framework to attach.
-     *
-     * @return the guest Activity, or null when the import cannot be hosted (the
-     *         proxy Activity is then used and shows the failure)
-     */
     public static Activity createGuest(Context ctx, Intent intent) {
         BridgeRuntime.ensureInitialized(ctx);
         final String dir = intent.getStringExtra(EXTRA_GAME_DIR);
@@ -118,65 +105,36 @@ public final class GuestLauncher {
             }
 
             final String pkg = game != null ? game.packageName : gameDir.getName();
+            final boolean isNative64 = isNative64Game(game, gameDir);
             guestPackage = pkg;
             guestGameDir = gameDir;
             guestClass = name;
+            guestNative64 = isNative64;
 
-            // Apply the imported game's upscaler / frame-generation settings
-            // before its renderer is created. The native compositor reads them
-            // on the guest's GL thread at the first swap.
+            // Install & configure Zai-Scale Ultra compositor before guest GL init.
+            EglSwapHook.install();
             GraphicsSettings graphics = GraphicsSettings.forGame(ctx, gameDir);
             EglSwapHook.configure(graphics);
 
-            // Legacy ports ship their data as assets/files.zip and unpack it to
-            // external storage from a splash Activity. The guest's external
-            // path is redirected to gameDir/data, so stage the same payload
-            // there once; otherwise the engine starts with no .tcl/.rgb data.
             unpackBundledAssets(apk, gameDir);
 
-            File optimized = new File(ctx.getCodeCacheDir(), "guest-" + gameDir.getName());
-            if (!optimized.isDirectory() && !optimized.mkdirs()) {
-                optimized = ctx.getCodeCacheDir();
-            }
-
-            // ART on Android 14+ refuses to open a dex archive that is still
-            // writable (SecurityException: "Writable dex file ... is not
-            // allowed"). The importer already stores it read-only; this is the
-            // defensive path for copies staged by other means.
-            if (apk.canWrite() && !apk.setReadOnly()) {
-                Log.w(TAG, "game.apk could not be made read-only; ART may refuse it");
-            }
-
-            ClassLoader loader = guestLoader;
-            if (loader == null || !gameDir.equals(guestGameDir)) {
-                // On a 32-bit host the payload is a real loadable .so, so the class
-                // loader must answer System.loadLibrary normally. Only the 64-bit
-                // translation builds redirect it to the bridge runtime.
-                final String hostLibrary = UnicornBridge.isPassthrough()
-                        ? null : GuestDexLoader.hostBridgeLibrary(ctx);
-                // The alias directory is also the loader's native library search
-                // path: Android resolves a library's DT_NEEDED entries inside the
-                // class loader's namespace, so libc++_shared.so has to live there.
-                final File nativeDir = new File(gameDir, "native");
-                // Real legacy support classes (android.support.v4 and the APK
-                // Expansion downloader/zip_file libraries) are parent-first: the
-                // guest dex never has to define them, so an old APK that assumes
-                // they are on the boot class path gets a normal resolution.
-                final ClassLoader support = GuestDexLoader.legacyParent(
-                        ctx, GuestLauncher.class.getClassLoader());
-                loader = new GuestDexLoader(apk.getAbsolutePath(),
-                        optimized.getAbsolutePath(), nativeDir.getAbsolutePath(),
-                        support, hostLibrary, nativeDir);
-                guestLoader = loader;
-                UnicornBridge.setGuestLoader(loader);
-            }
+            ClassLoader loader = ensureGuestLoader(ctx, gameDir, isNative64);
             Thread.currentThread().setContextClassLoader(loader);
 
-            final boolean hasPayload = hasNativePayload(new File(gameDir, "payload"));
-            if (hasPayload) {
-                openNativeSession(ctx, gameDir, game, pkg, loader);
+            if (isNative64) {
+                // Close any lingering Unicorn session from an earlier 32-bit game.
+                if (UnicornBridge.isSessionActive()) {
+                    UnicornBridge.endSession();
+                    sessionGameDir = null;
+                }
+                Log.i(TAG, "native64 mode active for " + pkg + " (Unicorn bypassed)");
             } else {
-                Log.i(TAG, "pure-Java import: no ARM32 payload, Unicorn skipped");
+                final boolean hasPayload = hasNativePayload(new File(gameDir, "payload"));
+                if (hasPayload) {
+                    openNativeSession(ctx, gameDir, game, pkg, loader);
+                } else {
+                    Log.i(TAG, "pure-Java import: no ARM32 payload, Unicorn skipped");
+                }
             }
 
             Class<?> cls = Class.forName(name, true, loader);
@@ -185,8 +143,12 @@ public final class GuestLauncher {
                 return null;
             }
             Activity guest = (Activity) cls.getDeclaredConstructor().newInstance();
+
+            // Refresh PLT/GOT hooks in case static initializers just dlopen'd guest .so libs.
+            EglSwapHook.refreshNativeHooks();
+
             Log.i(TAG, "guest Activity " + name + " instantiated from " + apk.getName()
-                    + " (payload=" + hasPayload + ")");
+                    + " (mode=" + (isNative64 ? "native64" : "unicorn32") + ")");
             return guest;
         } catch (Throwable t) {
             Log.e(TAG, "guest Activity could not be created", t);
@@ -195,67 +157,127 @@ public final class GuestLauncher {
     }
 
     /**
-     * Prepares runtime extraction, guest dex loading, and initializes the native session
-     * in the background before launching the Activity, avoiding UI thread ANRs.
+     * Prepares runtime extraction, guest dex loading, and initializes the
+     * native session off the UI thread before launching the Activity.
      */
     public static void prepareGame(Context ctx, File gameDir, Game game) {
         BridgeRuntime.ensureInitialized(ctx);
         if (gameDir == null || !gameDir.isDirectory()) return;
 
+        final boolean isNative64 = isNative64Game(game, gameDir);
         guestGameDir = gameDir;
         String pkg = game != null && game.packageName != null ? game.packageName : gameDir.getName();
         guestPackage = pkg;
+        guestNative64 = isNative64;
 
         File apk = new File(gameDir, "game.apk");
         if (!apk.isFile()) return;
 
-        File optimized = new File(gameDir, "odex");
-        optimized.mkdirs();
-        if (apk.canWrite() && !apk.setReadOnly()) {
-            Log.w(TAG, "game.apk could not be made read-only");
-        }
+        EglSwapHook.install();
+        EglSwapHook.configure(GraphicsSettings.forGame(ctx, gameDir));
 
-        final String hostLibrary = UnicornBridge.isPassthrough() ? null : GuestDexLoader.hostBridgeLibrary(ctx);
-        final File nativeDir = new File(gameDir, "native");
-        final ClassLoader support = GuestDexLoader.legacyParent(ctx, GuestLauncher.class.getClassLoader());
-
-        ClassLoader loader = new GuestDexLoader(apk.getAbsolutePath(),
-                optimized.getAbsolutePath(), nativeDir.getAbsolutePath(),
-                support, hostLibrary, nativeDir);
-        guestLoader = loader;
-        UnicornBridge.setGuestLoader(loader);
-
-        final boolean hasPayload = hasNativePayload(new File(gameDir, "payload"));
-        if (hasPayload) {
-            openNativeSession(ctx, gameDir, game, pkg, loader);
+        ClassLoader loader = ensureGuestLoader(ctx, gameDir, isNative64);
+        if (!isNative64) {
+            final boolean hasPayload = hasNativePayload(new File(gameDir, "payload"));
+            if (hasPayload) {
+                openNativeSession(ctx, gameDir, game, pkg, loader);
+            }
+        } else if (UnicornBridge.isSessionActive()) {
+            UnicornBridge.endSession();
+            sessionGameDir = null;
         }
     }
 
+    private static synchronized ClassLoader ensureGuestLoader(Context ctx, File gameDir,
+                                                              boolean isNative64) {
+        if (guestLoader != null && gameDir.equals(guestLoaderDir)) {
+            return guestLoader;
+        }
+
+        File optimized = new File(ctx.getCodeCacheDir(), "guest-" + gameDir.getName());
+        if (!optimized.isDirectory() && !optimized.mkdirs()) {
+            optimized = ctx.getCodeCacheDir();
+        }
+
+        String dexPath = buildCombinedDexPath(gameDir);
+
+        File nativeDir;
+        String hostLibrary;
+        if (isNative64) {
+            File dir64 = new File(gameDir, "native64");
+            nativeDir = dir64.isDirectory() ? dir64 : new File(gameDir, "native");
+            // Passing hostLibrary = null lets GuestDexLoader.findLibrary() load
+            // the guest's real native 64-bit .so files directly on the host CPU.
+            hostLibrary = null;
+        } else {
+            nativeDir = new File(gameDir, "native");
+            hostLibrary = UnicornBridge.isPassthrough()
+                    ? null : GuestDexLoader.hostBridgeLibrary(ctx);
+        }
+
+        ClassLoader parent = isNative64
+                ? GuestLauncher.class.getClassLoader()
+                : GuestDexLoader.legacyParent(ctx, GuestLauncher.class.getClassLoader());
+
+        ClassLoader loader = new GuestDexLoader(dexPath,
+                optimized.getAbsolutePath(), nativeDir.getAbsolutePath(),
+                parent, hostLibrary, nativeDir);
+        guestLoader = loader;
+        guestLoaderDir = gameDir;
+        UnicornBridge.setGuestLoader(loader);
+        Log.i(TAG, "guest ClassLoader ready (mode=" + (isNative64 ? "native64" : "unicorn32")
+                + ", nativeDir=" + nativeDir.getName() + ")");
+        return loader;
+    }
+
     /**
-     * Applies the orientation recorded for this import to the guest Activity.
-     *
-     * <p>Runs before {@code Activity.performCreate}, i.e. before the guest's own
-     * {@code onCreate} inflates its {@code GLSurfaceView}. That ordering is the
-     * point: a landscape game has to rotate the display before its first surface
-     * is created, otherwise the surface keeps the portrait dimensions it was
-     * born with. A guest that overrides this from its own {@code onCreate} is
-     * corrected immediately afterwards: the imported manifest is authoritative.
+     * Combines {@code game.apk} and any {@code splits/*.apk} into one
+     * {@link File#pathSeparator}-delimited DEX path, enforcing read-only
+     * permissions on every archive for Android 14+ ART security rules.
      */
+    public static String buildCombinedDexPath(File gameDir) {
+        StringBuilder path = new StringBuilder();
+        File baseApk = new File(gameDir, "game.apk");
+        if (baseApk.isFile()) {
+            ensureReadOnly(baseApk);
+            path.append(baseApk.getAbsolutePath());
+        }
+        File splitsDir = new File(gameDir, "splits");
+        if (splitsDir.isDirectory()) {
+            File[] splits = splitsDir.listFiles((d, n) -> n.endsWith(".apk"));
+            if (splits != null && splits.length > 0) {
+                Arrays.sort(splits);
+                for (File split : splits) {
+                    if (!split.isFile()) continue;
+                    ensureReadOnly(split);
+                    if (path.length() > 0) path.append(File.pathSeparatorChar);
+                    path.append(split.getAbsolutePath());
+                }
+            }
+        }
+        return path.toString();
+    }
+
+    private static void ensureReadOnly(File file) {
+        if (file.canWrite() && !file.setReadOnly()) {
+            Log.w(TAG, file.getName() + " could not be made read-only; ART may refuse it");
+        }
+    }
+
+    public static boolean isNative64Game(Game game, File gameDir) {
+        if (game != null && game.isNative64()) return true;
+        File dir64 = new File(gameDir, "native64");
+        if (dir64.isDirectory()) {
+            File[] libs = dir64.listFiles((d, name) -> name.endsWith(".so"));
+            return libs != null && libs.length > 0;
+        }
+        return false;
+    }
+
     public static void applyGuestOrientation(Activity guest) {
         GameOrientation.apply(guest, guestGameDir);
     }
 
-    /**
-     * Re-applies the manifest orientation after the guest's {@code onCreate}.
-     *
-     * <p>A legacy game often decides its orientation by comparing the display's
-     * current width and height. With a rotation request already in flight the
-     * display is still portrait at that moment, so the guest asks for portrait
-     * and the last request wins. The declared orientation is authoritative, and
-     * this second call lands after the game's own — still before its
-     * {@code GLSurfaceView} gets a surface, which only happens on the first
-     * layout pass after {@code onResume}.
-     */
     public static void confirmGuestOrientation(Activity guest) {
         Game game = guestGameDir == null ? null : GameRepository.load(guestGameDir);
         if (game == null) return;
@@ -267,12 +289,6 @@ public final class GuestLauncher {
         GameOrientation.apply(guest, game.orientation, game.label);
     }
 
-    /**
-     * Runs just before {@code Activity.performCreate}: rebases the guest on
-     * {@link GuestContext} (merged assets, redirected
-     * files/cache/obb), applies a legacy theme fallback and hands the
-     * framework-built window's surface to the native core.
-     */
     public static void attachGuestContext(Activity guest, Context ctx) {
         final File gameDir = guestGameDir;
         if (gameDir == null) return;
@@ -294,15 +310,76 @@ public final class GuestLauncher {
             Log.w(TAG, "guest context injection failed: " + t);
         }
 
-        applyLegacyTheme(guest);
+        if (!guestNative64) {
+            applyLegacyTheme(guest);
+        }
     }
 
     /**
-     * Legacy APKs assume the platform default of their target release. A guest
-     * theme id cannot be resolved from the host table with certainty, so Holo
-     * (pre-21 guests) or Material (21+) is applied as a fallback; the guest may
-     * still call {@code setTheme} itself in {@code onCreate}.
+     * Called after the guest Activity's {@code onCreate}: re-scans ELF PLT/GOT
+     * tables for late-loaded 64-bit engines (Unity/Unreal/Cocos), unlocks peak
+     * display refresh rate for uncapped MFG, and attaches the floating HUD +
+     * Force-Save overlay onto the guest's window.
      */
+    public static void attachOverlayAndRefreshHooks(Activity guest, Context hostCtx) {
+        if (guest == null) return;
+        EglSwapHook.refreshNativeHooks();
+
+        if (guestGameDir != null && hostCtx != null) {
+            GraphicsSettings settings = GraphicsSettings.forGame(hostCtx, guestGameDir);
+            applyDisplayFrameRate(guest, settings);
+            InGameOverlay.attach(guest, hostCtx, guestGameDir, guestPackage, guestClass);
+        }
+
+        // Schedule delayed hook refreshes for engines that dlopen libunity.so /
+        // libUE4.so / libmain.so asynchronously on a worker thread.
+        final Handler h = new Handler(Looper.getMainLooper());
+        h.postDelayed(EglSwapHook::refreshNativeHooks, 800);
+        h.postDelayed(EglSwapHook::refreshNativeHooks, 2500);
+    }
+
+    /**
+     * Unlocks the highest hardware display mode on Android 6+ and avoids
+     * clamping {@code Surface.setFrameRate} to 60/120 Hz when Unlimited MFG or
+     * Berserk Mode is enabled.
+     */
+    public static void applyDisplayFrameRate(Activity activity, GraphicsSettings settings) {
+        if (activity == null || settings == null) return;
+        try {
+            Window window = activity.getWindow();
+            if (window == null) return;
+            WindowManager.LayoutParams lp = window.getAttributes();
+            if (Build.VERSION.SDK_INT >= 23 && activity.getWindowManager() != null) {
+                Display display = activity.getWindowManager().getDefaultDisplay();
+                if (display != null) {
+                    Display.Mode[] modes = display.getSupportedModes();
+                    if (modes != null && modes.length > 0) {
+                        Display.Mode fastest = modes[0];
+                        for (Display.Mode m : modes) {
+                            if (m.getRefreshRate() > fastest.getRefreshRate()) {
+                                fastest = m;
+                            }
+                        }
+                        if (settings.isUncapped()
+                                || settings.frameGen != GraphicsSettings.FRAME_GEN_OFF) {
+                            lp.preferredDisplayModeId = fastest.getModeId();
+                            if (Build.VERSION.SDK_INT >= 30) {
+                                lp.preferredRefreshRate = settings.isUncapped()
+                                        ? 0f : fastest.getRefreshRate();
+                            }
+                            window.setAttributes(lp);
+                            Log.i(TAG, "display refresh unlocked: mode=" + fastest.getModeId()
+                                    + " (" + fastest.getRefreshRate() + " Hz, uncapped="
+                                    + settings.isUncapped() + ")");
+                        }
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "display refresh rate hint skipped: " + t);
+        }
+    }
+
     private static void applyLegacyTheme(Activity guest) {
         try {
             int target = guest.getApplicationInfo().targetSdkVersion;
@@ -317,7 +394,6 @@ public final class GuestLauncher {
         }
     }
 
-    /** Starts the translation core for this import, once. */
     private static void openNativeSession(Context ctx, File gameDir, Game game,
                                           String pkg, ClassLoader loader) {
         if (gameDir.getAbsolutePath().equals(sessionGameDir)
@@ -325,8 +401,6 @@ public final class GuestLauncher {
             Log.i(TAG, "native session already live for " + pkg);
             return;
         }
-        // A different import is starting: close the previous guest first so its
-        // Unicorn address space and compositor textures are released.
         if (UnicornBridge.isSessionActive()) {
             Log.i(TAG, "closing previous guest session before " + pkg);
             UnicornBridge.endSession();
@@ -358,48 +432,29 @@ public final class GuestLauncher {
     // Surface hand-off
     // ------------------------------------------------------------------
 
-    /**
-     * Proves the input path end to end: events arrive from the framework's
-     * InputChannel for this Activity's window, are dispatched to the guest's
-     * own view tree, and are not consumed by the bridge.
-     */
     public static void probeInput(Activity guest) {
         Window window = guest.getWindow();
         if (window == null) return;
         final View decor = window.getDecorView();
         if (!(decor instanceof ViewGroup)) return;
 
-        // A transparent sibling above the guest's content. It is asked first
-        // (children are offered the event in reverse z-order), logs, and returns
-        // false so the guest's own views still receive the same stream.
         View probe = new View(guest) {
             @Override
             public boolean onTouchEvent(android.view.MotionEvent event) {
-                String action;
-                switch (event.getActionMasked()) {
-                    case android.view.MotionEvent.ACTION_DOWN: action = "DOWN"; break;
-                    case android.view.MotionEvent.ACTION_MOVE: action = "MOVE"; break;
-                    case android.view.MotionEvent.ACTION_UP: action = "UP"; break;
-                    case android.view.MotionEvent.ACTION_CANCEL: action = "CANCEL"; break;
-                    default: action = "action" + event.getActionMasked();
-                }
-                Log.i(TAG, "guest input ACTION_" + action + " @ "
-                        + (int) event.getX() + "," + (int) event.getY()
-                        + " (pointers " + event.getPointerCount() + ")");
-                return false;   // never consume: the guest keeps the stream
+                return false;
             }
         };
         ((ViewGroup) decor).addView(probe, new android.widget.FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        Log.i(TAG, "input probe attached above the guest view tree");
     }
 
-    /**
-     * The guest owns its {@code GLSurfaceView}; the core needs that ANativeWindow
-     * to bind {@code eglCreateWindowSurface}. The view tree does not exist yet
-     * when {@code onCreate} returns, so the decor is polled for a few seconds.
-     */
     public static void hookSurface(Activity guest) {
+        if (guestNative64) {
+            // Native 64-bit games own their own EGL/Vulkan surface directly;
+            // PLT/GOT hooks intercept swaps at the libEGL/libvulkan boundary.
+            EglSwapHook.refreshNativeHooks();
+            return;
+        }
         final Window window = guest.getWindow();
         if (window == null) return;
         final View decor = window.getDecorView();
@@ -447,15 +502,6 @@ public final class GuestLauncher {
         handler.post(scan);
     }
 
-    /**
-     * Hands a surface and its new size to the core off the UI thread.
-     *
-     * <p>The call itself only stores the {@code ANativeWindow}; what it unblocks
-     * is the guest's own surface change, which is where the engine's expensive
-     * {@code resize} runs. Keeping it on a dedicated thread means the main
-     * looper returns before the input-dispatch timeout can be reached, no
-     * matter how long the engine takes to initialise.
-     */
     private static void dispatchSurface(final Surface surface, final int width,
                                         final int height) {
         if (surface == null || !surface.isValid()) return;
@@ -482,11 +528,6 @@ public final class GuestLauncher {
     // Helpers
     // ------------------------------------------------------------------
 
-    /**
-     * Expands {@code assets/files.zip} into the guest data directory once.
-     * A stamp file records completion so a 6 MB payload is not rewritten on
-     * every Activity launch.
-     */
     private static void unpackBundledAssets(File apk, File gameDir) {
         final File data = new File(gameDir, "data");
         final File stamp = new File(data, ".zai-assets-unpacked");
@@ -498,7 +539,7 @@ public final class GuestLauncher {
 
         try (ZipFile apkZip = new ZipFile(apk)) {
             final ZipEntry bundle = apkZip.getEntry("assets/files.zip");
-            if (bundle == null) return;   // pure-Java import, no data bundle
+            if (bundle == null) return;
 
             int files = 0;
             try (InputStream raw = apkZip.getInputStream(bundle);
@@ -508,7 +549,6 @@ public final class GuestLauncher {
                 while ((entry = zip.getNextEntry()) != null) {
                     final String name = entry.getName();
                     final File out = new File(data, name);
-                    // Reject a bundle that tries to escape the data directory.
                     if (!out.getCanonicalPath().startsWith(data.getCanonicalPath() + File.separator)) {
                         Log.w(TAG, "asset unpack: rejected " + name);
                         continue;
@@ -555,13 +595,15 @@ public final class GuestLauncher {
                 : guestClass + " (" + guestPackage + ")";
     }
 
-    /** Package name of the imported APK currently hosted by this session. */
     public static String getGuestPackage() {
         return guestPackage;
     }
 
-    /** Absolute path of the imported game directory, or null before a launch. */
     public static String getGameDir() {
         return guestGameDir == null ? null : guestGameDir.getAbsolutePath();
+    }
+
+    public static boolean isCurrentGuestNative64() {
+        return guestNative64;
     }
 }

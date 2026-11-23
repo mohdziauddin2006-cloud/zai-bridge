@@ -64,15 +64,18 @@
                 android:src="@drawable/ic_tune" />
         </LinearLayout>
 
-        <!-- Detected hardware -->
+        <!-- Detected hardware (tap to open Hardware & SoC Inspector) -->
         <TextView
             android:id="@+id/tv_hardware"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginTop="14dp"
             android:background="@drawable/bg_status_pill"
+            android:clickable="true"
             android:drawableStart="@drawable/ic_shield"
             android:drawablePadding="7dp"
+            android:focusable="true"
+            android:foreground="?attr/selectableItemBackgroundBorderless"
             android:letterSpacing="0.04"
             android:paddingStart="12dp"
             android:paddingTop="7dp"
@@ -80,26 +83,100 @@
             android:paddingBottom="7dp"
             android:textColor="@color/zb_accent"
             android:textSize="10.5sp"
-            tools:text="ARM64 · Hardware GPU active" />
+            tools:text="ARM64 · Hardware GPU active · Tap to inspect" />
 
-        <!-- Library search -->
-        <androidx.appcompat.widget.AppCompatEditText
-            android:id="@+id/et_search"
+        <!-- Library search + Grid/List view toggle -->
+        <LinearLayout
             android:layout_width="match_parent"
-            android:layout_height="48dp"
+            android:layout_height="wrap_content"
             android:layout_marginTop="14dp"
-            android:background="@drawable/bg_search"
-            android:drawableStart="@drawable/ic_search"
-            android:drawablePadding="10dp"
-            android:hint="@string/search_games"
-            android:imeOptions="actionSearch"
-            android:inputType="text"
-            android:paddingStart="14dp"
-            android:paddingEnd="14dp"
-            android:singleLine="true"
-            android:textColor="@color/zb_text"
-            android:textColorHint="@color/zb_text_faint"
-            android:textSize="13.5sp" />
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <androidx.appcompat.widget.AppCompatEditText
+                android:id="@+id/et_search"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_weight="1"
+                android:background="@drawable/bg_search"
+                android:drawableStart="@drawable/ic_search"
+                android:drawablePadding="10dp"
+                android:hint="@string/search_games"
+                android:imeOptions="actionSearch"
+                android:inputType="text"
+                android:paddingStart="14dp"
+                android:paddingEnd="14dp"
+                android:singleLine="true"
+                android:textColor="@color/zb_text"
+                android:textColorHint="@color/zb_text_faint"
+                android:textSize="13.5sp" />
+
+            <ImageButton
+                android:id="@+id/btn_view_toggle"
+                android:layout_width="48dp"
+                android:layout_height="48dp"
+                android:layout_marginStart="10dp"
+                android:background="@drawable/bg_icon_button"
+                android:contentDescription="@string/toggle_layout_view"
+                android:padding="12dp"
+                android:src="@drawable/ic_view_list" />
+        </LinearLayout>
+
+        <!-- Library category filter chips -->
+        <HorizontalScrollView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:overScrollMode="never"
+            android:scrollbars="none">
+
+            <com.google.android.material.chip.ChipGroup
+                android:id="@+id/chips_library_filter"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                app:checkedChip="@id/chip_filter_all"
+                app:chipSpacingHorizontal="8dp"
+                app:selectionRequired="true"
+                app:singleLine="true"
+                app:singleSelection="true">
+
+                <com.google.android.material.chip.Chip
+                    android:id="@+id/chip_filter_all"
+                    style="@style/Widget.ZaiBridge.Chip"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:checked="true"
+                    android:text="@string/filter_all" />
+
+                <com.google.android.material.chip.Chip
+                    android:id="@+id/chip_filter_32bit"
+                    style="@style/Widget.ZaiBridge.Chip"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/filter_32bit" />
+
+                <com.google.android.material.chip.Chip
+                    android:id="@+id/chip_filter_64bit"
+                    style="@style/Widget.ZaiBridge.Chip"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/filter_64bit" />
+
+                <com.google.android.material.chip.Chip
+                    android:id="@+id/chip_filter_unity"
+                    style="@style/Widget.ZaiBridge.Chip"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/filter_unity" />
+
+                <com.google.android.material.chip.Chip
+                    android:id="@+id/chip_filter_obb"
+                    style="@style/Widget.ZaiBridge.Chip"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/filter_obb" />
+            </com.google.android.material.chip.ChipGroup>
+        </HorizontalScrollView>
 
         <!-- Storage permission banner -->
         <LinearLayout

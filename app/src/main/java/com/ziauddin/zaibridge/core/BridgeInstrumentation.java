@@ -146,6 +146,7 @@ public final class BridgeInstrumentation extends Instrumentation {
             // only observes it.
             GuestLauncher.hookSurface(activity);
             GuestLauncher.probeInput(activity);
+            GuestLauncher.attachOverlayAndRefreshHooks(activity, ctx);
         }
     }
 
@@ -218,6 +219,9 @@ public final class BridgeInstrumentation extends Instrumentation {
     @Override
     public void callActivityOnResume(Activity activity) {
         Log.i(TAG, "lifecycle onResume " + activity.getClass().getName());
+        if (isGuest(activity)) {
+            EglSwapHook.refreshNativeHooks();
+        }
         super.callActivityOnResume(activity);
     }
 

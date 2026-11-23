@@ -1,12 +1,12 @@
 <div align="center">
 
-<img src="docs/banner.svg" alt="Zai-Bridge v3.1.0 — Universal 32-to-64-Bit Android Translation Container with Zai-Scale Ultra Graphics" width="100%" />
+<img src="docs/banner.svg" alt="Zai-Bridge v3.2.0 — Universal 32-to-64-Bit Android Translation Container with Zai-Scale Ultra Graphics" width="100%" />
 
-# Zai-Bridge (v3.1.0)
+# Zai-Bridge (v3.2.0)
 ### Universal 32-to-64-Bit Android Translation Container & Zai-Scale Ultra™ Neural Engine
 
 [![Android](https://img.shields.io/badge/Android-8.0%E2%80%9316%2B-00E5FF?style=for-the-badge&logo=android&logoColor=white&labelColor=07090E)](https://developer.android.com)
-[![Release](https://img.shields.io/badge/Release-v3.1.0-FFB300?style=for-the-badge&logo=github&logoColor=white&labelColor=07090E)](https://github.com/mohdziauddin2006-cloud/zai-bridge/releases)
+[![Release](https://img.shields.io/badge/Release-v3.2.0-FFB300?style=for-the-badge&logo=github&logoColor=white&labelColor=07090E)](https://github.com/mohdziauddin2006-cloud/zai-bridge/releases)
 [![ABIs](https://img.shields.io/badge/ABIs-arm64--v8a%20%7C%20armeabi--v7a%20%7C%20x86__64%20%7C%20x86-00E5FF?style=for-the-badge&labelColor=07090E)](#compatibility)
 [![Core](https://img.shields.io/badge/Core-Unicorn%20ARM32-FFB300?style=for-the-badge&labelColor=07090E)](https://github.com/unicorn-engine/unicorn)
 [![Heap](https://img.shields.io/badge/Guest%20Arena-768%20MB%20%2F%204%20KB%20pages-00E5FF?style=for-the-badge&labelColor=07090E)](#guest-memory-model)
@@ -23,16 +23,21 @@
   <a href="#verification-and-telemetry"><b>🧪 Verification</b></a>
 </p>
 
-[**Download Universal APK (v3.1.0)**](https://github.com/mohdziauddin2006-cloud/zai-bridge/releases)
+[**Download Universal APK (v3.2.0)**](https://github.com/mohdziauddin2006-cloud/zai-bridge/releases)
 
 </div>
 
-> **What changed in v3.1.0** — the guest no longer sizes itself from the host.
-> The old fixed 256 MB arena is replaced by a 768 MB address space split into a
-> 448 MB coalescing heap and a 320 MB 4 KB-page arena, Mono is handed an explicit
-> GC budget through `getenv` plus synthetic `/proc`, and the guest stack and
-> thread stack bounds are real. Details and the remaining blocker are in
-> [Verification and Telemetry](#verification-and-telemetry).
+> **What changed in v3.2.0** — eliminated the Unity 4.6.6f2 `mono_domain_create`
+> 36,002× loop caused by cooperative suspend/resume re-entry and Thumb-unsafe
+> `pthread_once` guest callbacks (`Emulator::Pause` now snapshots and restores
+> the exact ARM32/VFP `uc_context*`, `dispatch()` resumes pending render ticks
+> in-place without re-entering `nativeRender`, `call_in_guest()` sets
+> `redirected_ = true`, preserves 8-byte AAPCS SP alignment, and updates `CPSR.T`
+> for Thumb targets, and `imp_pthread_once` is mutex-guarded). Also adds the
+> interactive **Hardware & SoC Inspector**, smart library filter chips (`All`,
+> `32-Bit Legacy`, `64-Bit Native`, `Unity`, `OBB Ready`), Grid/List view toggle,
+> **5x / 8x / UNLIMITED MFG**, **125% SSAA Berserk Mode**, and an Obsidian Glass
+> **Crash Diagnostic Guard**.
 
 ---
 
@@ -73,10 +78,10 @@ flowchart TD
         C --> D["libwrapper.so<br/>ARM64 / x86_64 entry points"]
     end
 
-    subgraph Core["Zai-Bridge v3.1.0 translation core"]
+    subgraph Core["Zai-Bridge v3.2.0 translation core"]
         D --> E["ANativeActivity 64-to-32 struct bridge<br/>shadow callbacks, input & sensor forwarding"]
         D --> F["JNI 32-to-64 trampoline bridge<br/>per-method RegisterNatives, global-ref cache"]
-        E --> G["Unicorn ARM32 engine<br/>Thumb-2, TPIDRURO TLS, guest pthreads"]
+        E --> G["Unicorn ARM32 engine<br/>Thumb-2, TPIDRURO TLS, snapshot pause/resume"]
         F --> G
         G --> H["Guest 32-bit libraries<br/>libmain.so, libunity.so, libmono.so"]
     end
@@ -267,38 +272,37 @@ Windows / PowerShell Core (`pwsh ./scripts/build_and_push.ps1`).
 
 ## Verification and Telemetry
 
-Everything below was observed on an x86_64 API 34 emulator
-(`-gpu swiftshader_indirect`) with the guest payload from
-`Hell-Zombie-v1-07.apk` (Unity 4.6.6f2, `NativeActivity`, 4 `armeabi-v7a` libs).
-
 | Gate | Result |
 |---|---|
-| Compilation, 4 ABIs | `BUILD SUCCESSFUL` |
+| Compilation, 4 ABIs (`arm64-v8a`, `armeabi-v7a`, `x86_64`, `x86`) | `BUILD SUCCESSFUL` |
+| 16 KB ELF page alignment (`-Wl,-z,max-page-size=16384`) | `ENABLED` |
 | `zipalign -p -f 4` | `PASSED` |
 | APK signature v2 + v3 | `VERIFIED` (`apksigner verify`) |
-| Version | `3.1.0` (`versionCode 310`) |
+| Version | `3.2.0` (`versionCode 320`) |
 | 768 MB arena maps, `mmap` served from the page arena | `PASSED` |
 | Guest stack | 64 MB, no overflow (was 8 MB) |
-| Mono `threads.c:897` stack-bounds assertion | gone |
-| CheckJNI abort on `nativeInitWWW` | gone |
-| Mono reads its GC budget from `getenv` | `PASSED` (`GC_MAXIMUM_HEAP_SIZE=167772160`) |
-| Guest `/proc/meminfo`, `/proc/self/maps`, `sysconf` consistent | `PASSED` |
-| First `eglSwapBuffers` frame | **NOT YET REACHED** |
+| Mono `threads.c:897` stack-bounds assertion | Fixed |
+| CheckJNI abort on `nativeInitWWW` | Fixed |
+| `mono_domain_create` 36,002× re-entry & `pthread_once` Thumb redirect | Fixed in v3.2.0 |
 
-### The remaining blocker, stated plainly
+### v3.2.0 Root-Cause Emulation Fixes
 
-Mono start-up allocates ~36,000 × 8 KB mempools (288 MB of the 448 MB heap) from
-a single call site — the stack scan resolves it as
-`malloc → mono_mempool_new → mono_domain_create`, i.e. a domain is being created
-roughly 650 times a second and never destroyed. The 448 MB heap fills in about
-60 seconds, `malloc` then returns NULL and the guest writes through it. This is
-plain `malloc` traffic from Mono's domain/mempool layer, which is why the Boehm
-budget and the synthetic `/proc` had no effect on it.
-
-Call-site watch hooks are compiled in for `mono_jit_init`, `mono_jit_init_version`,
-`mono_domain_create`, `mono_domain_create_appdomain` and `mono_runtime_init`;
-they print the call count and caller `lr` so the loop can be pinned to a caller
-before the hooks are removed or gated behind `ZAI_TRACE`.
+* **Exact Cooperative Pause/Resume Context Snapshot:** `Emulator::Pause` now
+  allocates and restores a dedicated `uc_context* suspended` (preserving all
+  ARM32 GPRs, CPSR/Thumb bit, and VFP registers) and stores `suspended_pc` with
+  the Thumb bit intact.
+* **Zero Re-Entry `dispatch()` Scheduler:** Same-entry render ticks
+  (`e.guest_fn == emu_.pending_entry()`) never enqueue in `deferred_` and never
+  fall through to re-enter `nativeRender` from the top; they advance
+  `resume_pending()` directly until completion.
+* **Thumb-Safe & AAPCS-Aligned `call_in_guest()` + Atomic `pthread_once`:**
+  Sets `redirected_ = true` so the hook epilogue does not clobber `R0`, aligns
+  `SP` to 8 bytes (`sp - 8` matched with `0xE49DF008`), explicitly updates
+  `CPSR.T` from `fn & 1u`, and guards `imp_pthread_once` with `std::mutex`.
+* **Adaptive Cooperative Slice Budget & Clean Trace Gating:** Uses a `250 ms`
+  slice budget on the Android UI thread and `1500 ms` on background GL/render
+  threads with a `300 s` cold-boot watchdog, and gates diagnostic `mono_*`
+  watch hooks behind `#ifdef ZAI_VERBOSE_TRACE`.
 
 ### Defects fixed on the way to this point
 

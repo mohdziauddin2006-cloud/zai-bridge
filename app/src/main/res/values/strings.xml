@@ -131,4 +131,11 @@
     <string name="compare_vanilla">Vanilla</string>
     <string name="compare_zaiscale">Zai-Scale</string>
     <string name="game_details">Game details</string>
+    <string name="soc_applied_toast">Tier %1$d recommended Zai-Scale Ultra profile applied globally</string>
+    <string name="filter_all">All</string>
+    <string name="filter_32bit">32-Bit Legacy</string>
+    <string name="filter_64bit">64-Bit Native</string>
+    <string name="filter_unity">Unity</string>
+    <string name="filter_obb">OBB Ready</string>
+    <string name="toggle_layout_view">Toggle grid or list view</string>
 </resources>

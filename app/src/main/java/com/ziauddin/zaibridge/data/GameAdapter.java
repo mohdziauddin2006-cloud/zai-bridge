@@ -45,11 +45,18 @@ public class GameAdapter extends RecyclerView.Adapter<GameAdapter.Holder> {
         void onDetails(Game game);
     }
 
+    public static final int FILTER_ALL = 0;
+    public static final int FILTER_32BIT = 1;
+    public static final int FILTER_64BIT = 2;
+    public static final int FILTER_UNITY = 3;
+    public static final int FILTER_OBB = 4;
+
     private final Context context;
     private final Listener listener;
     private final List<Game> all = new ArrayList<>();
     private final List<Game> visible = new ArrayList<>();
     private String query = "";
+    private int categoryFilter = FILTER_ALL;
 
     public GameAdapter(Context context, Listener listener) {
         this.context = context;
@@ -68,13 +75,45 @@ public class GameAdapter extends RecyclerView.Adapter<GameAdapter.Holder> {
         applyFilter();
     }
 
+    public void setCategoryFilter(int filter) {
+        if (categoryFilter == filter) return;
+        categoryFilter = filter;
+        applyFilter();
+    }
+
     public boolean isEmpty() {
         return visible.isEmpty();
+    }
+
+    private boolean matchesCategory(Game game) {
+        switch (categoryFilter) {
+            case FILTER_32BIT:
+                return !game.isNative64();
+            case FILTER_64BIT:
+                return game.isNative64();
+            case FILTER_UNITY: {
+                String launcher = game.launcherActivity == null ? "" : game.launcherActivity.toLowerCase(Locale.ROOT);
+                String lib = game.libName == null ? "" : game.libName.toLowerCase(Locale.ROOT);
+                String func = game.funcName == null ? "" : game.funcName.toLowerCase(Locale.ROOT);
+                if (launcher.contains("unity") || lib.contains("unity") || func.contains("unity")) {
+                    return true;
+                }
+                File dir = GameRepository.gameDir(context, game.directoryName);
+                return new File(dir, "lib/libunity.so").isFile()
+                        || new File(dir, "native64/libunity.so").isFile();
+            }
+            case FILTER_OBB:
+                return game.hasObb();
+            case FILTER_ALL:
+            default:
+                return true;
+        }
     }
 
     private void applyFilter() {
         visible.clear();
         for (Game game : all) {
+            if (!matchesCategory(game)) continue;
             if (query.isEmpty()
                     || game.label.toLowerCase(Locale.ROOT).contains(query)
                     || game.packageName.toLowerCase(Locale.ROOT).contains(query)) {

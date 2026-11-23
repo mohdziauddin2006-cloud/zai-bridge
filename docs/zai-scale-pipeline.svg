@@ -1,124 +1,63 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 420" width="1280" height="420" role="img" aria-labelledby="ptitle pdesc">
-  <title id="ptitle">Zai-Scale Ultra multi-pass pipeline</title>
-  <desc id="pdesc">Four stages: guest frame capture, YCoCg temporal super resolution with neural lighting, optical-flow unlimited multi-frame generation, and EASU/RCAS display output.</desc>
-
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 340" width="1120" height="340">
   <defs>
-    <linearGradient id="pflow" x1="0" y1="0" x2="1" y2="0">
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#07090E"/>
+      <stop offset="100%" stop-color="#0E1522"/>
+    </linearGradient>
+    <linearGradient id="cyanGrad" x1="0%" y1="0%" x2="100%" y2="0%">
       <stop offset="0%" stop-color="#00E5FF"/>
-      <stop offset="100%" stop-color="#FFB300"/>
+      <stop offset="100%" stop-color="#00B0FF"/>
     </linearGradient>
-    <linearGradient id="cardBg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#0D131E"/>
-      <stop offset="100%" stop-color="#080B12"/>
+    <linearGradient id="berserkGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#FFB300"/>
+      <stop offset="100%" stop-color="#FF2A5F"/>
     </linearGradient>
-    <radialGradient id="pglow" cx="50%" cy="50%" r="50%">
-      <stop offset="0%" stop-color="#00E5FF" stop-opacity="0.16"/>
-      <stop offset="100%" stop-color="#00E5FF" stop-opacity="0"/>
-    </radialGradient>
-    <filter id="pbloom" x="-30%" y="-30%" width="160%" height="160%">
-      <feGaussianBlur stdDeviation="3.5" result="b"/>
-      <feMerge>
-        <feMergeNode in="b"/>
-        <feMergeNode in="SourceGraphic"/>
-      </feMerge>
-    </filter>
-    <pattern id="pgrid" width="32" height="32" patternUnits="userSpaceOnUse">
-      <path d="M32 0H0V32" fill="none" stroke="#7C8CA6" stroke-opacity="0.05" stroke-width="1"/>
-    </pattern>
-    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M0 0L10 5L0 10Z" fill="#3F6277"/>
-    </marker>
   </defs>
+  <rect width="1120" height="340" rx="18" fill="url(#bg)" stroke="#1F293D" stroke-width="2"/>
+  <text x="42" y="48" fill="#E8EEF7" font-family="Inter,Segoe UI,sans-serif" font-size="22" font-weight="700" letter-spacing="1">ZAI-SCALE ULTRA™ GRAPHICS PIPELINE (v3.2.0)</text>
+  <text x="42" y="72" fill="#8A99AD" font-family="Inter,Segoe UI,sans-serif" font-size="13">Zero-Copy EGL/PLT-GOT Capture · 3-Frame Temporal Ring · Hierarchical Optical Flow · DLSS-5 / FSR · Unlimited Uncapped MFG</text>
 
-  <rect width="1280" height="420" fill="#07090E"/>
-  <rect width="1280" height="420" fill="url(#pgrid)"/>
-  <rect width="1280" height="420" fill="none" stroke="#14202E" stroke-width="2"/>
+  <!-- Stage 1 -->
+  <rect x="42" y="106" width="190" height="170" rx="14" fill="#111622" stroke="#00E5FF" stroke-width="1.5"/>
+  <text x="58" y="134" fill="#00E5FF" font-family="monospace" font-size="11" font-weight="700">STAGE 01 · CAPTURE</text>
+  <text x="58" y="158" fill="#E8EEF7" font-family="Inter,Segoe UI,sans-serif" font-size="15" font-weight="700">EGL / PLT-GOT Hook</text>
+  <text x="58" y="182" fill="#8A99AD" font-family="Inter,Segoe UI,sans-serif" font-size="11.5">• 64-bit Native &amp; 32-bit</text>
+  <text x="58" y="202" fill="#8A99AD" font-family="Inter,Segoe UI,sans-serif" font-size="11.5">• Scaled FBO (50%–125%)</text>
+  <text x="58" y="222" fill="#8A99AD" font-family="Inter,Segoe UI,sans-serif" font-size="11.5">• GLSL ES3/ES2 Patcher</text>
+  <text x="58" y="242" fill="#8A99AD" font-family="Inter,Segoe UI,sans-serif" font-size="11.5">• Vulkan FPS Telemetry</text>
 
-  <ellipse cx="640" cy="210" rx="560" ry="200" fill="url(#pglow)"/>
+  <path d="M236 191 L266 191" stroke="#00E5FF" stroke-width="2.5" marker-end="url(#arrow)"/>
 
-  <g font-family="Inter, Segoe UI, system-ui, sans-serif">
-    <text x="40" y="52" font-size="13" font-weight="700" letter-spacing="4.2" fill="#69E8F6">ZAI-SCALE ULTRA™</text>
-    <text x="40" y="80" font-size="12" letter-spacing="1.2" fill="#5E7288">MULTI-PASS NEURAL PRESENT PIPELINE — EVERY PRESET FROM FSR PERF + 2x TO UNLIMITED / BERSERK</text>
+  <!-- Stage 2 -->
+  <rect x="270" y="106" width="200" height="170" rx="14" fill="#111622" stroke="#1F293D" stroke-width="1.5"/>
+  <text x="286" y="134" fill="#00E5FF" font-family="monospace" font-size="11" font-weight="700">STAGE 02 · SPATIAL/TSR</text>
+  <text x="286" y="158" fill="#E8EEF7" font-family="Inter,Segoe UI,sans-serif" font-size="15" font-weight="700">DLSS-5 / FSR / SGSR</text>
+  <text x="286" y="182" fill="#8A99AD" font-family="Inter,Segoe UI,sans-serif" font-size="11.5">• 12-Tap Lanczos-2 EASU</text>
+  <text x="286" y="202" fill="#8A99AD" font-family="Inter,Segoe UI,sans-serif" font-size="11.5">• 3×3 YCoCg Clamp TSR</text>
+  <text x="286" y="222" fill="#8A99AD" font-family="Inter,Segoe UI,sans-serif" font-size="11.5">• 3-Frame History Ring</text>
+  <text x="286" y="242" fill="#8A99AD" font-family="Inter,Segoe UI,sans-serif" font-size="11.5">• 125% SSAA / DLAA</text>
 
-    <!-- connecting flow line -->
-    <path d="M302 200H1240" stroke="#1B2C3C" stroke-width="2"/>
-    <path d="M302 200H1250" stroke="url(#pflow)" stroke-width="2" stroke-dasharray="18 26" stroke-opacity="0.75">
-      <animate attributeName="stroke-dashoffset" from="44" to="0" dur="1.6s" repeatCount="indefinite"/>
-    </path>
-    <circle r="3.6" fill="#00E5FF" filter="url(#pbloom)">
-      <animateMotion dur="3.4s" repeatCount="indefinite" path="M302 200H1250"/>
-    </circle>
+  <path d="M474 191 L504 191" stroke="#00E5FF" stroke-width="2.5"/>
 
-    <!-- ============ stage 1 ============ -->
-    <g>
-      <rect x="40" y="104" width="262" height="208" rx="16" fill="url(#cardBg)" stroke="#1E3244" stroke-width="1.5"/>
-      <rect x="40" y="104" width="262" height="3" rx="1.5" fill="#00E5FF" fill-opacity="0.8"/>
-      <text x="62" y="136" font-size="10.5" font-weight="700" letter-spacing="2.4" fill="#00E5FF">STAGE 01</text>
-      <text x="62" y="168" font-size="18" font-weight="700" fill="#EAF2FA">Guest Frame</text>
-      <text x="62" y="190" font-size="11.5" fill="#7E93A9">32-bit &amp; native 64-bit paths</text>
-      <path d="M62 204H280" stroke="#17232F"/>
-      <text x="62" y="226" font-size="11" fill="#8FA5BB">· eglSwapBuffers intercept</text>
-      <text x="62" y="246" font-size="11" fill="#8FA5BB">· zero-copy FBO capture</text>
-      <text x="62" y="266" font-size="11" fill="#8FA5BB">· YCbCr surface normalize</text>
-      <text x="62" y="286" font-size="10.5" fill="#4E6478">source: guest render target</text>
-    </g>
+  <!-- Stage 3 -->
+  <rect x="508" y="106" width="200" height="170" rx="14" fill="#111622" stroke="#1F293D" stroke-width="1.5"/>
+  <text x="524" y="134" fill="#FFB300" font-family="monospace" font-size="11" font-weight="700">STAGE 03 · NEURAL HDR</text>
+  <text x="524" y="158" fill="#E8EEF7" font-family="Inter,Segoe UI,sans-serif" font-size="15" font-weight="700">Lighting &amp; RCAS</text>
+  <text x="524" y="182" fill="#8A99AD" font-family="Inter,Segoe UI,sans-serif" font-size="11.5">• PBR Specular Recovery</text>
+  <text x="524" y="202" fill="#8A99AD" font-family="Inter,Segoe UI,sans-serif" font-size="11.5">• ACES Filmic Contrast</text>
+  <text x="524" y="222" fill="#8A99AD" font-family="Inter,Segoe UI,sans-serif" font-size="11.5">• Adaptive RCAS Sharpen</text>
+  <text x="524" y="242" fill="#8A99AD" font-family="Inter,Segoe UI,sans-serif" font-size="11.5">• Live Split-Wipe Mask</text>
 
-    <!-- ============ stage 2 ============ -->
-    <g>
-      <rect x="340" y="104" width="262" height="208" rx="16" fill="url(#cardBg)" stroke="#1E3244" stroke-width="1.5"/>
-      <rect x="340" y="104" width="262" height="3" rx="1.5" fill="#2FD6EA" fill-opacity="0.8"/>
-      <text x="362" y="136" font-size="10.5" font-weight="700" letter-spacing="2.4" fill="#2FD6EA">STAGE 02</text>
-      <text x="362" y="168" font-size="18" font-weight="700" fill="#EAF2FA">YCoCg TSR</text>
-      <text x="362" y="190" font-size="11.5" fill="#7E93A9">+ neural lighting</text>
-      <path d="M362 204H580" stroke="#17232F"/>
-      <text x="362" y="226" font-size="11" fill="#8FA5BB">· 12-tap Lanczos-2 history</text>
-      <text x="362" y="246" font-size="11" fill="#8FA5BB">· 3x3 YCoCg clamp</text>
-      <text x="362" y="266" font-size="11" fill="#8FA5BB">· ACES tonemap + specular</text>
-      <text x="362" y="286" font-size="10.5" fill="#4E6478">upscale 67% – 125% DLAA</text>
-    </g>
+  <path d="M712 191 L742 191" stroke="#FF2A5F" stroke-width="2.5"/>
 
-    <!-- ============ stage 3 ============ -->
-    <g>
-      <rect x="640" y="104" width="262" height="208" rx="16" fill="url(#cardBg)" stroke="#1E3244" stroke-width="1.5"/>
-      <rect x="640" y="104" width="262" height="3" rx="1.5" fill="#6BE4DB" fill-opacity="0.85"/>
-      <text x="662" y="136" font-size="10.5" font-weight="700" letter-spacing="2.4" fill="#6BE4DB">STAGE 03</text>
-      <text x="662" y="168" font-size="18" font-weight="700" fill="#EAF2FA">Unlimited MFG</text>
-      <text x="662" y="190" font-size="11.5" fill="#7E93A9">optical-flow frame generator</text>
-      <path d="M662 204H880" stroke="#17232F"/>
-      <text x="662" y="226" font-size="11" fill="#8FA5BB">· 2x / 3x / 4x / 5x / 8x</text>
-      <text x="662" y="246" font-size="11" fill="#8FA5BB">· uncapped Berserk pacing</text>
-      <text x="662" y="266" font-size="11" fill="#8FA5BB">· motion-compensated blend</text>
-      <text x="662" y="286" font-size="10.5" fill="#4E6478">no refresh-rate ceiling</text>
-    </g>
+  <!-- Stage 4 -->
+  <rect x="746" y="106" width="332" height="170" rx="14" fill="#16101B" stroke="url(#berserkGrad)" stroke-width="2"/>
+  <text x="764" y="134" fill="#FF2A5F" font-family="monospace" font-size="11" font-weight="700">STAGE 04 · OPTICAL-FLOW MFG &amp; BERSERK</text>
+  <text x="764" y="158" fill="#E8EEF7" font-family="Inter,Segoe UI,sans-serif" font-size="15" font-weight="700">2x / 3x / 4x / 5x / 8x / UNLIMITED</text>
+  <text x="764" y="182" fill="#D5DFEC" font-family="Inter,Segoe UI,sans-serif" font-size="11.5">• Hierarchical Block Flow (16×16 → 8×8 → 4×4)</text>
+  <text x="764" y="202" fill="#D5DFEC" font-family="Inter,Segoe UI,sans-serif" font-size="11.5">• Bidirectional Disocclusion + HUD Edge Lock</text>
+  <text x="764" y="222" fill="#FFB300" font-family="Inter,Segoe UI,sans-serif" font-size="11.5">• Refresh Cap Bypassed (eglSwapInterval(0))</text>
+  <text x="764" y="242" fill="#00E676" font-family="Inter,Segoe UI,sans-serif" font-size="11.5">• Adreno · Mali · Immortalis · PowerVR · Xclipse</text>
 
-    <!-- ============ stage 4 ============ -->
-    <g>
-      <rect x="940" y="104" width="300" height="208" rx="16" fill="url(#cardBg)" stroke="#3A2E17" stroke-width="1.5"/>
-      <rect x="940" y="104" width="300" height="3" rx="1.5" fill="#FFB300" fill-opacity="0.85"/>
-      <text x="962" y="136" font-size="10.5" font-weight="700" letter-spacing="2.4" fill="#FFB300">STAGE 04</text>
-      <text x="962" y="168" font-size="18" font-weight="700" fill="#EAF2FA">EASU / RCAS Output</text>
-      <text x="962" y="190" font-size="11.5" fill="#7E93A9">display present</text>
-      <path d="M962 204H1220" stroke="#2B2416"/>
-      <text x="962" y="226" font-size="11" fill="#8FA5BB">· adaptive edge resample</text>
-      <text x="962" y="246" font-size="11" fill="#8FA5BB">· contrast-adaptive sharpen</text>
-      <text x="962" y="266" font-size="11" fill="#8FA5BB">· 120 Hz SurfaceView swap</text>
-      <text x="962" y="286" font-size="10.5" fill="#6B5A34">HUD + split-screen wipe overlay</text>
-    </g>
-
-    <!-- arrows -->
-    <g stroke="#3F6277" stroke-width="2" fill="none" marker-end="url(#arrow)">
-      <path d="M306 200H332"/>
-      <path d="M606 200H632"/>
-      <path d="M906 200H932"/>
-    </g>
-
-    <!-- footer -->
-    <text x="40" y="358" font-size="11" fill="#5E7288">Every stage runs on the host GPU through the EGL hook; the guest never sees the extra passes.</text>
-    <g>
-      <rect x="40" y="372" width="150" height="26" rx="13" fill="#00E5FF" fill-opacity="0.08" stroke="#00E5FF" stroke-opacity="0.4"/>
-      <text x="58" y="389" font-size="10.5" letter-spacing="1.4" fill="#9DEEF9">GLES 2.0 → 3.2 SAFE</text>
-      <rect x="202" y="372" width="164" height="26" rx="13" fill="#FFB300" fill-opacity="0.07" stroke="#FFB300" stroke-opacity="0.35"/>
-      <text x="220" y="389" font-size="10.5" letter-spacing="1.4" fill="#FFD27A">ZERO GUEST REBUILD</text>
-    </g>
-  </g>
+  <text x="42" y="314" fill="#5F6E80" font-family="monospace" font-size="11">Zai-Bridge v3.2.0 · Strictly Vendor-Neutral GLES 3.0 ES / ES 2.0 Shaders · Zero External Dependencies</text>
 </svg>

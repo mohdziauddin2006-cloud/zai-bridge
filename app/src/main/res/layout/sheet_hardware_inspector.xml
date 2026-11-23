@@ -1,0 +1,181 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.core.widget.NestedScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:background="@drawable/bg_sheet"
+    android:overScrollMode="never">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:paddingStart="22dp"
+        android:paddingTop="12dp"
+        android:paddingEnd="22dp"
+        android:paddingBottom="26dp">
+
+        <View
+            android:layout_width="38dp"
+            android:layout_height="4dp"
+            android:layout_gravity="center_horizontal"
+            android:background="@drawable/bg_handle" />
+
+        <!-- Header -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <ImageView
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:contentDescription="@null"
+                android:src="@drawable/ic_emblem" />
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="12dp"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Hardware &amp; SoC Inspector"
+                    android:textColor="@color/zb_text"
+                    android:textSize="18sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:id="@+id/tv_hw_tier_badge"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:letterSpacing="0.06"
+                    android:text="PROBING HARDWARE..."
+                    android:textAllCaps="true"
+                    android:textColor="@color/zb_accent"
+                    android:textSize="10.5sp"
+                    android:textStyle="bold" />
+            </LinearLayout>
+
+            <ImageButton
+                android:id="@+id/btn_close_hw"
+                android:layout_width="34dp"
+                android:layout_height="34dp"
+                android:background="@drawable/bg_icon_button"
+                android:contentDescription="@string/close"
+                android:padding="8dp"
+                android:src="@drawable/ic_close" />
+        </LinearLayout>
+
+        <!-- Primary Silicon Card -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:background="@drawable/bg_glass"
+            android:orientation="vertical"
+            android:padding="15dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:letterSpacing="0.12"
+                android:text="SILICON &amp; GPU ARCHITECTURE"
+                android:textAllCaps="true"
+                android:textColor="@color/zb_text_dim"
+                android:textSize="9.5sp" />
+
+            <TextView
+                android:id="@+id/tv_hw_soc"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:textColor="@color/zb_text"
+                android:textSize="15sp"
+                android:textStyle="bold"
+                tools:text="Qualcomm Snapdragon 8 Elite" />
+
+            <TextView
+                android:id="@+id/tv_hw_gpu"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="3dp"
+                android:fontFeatureSettings="tnum"
+                android:textColor="@color/zb_accent"
+                android:textSize="12sp"
+                tools:text="Adreno (TM) 830 · OpenGL ES 3.2" />
+
+            <TextView
+                android:id="@+id/tv_hw_metrics"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:fontFamily="monospace"
+                android:fontFeatureSettings="tnum"
+                android:lineSpacingExtra="4dp"
+                android:textColor="@color/zb_text_dim"
+                android:textSize="11sp"
+                tools:text="CPU: 8-core @ 4.32 GHz\nRAM: 16.0 GB · ABI: arm64-v8a\n16 KB Page Alignment: COMPLIANT\nRuntime: Native64 + Unicorn ARM32" />
+        </LinearLayout>
+
+        <!-- Recommended Profile Card -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:background="@drawable/bg_file_row"
+            android:orientation="vertical"
+            android:padding="14dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:letterSpacing="0.12"
+                android:text="RECOMMENDED ZAI-SCALE ULTRA PROFILE"
+                android:textAllCaps="true"
+                android:textColor="@color/zb_amber"
+                android:textSize="9.5sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/tv_hw_rec_profile"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="5dp"
+                android:textColor="@color/zb_text"
+                android:textSize="13sp"
+                android:textStyle="bold"
+                tools:text="DLSS-5 · 100% · 4x MFG" />
+
+            <TextView
+                android:id="@+id/tv_hw_rec_desc"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="3dp"
+                android:textColor="@color/zb_text_dim"
+                android:textSize="11sp"
+                tools:text="Ultra-flagship silicon with headroom for 4x MFG and neural specular reconstruction." />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn_hw_apply_global"
+                style="@style/Widget.ZaiBridge.Button"
+                android:layout_width="match_parent"
+                android:layout_height="46dp"
+                android:layout_marginTop="12dp"
+                android:text="Apply Recommended Globally"
+                android:textColor="@color/zb_on_accent"
+                android:textSize="12.5sp"
+                app:backgroundTint="@color/zb_accent"
+                app:cornerRadius="12dp" />
+        </LinearLayout>
+
+    </LinearLayout>
+
+</androidx.core.widget.NestedScrollView>

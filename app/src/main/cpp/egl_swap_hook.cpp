@@ -532,7 +532,7 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_ziauddin_zaibridge_core_EglSwapHook_nativeConfigure(
         JNIEnv* /*env*/, jclass /*clazz*/, jint upscaler, jint scale_percent,
         jint sharpness_percent, jint neural_percent, jint frame_gen,
-        jint temporal, jint auto_mfg, jint preset) {
+        jint temporal, jint auto_mfg, jint preset, jint berserk) {
     zai::GraphicsConfig config;
     config.preset = preset;
     config.upscaler = upscaler;
@@ -542,6 +542,7 @@ Java_com_ziauddin_zaibridge_core_EglSwapHook_nativeConfigure(
     config.frame_gen = frame_gen;
     config.temporal = temporal;
     config.auto_mfg = auto_mfg;
+    config.berserk_mode = berserk;
     zai::GpuCompositor::instance().configure(config);
 }
 

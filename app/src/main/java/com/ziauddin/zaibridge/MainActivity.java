@@ -27,6 +27,7 @@ import android.view.Window;
 import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.ImageButton;
 import android.widget.TextView;
 import android.widget.Toast;
 import android.opengl.EGL14;
@@ -36,12 +37,14 @@ import android.opengl.EGLDisplay;
 import android.opengl.EGLSurface;
 import android.opengl.GLES20;
 
+import com.google.android.material.chip.ChipGroup;
 import com.ziauddin.zaibridge.GameHostActivity;
 import com.ziauddin.zaibridge.R;
 import com.ziauddin.zaibridge.core.BridgeInstrumentation;
 import com.ziauddin.zaibridge.core.BridgeRuntime;
 import com.ziauddin.zaibridge.core.EglSwapHook;
 import com.ziauddin.zaibridge.core.GuestLauncher;
+import com.ziauddin.zaibridge.core.SoCProfiler;
 import com.ziauddin.zaibridge.data.Game;
 import com.ziauddin.zaibridge.data.GameAdapter;
 import com.ziauddin.zaibridge.data.GameRepository;
@@ -49,6 +52,7 @@ import com.ziauddin.zaibridge.data.GraphicsSettings;
 import com.ziauddin.zaibridge.proxy.ProxyGameActivity;
 import com.ziauddin.zaibridge.service.IngestionService;
 import com.ziauddin.zaibridge.ui.GameDetailsSheet;
+import com.ziauddin.zaibridge.ui.HardwareInspectorSheet;
 import com.ziauddin.zaibridge.ui.ImportSheet;
 
 import java.io.File;
@@ -70,8 +74,11 @@ public class MainActivity extends AppCompatActivity implements GameAdapter.Liste
     private static final int REQ_OBB = 0x53;
 
     private RecyclerView recycler;
+    private GridLayoutManager gridLayoutManager;
     private GameAdapter adapter;
     private EditText search;
+    private ImageButton btnViewToggle;
+    private boolean listMode = false;
     private View emptyState;
     private View permissionBanner;
     private TextView permissionText;
@@ -95,7 +102,8 @@ public class MainActivity extends AppCompatActivity implements GameAdapter.Liste
         loadingOverlay = findViewById(R.id.loading_overlay);
 
         recycler = findViewById(R.id.recycler_games);
-        recycler.setLayoutManager(new GridLayoutManager(this, spanCount()));
+        gridLayoutManager = new GridLayoutManager(this, spanCount());
+        recycler.setLayoutManager(gridLayoutManager);
         adapter = new GameAdapter(this, this);
         recycler.setAdapter(adapter);
         recycler.setItemAnimator(null);
@@ -111,6 +119,29 @@ public class MainActivity extends AppCompatActivity implements GameAdapter.Liste
             @Override public void afterTextChanged(Editable s) { }
         });
 
+        btnViewToggle = findViewById(R.id.btn_view_toggle);
+        if (btnViewToggle != null) {
+            btnViewToggle.setOnClickListener(v -> toggleLayoutMode());
+        }
+
+        ChipGroup filterChips = findViewById(R.id.chips_library_filter);
+        if (filterChips != null) {
+            filterChips.setOnCheckedStateChangeListener((group, checkedIds) -> {
+                int id = checkedIds.isEmpty() ? R.id.chip_filter_all : checkedIds.get(0);
+                if (id == R.id.chip_filter_32bit) {
+                    adapter.setCategoryFilter(GameAdapter.FILTER_32BIT);
+                } else if (id == R.id.chip_filter_64bit) {
+                    adapter.setCategoryFilter(GameAdapter.FILTER_64BIT);
+                } else if (id == R.id.chip_filter_unity) {
+                    adapter.setCategoryFilter(GameAdapter.FILTER_UNITY);
+                } else if (id == R.id.chip_filter_obb) {
+                    adapter.setCategoryFilter(GameAdapter.FILTER_OBB);
+                } else {
+                    adapter.setCategoryFilter(GameAdapter.FILTER_ALL);
+                }
+            });
+        }
+
         emptyState = findViewById(R.id.empty_state);
         permissionBanner = findViewById(R.id.banner_permission);
         permissionText = findViewById(R.id.tv_permission);
@@ -124,7 +155,18 @@ public class MainActivity extends AppCompatActivity implements GameAdapter.Liste
 
         TextView hardware = findViewById(R.id.tv_hardware);
         hardware.setText(getString(R.string.hardware_active, abiLabel()));
+        hardware.setOnClickListener(v -> HardwareInspectorSheet.show(this, this::refreshGames));
         probeHardwareGpu(hardware);
+    }
+
+    private void toggleLayoutMode() {
+        listMode = !listMode;
+        if (gridLayoutManager != null) {
+            gridLayoutManager.setSpanCount(listMode ? 1 : spanCount());
+        }
+        if (btnViewToggle != null) {
+            btnViewToggle.setImageResource(listMode ? R.drawable.ic_view_grid : R.drawable.ic_view_list);
+        }
     }
 
     @Override
@@ -289,11 +331,21 @@ public class MainActivity extends AppCompatActivity implements GameAdapter.Liste
                 Log.w(TAG, "Hardware GPU probe failed", t);
             }
 
+            SoCProfiler.Profile profile = null;
+            try {
+                profile = SoCProfiler.get(MainActivity.this);
+            } catch (Throwable ignored) {
+            }
+
             final String gpu = rendererName;
+            final SoCProfiler.Profile resolvedProfile = profile;
             mainHandler.post(() -> {
                 if (isFinishing() || isDestroyed()) return;
                 String abi = abiLabel();
-                if (gpu != null && !gpu.isEmpty()) {
+                if (resolvedProfile != null) {
+                    String gpuLabel = (gpu != null && !gpu.isEmpty()) ? gpu : resolvedProfile.gpuName;
+                    hardware.setText("T" + resolvedProfile.tier + " \u2022 " + resolvedProfile.socName + " \u2022 " + gpuLabel);
+                } else if (gpu != null && !gpu.isEmpty()) {
                     hardware.setText(abi + " \u2022 " + gpu);
                 } else {
                     hardware.setText(getString(R.string.hardware_active, abi));

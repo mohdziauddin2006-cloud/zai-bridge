@@ -30,12 +30,14 @@ enum GraphicsUpscaler : int {
 };
 
 enum GraphicsPreset : int {
-    kPresetCustom = 0,
-    kPresetOff = 1,
-    kPresetFsrPerformance2x = 2,
-    kPresetFsrQuality2x = 3,
-    kPresetDlssUltra3x = 4,
-    kPresetDlssOverdrive4x = 5,
+    kPresetCustom = -1,
+    kPresetOff = 0,
+    kPresetFsrPerformance2x = 1,
+    kPresetFsrQuality2x = 2,
+    kPresetDlssUltra3x = 3,
+    kPresetDlssOverdrive4x = 4,
+    kPresetBerserkGod = 5,
+    kPresetSgsrBattery = 6,
 };
 
 enum GraphicsFrameGen : int {
@@ -54,13 +56,14 @@ struct GraphicsConfig {
     int scale_percent = 100;       // 40-125: <100 upscales, >100 supersamples (DLAA)
     int sharpness_percent = 50;    // RCAS / directional sharpen
     int neural_percent = 0;        // lighting + micro-detail reconstruction
-    int frame_gen = kFrameGenOff;  // 0 | 2 | 3 | 4
+    int frame_gen = kFrameGenOff;  // 0 | 2 | 3 | 4 | 5 | 8 | -1 (UNLIMITED)
     int temporal = 0;              // TSR accumulation
     int auto_mfg = 0;              // scale generation down when already fast
+    int berserk_mode = 0;          // bypass all auto-MFG limits + zero-sleep pacing
 
     bool effects() const {
         return upscaler != kUpscalerOff || frame_gen != kFrameGenOff ||
-               neural_percent > 0;
+               neural_percent > 0 || scale_percent != 100 || berserk_mode != 0;
     }
 };
 
@@ -76,6 +79,7 @@ public:
 
     bool active() const;
     bool internal_scaling() const;
+    bool is_uncapped() const;               // true in UNLIMITED MFG or Berserk Mode
     int scale_percent() const;              // render target size relative to the panel
     bool guest_drew_internal() const;       // guest bound the scaled target, not the window
     int synthetic_count() const;            // frames to emit before the real one

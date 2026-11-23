@@ -15,7 +15,7 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $RepoRoot
 
 Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host " Zai-Bridge v3.0.0 — Automated Build, Sign & Push Pipeline" -ForegroundColor Cyan
+Write-Host " Zai-Bridge v3.2.0 — Automated Build, Sign & Push Pipeline" -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 
 # 1. Locate Android SDK Build-Tools (zipalign & apksigner)
@@ -84,7 +84,7 @@ if (Test-Path (Join-Path $RepoRoot ".git")) {
     & git add -A
     $GitStatus = & git status --porcelain
     if ($GitStatus) {
-        & git commit -m "release(v3.0.0): complete Zai-Bridge universal 32-to-64-bit container & Zai-Scale Ultra engine"
+        & git commit -m "release(v3.2.0): Zai-Bridge universal 32/64-bit container, Unity/Mono suspend fix & Zai-Scale Ultra"
         Write-Host "`n[4/4] Pushing to origin/main..." -ForegroundColor Yellow
         & git push origin HEAD:main
     } else {

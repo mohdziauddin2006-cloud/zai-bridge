@@ -538,6 +538,7 @@ struct GpuCompositor::Impl {
     std::atomic<int> frame_gen{kFrameGenOff};
     std::atomic<int> temporal{0};
     std::atomic<int> auto_mfg{0};
+    std::atomic<int> berserk{0};
     std::atomic<int> compare_milli{0};
     std::atomic<uint64_t> epoch{1};
     std::atomic<bool> internal_bound{false};
@@ -552,6 +553,7 @@ struct GpuCompositor::Impl {
         c.frame_gen = frame_gen.load();
         c.temporal = temporal.load();
         c.auto_mfg = auto_mfg.load();
+        c.berserk_mode = berserk.load();
         return c;
     }
 
@@ -1153,7 +1155,7 @@ struct GpuCompositor::Impl {
         if (requested == kFrameGenUnlimited) return budget_extras();
         if (requested < 2) return 0;
         const int extras = std::min(requested - 1, kMaxGeneratedFrames);
-        if (auto_mfg.load() == 0) return extras;
+        if (berserk.load() != 0 || auto_mfg.load() == 0) return extras;
         return clamp_int(extras_latched, 0, extras);
     }
 };
@@ -1185,13 +1187,15 @@ void GpuCompositor::configure(const GraphicsConfig& config) {
                            gen == 4 || gen == 5 || gen == 8;
     d.frame_gen.store(gen_valid ? gen : 0);
     d.temporal.store(config.temporal != 0 ? 1 : 0);
-    d.auto_mfg.store(config.auto_mfg != 0 ? 1 : 0);
+    d.berserk.store(config.berserk_mode != 0 ? 1 : 0);
+    d.auto_mfg.store((config.auto_mfg != 0 && config.berserk_mode == 0) ? 1 : 0);
 
     const bool changed = old.upscaler != d.upscaler.load() ||
                          old.scale_percent != d.scale.load() ||
                          old.frame_gen != d.frame_gen.load() ||
                          old.temporal != d.temporal.load() ||
-                         old.neural_percent != d.neural.load();
+                         old.neural_percent != d.neural.load() ||
+                         old.berserk_mode != d.berserk.load();
     if (changed) {
         d.tsr_valid = false;
         d.ring_count = 0;
@@ -1205,9 +1209,10 @@ void GpuCompositor::configure(const GraphicsConfig& config) {
                                : (d.frame_gen.load() >= 2 ? d.frame_gen.load() - 1 : 0);
     d.frames_fast = 0;
     d.frames_slow = 0;
-    LOGI("Zai-Scale: preset=%d up=%d scale=%d%% sharp=%d%% neural=%d%% gen=%dx temporal=%d auto=%d",
+    LOGI("Zai-Scale: preset=%d up=%d scale=%d%% sharp=%d%% neural=%d%% gen=%dx temporal=%d auto=%d berserk=%d",
          d.preset.load(), d.upscaler.load(), d.scale.load(), d.sharpness.load(),
-         d.neural.load(), d.frame_gen.load(), d.temporal.load(), d.auto_mfg.load());
+         d.neural.load(), d.frame_gen.load(), d.temporal.load(), d.auto_mfg.load(),
+         d.berserk.load());
 }
 
 GraphicsConfig GpuCompositor::config() const { return impl_->snapshot(); }
@@ -1231,6 +1236,10 @@ bool GpuCompositor::internal_scaling() const {
     // Anything other than 1:1 needs the offscreen target: below 100% it is an
     // upscale, above it is DLAA super-sampling.
     return c.upscaler != kUpscalerOff && c.scale_percent != 100;
+}
+
+bool GpuCompositor::is_uncapped() const {
+    return impl_->frame_gen.load() == kFrameGenUnlimited || impl_->berserk.load() != 0;
 }
 
 int GpuCompositor::scale_percent() const { return impl_->scale.load(); }
@@ -1407,6 +1416,8 @@ void GpuCompositor::present_current() {
 
 void GpuCompositor::wait_subframe() {
     Impl& d = *impl_;
+    // True uncapped delivery in UNLIMITED MFG or Berserk Mode: 0 ms sleep.
+    if (is_uncapped()) return;
     const int extras = d.effective_extras();
     if (extras <= 0) return;
     double slice = d.interval_ms / static_cast<double>(extras + 1);
@@ -1452,7 +1463,7 @@ std::string GpuCompositor::stats() const {
     char buf[768];
     std::snprintf(buf, sizeof buf,
                   "mode=%s preset=%d scale=%d%% sharpness=%d%% neural=%d%% "
-                  "frameGen=%s temporal=%d autoMfg=%d compare=%.2f source=%dx%d "
+                  "frameGen=%s temporal=%d autoMfg=%d berserk=%d compare=%.2f source=%dx%d "
                   "display=%dx%d guestFrames=%llu outputFrames=%llu generated=%llu "
                   "guestFps=%.1f outputFps=%.1f frameMs=%.2f shaderFailures=%d gl=%s",
                   mode, c.preset, c.scale_percent, c.sharpness_percent,
@@ -1461,7 +1472,7 @@ std::string GpuCompositor::stats() const {
                       : (c.frame_gen >= 2 ? (c.frame_gen == 2 ? "2x" :
                          c.frame_gen == 3 ? "3x" : c.frame_gen == 4 ? "4x" :
                          c.frame_gen == 5 ? "5x" : "8x") : "off"),
-                  c.temporal, c.auto_mfg,
+                  c.temporal, c.auto_mfg, c.berserk_mode,
                   static_cast<double>(d.compare_milli.load()) / 1000.0,
                   d.source_w, d.source_h, d.display_w, d.display_h,
                   static_cast<unsigned long long>(d.guest_frames),
