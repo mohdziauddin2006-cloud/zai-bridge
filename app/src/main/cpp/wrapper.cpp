@@ -196,18 +196,30 @@ std::string g_last_import;
 // ---------------------------------------------------------------------------
 // Guest address space
 // ---------------------------------------------------------------------------
-// 768 MB guest arena: 0x50000000 - 0x80000000. Unity 4.x's Boehm GC keeps a
-// 160 MB max heap, but its chunk allocator does `mmap`/`munmap` for every
-// collected block. A 256 MB bump arena leaked that address space until
-// `guest heap exhausted` was hit ~22k log lines into managed initialisation,
-// so the arena is split in two:
+// 1.25 GB guest arena: 0x50000000 - 0xA0000000, directly below the guest
+// stack at 0xAFC00000. Unity 4.x's Boehm GC keeps a 160 MB max heap, but its
+// chunk allocator does `mmap`/`munmap` for every collected block. A 256 MB bump
+// arena leaked that address space until `guest heap exhausted` was hit ~22k log
+// lines into managed initialisation, so the arena is split in two:
 //   * a coalescing malloc heap (bottom, grows up), and
 //   * a 4 KB page-granular mmap arena (top, grows down via a free-page bitmap)
 // `munmap` returns pages to the bitmap and the next `mmap` reuses them zeroed.
+//
+// The malloc half is 1 GB because Unity 4.6's Mono JIT permanently retains one
+// ~8 KB mempool per compiled method (MonoJitInfo). Hell Zombie compiles 36,002
+// of them during cold boot, i.e. ~281 MB of live JIT bookkeeping before the
+// engine has drawn anything; with a 448 MB malloc arena the guest died mid-boot
+// with `guest heap exhausted` and then faulted on the NULL that memalign
+// returned. Reservation is virtual (overcommit), so only touched pages cost RAM.
 constexpr uint32_t kHeapBase   = 0x50000000u;
-constexpr size_t   kHeapSize   = 768u * 1024u * 1024u;
-constexpr size_t   kMallocArenaSize = 448u * 1024u * 1024u;
-constexpr uint32_t kPageArenaBase   = kHeapBase + static_cast<uint32_t>(kMallocArenaSize);
+constexpr size_t   kHeapSize   = 1280u * 1024u * 1024u;
+constexpr size_t   kMallocArenaSize = 1024u * 1024u * 1024u;
+// The mmap arena is deliberately *not* adjacent to the malloc heap: the
+// payload's position-independent PLT stubs compute their GOT slot from the PC
+// with `add r12, pc, #0x300000` / `add r12, r12, #0x98000000`, which lands near
+// 0x9B300000. With the arena at 0x90000000 an anonymous chunk could be handed
+// out on top of one of those slots, and the import then jumped into GC data.
+constexpr uint32_t kPageArenaBase   = 0xC0000000u;
 constexpr size_t   kPageArenaSize   = kHeapSize - kMallocArenaSize;
 
 // Library images sit below the arena in a dedicated 512 MB window.
@@ -542,13 +554,14 @@ public:
         munmap(probe, kPageSize);
 
         if (!map(kHeapBase, kHeapSize, "heap") ||
+            !map(kPageArenaBase, kPageArenaSize, "page arena") ||
             !map(kStackTop - kStackSize, kStackSize, "stack") ||
             !map(kStubBase, kStubRegionSz, "trap page")) {
             return false;
         }
 
-        // Page bitmap for the mmap half of the arena. 320 MB is 81,920 pages,
-        // i.e. a 10 KB bitmap.
+        // Page bitmap for the mmap half of the arena. 256 MB is 65,536 pages,
+        // i.e. an 8 KB bitmap.
         page_count_ = kPageArenaSize / kPageSize;
         page_bitmap_.assign((page_count_ + 63) / 64, 0);
         page_prot_.assign(page_count_, 0);
@@ -749,7 +762,7 @@ public:
         }
     }
 
-    // Guest malloc heap: 448 MB at the bottom of the arena, a bump cursor plus
+    // Guest malloc heap: 1 GB at the bottom of the arena, a bump cursor plus
     // a first-fit free list that coalesces in both directions. A pure bump
     // allocator survives startup but dies a few thousand frames into a render
     // loop, because games churn the allocator constantly and a host pointer can
@@ -961,7 +974,7 @@ public:
         }
         reclaimed_bytes_ += pages * kPageSize;
         // Hand the physical pages back to the kernel as well; the guest's
-        // 768 MB arena is reserved virtual space, not committed RAM.
+        // 1.25 GB arena is reserved virtual space, not committed RAM.
         uint8_t* hp = host_ptr_at(addr);
         if (hp) ::madvise(hp, pages * kPageSize, MADV_DONTNEED);
         if (first < page_hint_) page_hint_ = first;
@@ -1418,6 +1431,14 @@ private:
                 ret = 0;
                 break;
             case 0x0F0002:   // __ARM_NR_cacheflush
+                // Mono's JIT writes managed code and then flushes it. Unicorn
+                // keeps translated blocks per guest address, so without this
+                // the engine keeps running the *previous* contents of the
+                // page (or fails to decode it at all).
+                if (uc_) uc_ctl_remove_cache(uc_, static_cast<uint64_t>(a0),
+                                             static_cast<uint64_t>(a0) + a1);
+                ret = 0;
+                break;
             case 125:        // mprotect
             case 91:         // munmap
             case 215:        // munmap2
@@ -1602,7 +1623,7 @@ private:
     size_t     heap_peak_bytes_ = 0;
     unsigned long long class_allocs_[7] = {0, 0, 0, 0, 0, 0, 0};
     unsigned long long class_bytes_[7] = {0, 0, 0, 0, 0, 0, 0};
-    uint8_t*   heap_host_ = nullptr;     // host base of the 768 MB arena
+    uint8_t*   heap_host_ = nullptr;     // host base of the 1.25 GB arena
     std::vector<GuestStack> guest_stacks_;
     std::mutex guest_stacks_mtx_;
     std::vector<uint64_t> page_bitmap_;  // 1 bit per 4 KB page of the mmap arena
@@ -3024,9 +3045,8 @@ private:
         }
 
         uc_engine* uc = current_uc();
-        if (uc) {
-            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
-        }
+        if (!uc) return;
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
         // Leave PC on the stub's `bx lr`. Executing the real branch is what
         // preserves ARM/Thumb interworking: writing PC from the hook clears
         // CPSR.T, so the next Thumb opcode decodes as an ARM coprocessor
@@ -4336,6 +4356,7 @@ public:
         const uint32_t out = arg(0);
         const uint32_t key = next_tls_key_++;
         if (out) emu_.write_u32(out, key);
+        if (key <= 8) LOGI("pthread_key_create -> key %u (destructor %08x)", key, arg(1));
         return 0;
     }
 
@@ -4356,7 +4377,8 @@ public:
     uint32_t imp_pthread_getspecific() {
         const TlsMap& values = tls_values();
         auto it = values.find(arg(0));
-        return it == values.end() ? 0 : it->second;
+        const uint32_t v = it == values.end() ? 0 : it->second;
+        return v;
     }
 
     uint32_t imp_pthread_setspecific() {
@@ -4379,6 +4401,23 @@ public:
     uint32_t imp_clock_gettime() {
         struct timespec ts{};
         ::clock_gettime(static_cast<clockid_t>(arg(0)), &ts);
+        const uint32_t out = arg(1);
+        if (out) {
+            emu_.write_u32(out + 0, static_cast<uint32_t>(ts.tv_sec));
+            emu_.write_u32(out + 4, static_cast<uint32_t>(ts.tv_nsec));
+        }
+        return 0;
+    }
+
+    // int clock_getres(clockid_t id, struct timespec *res): the guest uses the
+    // resolution to size its timer slack, and left uninitialised it read a
+    // garbage resolution out of the caller's stack slot.
+    uint32_t imp_clock_getres() {
+        struct timespec ts{};
+        if (::clock_getres(static_cast<clockid_t>(arg(0)), &ts) != 0) {
+            ts.tv_sec = 0;
+            ts.tv_nsec = 1000000;
+        }
         const uint32_t out = arg(1);
         if (out) {
             emu_.write_u32(out + 0, static_cast<uint32_t>(ts.tv_sec));
@@ -7535,6 +7574,7 @@ public:
             const size_t rounded = (size + page - 1) / page * page;
             return imp_memalign_value(page, rounded ? rounded : page);
         };
+        import_handlers_["bsearch"] = [this] { return imp_bsearch(); };
         import_handlers_["memmem"] = [this] { return imp_memmem(); };
         import_handlers_["vsnprintf"] = [this] { return imp_vsnprintf(); };
         import_handlers_["vsprintf"] = [this] {
@@ -7636,6 +7676,39 @@ public:
             const std::string joined = base + add;
             emu_.write(dst, joined.c_str(), joined.size() + 1);
             return dst;
+        };
+        // size_t strlcpy(char *dst, const char *src, size_t size)
+        // Returns the source length and always NUL-terminates. Mono builds
+        // assembly names with it; reporting it unimplemented left the name
+        // buffer untouched, so a partially filled AssemblyName was used to
+        // identify an image and the wrong one was loaded.
+        import_handlers_["strlcpy"] = [this] {
+            const uint32_t dst = arg(0), src = arg(1);
+            const size_t size = arg(2);
+            const size_t len = guest_strlen(src);
+            if (size > 0) {
+                const size_t copy = std::min(len, size - 1);
+                std::vector<uint8_t> buf(copy + 1, 0);
+                if (copy && !emu_.read(src, buf.data(), copy)) return static_cast<uint32_t>(len);
+                emu_.write(dst, buf.data(), buf.size());
+            }
+            return static_cast<uint32_t>(len);
+        };
+        // size_t strlcat(char *dst, const char *src, size_t size)
+        import_handlers_["strlcat"] = [this] {
+            const uint32_t dst = arg(0), src = arg(1);
+            const size_t size = arg(2);
+            const size_t dlen = guest_strlen(dst);
+            const size_t slen = guest_strlen(src);
+            if (size > dlen + 1) {
+                const size_t room = size - dlen - 1;
+                const size_t copy = std::min(slen, room);
+                std::vector<uint8_t> buf(copy + 1, 0);
+                if (copy && !emu_.read(src, buf.data(), copy))
+                    return static_cast<uint32_t>(dlen + slen);
+                emu_.write(dst + static_cast<uint32_t>(dlen), buf.data(), buf.size());
+            }
+            return static_cast<uint32_t>(dlen + slen);
         };
         import_handlers_["strchr"] = [this] {
             const uint32_t s = arg(0);
@@ -8196,6 +8269,16 @@ public:
         // ---------------- time / scheduling -----------------------------
         import_handlers_["gettimeofday"] = [this] { return imp_gettimeofday(); };
         import_handlers_["clock_gettime"] = [this] { return imp_clock_gettime(); };
+        import_handlers_["clock_getres"] = [this] { return imp_clock_getres(); };
+        // gcc emits __clear_cache() after Mono's JIT emits a method body.
+        import_handlers_["__clear_cache"] = [this] {
+            const uint32_t begin = arg(0), end = arg(1);
+            if (emu_.uc() && end > begin) {
+                uc_ctl_remove_cache(emu_.uc(), static_cast<uint64_t>(begin),
+                                    static_cast<uint64_t>(end));
+            }
+            return 0u;
+        };
         // POSIX 48-bit LCG. The engine seeds the course randomiser with
         // srand48 and reads lrand48, so "return 0" would pin every game to the
         // same level order.
@@ -9226,6 +9309,32 @@ public:
         return p;
     }
 
+    // void *bsearch(const void *key, const void *base, size_t nmemb,
+    //               size_t size, int (*compar)(const void *, const void *))
+    // Mono's metadata loader binary-searches the generic-parameter table while
+    // initialising a class. Reporting it as unimplemented returned NULL for
+    // every lookup, so a class that really has generic parameters was built
+    // with none and the class failed to load. The comparator is guest code, so
+    // it is invoked through the reentrant guest-call path.
+    uint32_t imp_bsearch() {
+        const uint32_t key = arg(0);
+        const uint32_t base = arg(1);
+        const uint32_t nmemb = arg(2);
+        const uint32_t size = arg(3);
+        const uint32_t compar = stacked_arg(4);
+        if (!base || !size || !compar) return 0;
+        uint32_t lo = 0, hi = nmemb;
+        while (lo < hi) {
+            const uint32_t mid = lo + (hi - lo) / 2;
+            uint32_t r = 0;
+            if (!call_guest(compar, {key, base + mid * size}, r, "bsearch")) return 0;
+            const int32_t cmp = static_cast<int32_t>(r);
+            if (cmp == 0) return base + mid * size;
+            if (cmp < 0) hi = mid; else lo = mid + 1;
+        }
+        return 0;
+    }
+
     // memmem() has no bionic NDK equivalent to delegate to, and returning NULL
     // makes mono's string search silently miss every match.
     uint32_t imp_memmem() {
@@ -10079,7 +10188,7 @@ public:
         // cleanly even on slow software-rendered emulators or low-end phones.
         const bool is_main_thread =
                 (static_cast<pid_t>(::syscall(__NR_gettid)) == ::getpid());
-        return is_main_thread ? kMainThreadBudgetMs : kRenderThreadBudgetMs;
+        return is_main_thread ? kMainThreadBudgetMs : 0;
     }
 
     // A call that arrived while the guest was still inside a suspended one.
@@ -10183,6 +10292,7 @@ public:
     std::unordered_set<uint32_t> called_onloads_;
     std::vector<JavaExport> pending_;   // Java_* exports awaiting their class
     std::unordered_map<uint32_t, int> native_calls_;   // trampoline id -> count
+
 };
 
 // JNIEnv / JavaVM slot names, for diagnostics only.

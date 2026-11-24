@@ -45,23 +45,31 @@
 
 <div align="center">
 
-| **Launcher (design preview)** | **Import sheet (design preview)** |
+| **Launcher — live emulator capture** | **Hardware & SoC Inspector — live emulator capture** |
 |:---:|:---:|
-| <img src="docs/screenshots/launcher_home.png" width="420" alt="Zai-Bridge Launcher Home" /> | <img src="docs/screenshots/import_sheet.png" width="420" alt="Zai-Bridge Import Sheet" /> |
-| *Obsidian/neon home: GPU pill, game cards, 120 FPS MFG chip, Import Game action* | *APK + OBB selection with the Unicorn engine breakdown and staging bar* |
+| <img src="docs/screenshots/launcher_home.png" width="420" alt="Zai-Bridge Launcher Home" /> | <img src="docs/screenshots/hardware_inspector.png" width="420" alt="Zai-Bridge Hardware and SoC Inspector" /> |
+| *Obsidian/neon home: live GPU pill, staged Hell Zombie card, filter chips, Import Game action* | *Tier, GL string, ABI, 16 KB page-alignment status and the recommended Zai-Scale profile* |
 
-| **Zai-Scale Ultra settings sheet** | **HUD + telemetry overlay (design preview)** |
+| **Import sheet (design preview)** | **Zai-Scale Ultra settings (design preview)** |
 |:---:|:---:|
-| <img src="docs/screenshots/graphics_presets.png" width="420" alt="Zai-Scale Ultra Presets" /> | <img src="docs/screenshots/ingame_hud.png" width="480" alt="Zai-Bridge In-Game HUD" /> |
-| *MFG, TSR, PBR, HDR, micro-pacing and VSync-lock toggles with ULTRA / PERF / BATTERY tiers* | *Layout of the in-game HUD, speed readout and the Before/After wipe* |
+| <img src="docs/screenshots/import_sheet.png" width="420" alt="Zai-Bridge Import Sheet" /> | <img src="docs/screenshots/graphics_presets.png" width="420" alt="Zai-Scale Ultra Presets" /> |
+| *APK + OBB selection with the Unicorn engine breakdown and staging bar* | *MFG, TSR, PBR, HDR, micro-pacing and VSync-lock toggles with ULTRA / PERF / BATTERY tiers* |
+
+| **HUD + telemetry overlay (design preview)** |
+|:---:|
+| <img src="docs/screenshots/ingame_hud.png" width="480" alt="Zai-Bridge In-Game HUD" /> |
+| *Layout of the in-game HUD, speed readout and the Before/After wipe* |
 
 </div>
 
-> **These are interface design previews, not device captures.** The GPU string
-> (`PowerVR BXM-8-256`), the installed-games list, the `.apk` size and the
-> telemetry counters in them — including "384 MB Allocated / Zero Leaks" — are
-> illustrative artwork, not measurements. The real numbers from the v3.1.0 run
-> are in [Verification and Telemetry](#verification-and-telemetry).
+> **The launcher and inspector captures are real screenshots** taken on the
+> `ZaiBridge_X86_64` emulator (Android 14, API 34) running the signed
+> `arm64-v8a`/`x86_64` build — hence the `ranchu` / SwiftShader GL string.
+> The import sheet, Zai-Scale settings and HUD panels are still interface
+> design previews: the `PowerVR BXM-8-256` GPU string and the telemetry
+> counters in them, including "384 MB Allocated / Zero Leaks", are
+> illustrative artwork, not measurements. The measured numbers are in
+> [Verification and Telemetry](#verification-and-telemetry).
 >
 > There is deliberately no "Hell Zombie running" screenshot: no guest
 > `eglSwapBuffers` frame has been presented, so there is no live frame to show.
@@ -279,11 +287,25 @@ Windows / PowerShell Core (`pwsh ./scripts/build_and_push.ps1`).
 | `zipalign -p -f 4` | `PASSED` |
 | APK signature v2 + v3 | `VERIFIED` (`apksigner verify`) |
 | Version | `3.2.0` (`versionCode 320`) |
-| 768 MB arena maps, `mmap` served from the page arena | `PASSED` |
+| Guest arena, `mmap` served from the page arena | `PASSED` |
 | Guest stack | 64 MB, no overflow (was 8 MB) |
 | Mono `threads.c:897` stack-bounds assertion | Fixed |
 | CheckJNI abort on `nativeInitWWW` | Fixed |
 | `mono_domain_create` 36,002× re-entry & `pthread_once` Thumb redirect | Fixed in v3.2.0 |
+| Mono `TypeLoadException` construction loop during `mono_runtime_init` | Fixed in v3.2.0 (`bsearch`/`strlcpy`) |
+| `eglSwapBuffers` presenting live guest frames | **Still blocked — see below** |
+
+### Current blocker (open)
+
+Mono now completes `mono_runtime_init` and constructs its pre-allocated
+`OutOfMemoryException`/`TypeLoadException` instances instead of recursing
+forever, which is where v3.2.0 previously stalled. Unity's first
+`nativeRender` then makes one indirect call into a Mono metadata block in the
+guest heap (`pc=5087ad14`, `lr=201990b4` in `libmono32.so`, i.e. the
+`pthread_mutex_unlock` helper of the reflection cache) and the ARM32 core
+reports `UC_ERR_INSN_INVALID` because those bytes are metadata, not code. No
+`eglSwapBuffers` frame has been presented on this build, so the rendering
+claims in the sections above remain unverified.
 
 ### v3.2.0 Root-Cause Emulation Fixes
 
@@ -299,6 +321,17 @@ Windows / PowerShell Core (`pwsh ./scripts/build_and_push.ps1`).
   Sets `redirected_ = true` so the hook epilogue does not clobber `R0`, aligns
   `SP` to 8 bytes (`sp - 8` matched with `0xE49DF008`), explicitly updates
   `CPSR.T` from `fn & 1u`, and guards `imp_pthread_once` with `std::mutex`.
+* **Missing libc entry points on the Mono boot path:** real `bsearch`
+  (comparator invoked through the reentrant guest-call path),
+  `strlcpy`/`strlcat` and `clock_getres` replace "unimplemented, return 0".
+  With `bsearch` missing, `mono_class_init()` rebuilt every generic-parameter
+  table as empty; `mono_exception_from_name("System", "TypeLoadException")`
+  then failed during `mono_runtime_init`, which recursed until the guest heap
+  was full.
+* **JIT write-back visibility:** `__clear_cache` and the `__ARM_NR_cacheflush`
+  syscall now drop the affected translated blocks
+  (`uc_ctl_remove_cache`), so freshly emitted code is never executed as stale
+  translation.
 * **Adaptive Cooperative Slice Budget & Clean Trace Gating:** Uses a `250 ms`
   slice budget on the Android UI thread and `1500 ms` on background GL/render
   threads with a `300 s` cold-boot watchdog, and gates diagnostic `mono_*`
