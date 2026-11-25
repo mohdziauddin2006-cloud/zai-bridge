@@ -596,6 +596,24 @@ public:
             LOGW("uc_hook_add(mem faults) failed: %s", uc_strerror(err));
         }
 
+#ifdef ZAI_VERBOSE_TRACE
+        err = uc_hook_add(uc_, &code_guard_, UC_HOOK_BLOCK,
+                          reinterpret_cast<void*>(&Emulator::code_guard_thunk),
+                          this, 1, 0);
+        if (err != UC_ERR_OK) {
+            LOGW("uc_hook_add(code guard) failed: %s", uc_strerror(err));
+        } else {
+            LOGI("trace: wild-branch guard armed (images 0x20000000+, stubs 0x40000000+, "
+                 "exec arena 0xc0000000+)");
+        }
+        // libmono's .got lands at bias+0x3ad000; watch it for clobbering.
+        err = uc_hook_add(uc_, &got_watch_, UC_HOOK_MEM_WRITE,
+                          reinterpret_cast<void*>(&Emulator::got_watch_thunk), this,
+                          static_cast<uint64_t>(kImageBase0 + 0x3ad000u),
+                          static_cast<uint64_t>(kImageBase0 + 0x3ae000u));
+        if (err == UC_ERR_OK) LOGI("trace: GOT write watch armed");
+#endif
+
         // ARM32 CP15 TPIDRURO TLS initialisation
         uint32_t main_tls = alloc(64 * 4, 8);
         if (main_tls) {
@@ -607,6 +625,113 @@ public:
         LOGI("uc_open(UC_ARCH_ARM, ARM|THUMB) ok - guest heap @ %08x, stack @ %08x",
              kHeapBase, kStackTop - static_cast<uint32_t>(kStackSize));
         return true;
+    }
+
+    // Hex dump of a guest window, used to tell code from data when a branch
+    // lands somewhere unexpected (Thumb payload, ARM JIT, zeros or garbage).
+    void log_guest_window(const char* tag, uint32_t center, uint32_t before,
+                          uint32_t after) {
+        const uint32_t start = center - before;
+        const uint32_t end = center + after;
+        char line[256];
+        for (uint32_t p = start; p < end; p += 16) {
+            int n = std::snprintf(line, sizeof line, "%s %08x:", tag, p);
+            for (uint32_t q = p; q < p + 16 && q < end; ++q) {
+                uint8_t b = 0;
+                if (!read(q, &b, 1)) b = 0xEE;
+                n += std::snprintf(line + n, sizeof line - static_cast<size_t>(n),
+                                   " %02x", b);
+                if (q + 1 == center) {
+                    n += std::snprintf(line + n, sizeof line - static_cast<size_t>(n),
+                                       " <");
+                }
+            }
+            if (n > 0 && static_cast<size_t>(n) < sizeof line) {
+                LOGE("%s", line);
+            }
+        }
+    }
+
+    // A guest may only execute from a library image, the stub page or the
+    // executable page arena. Anything else is a wild branch (a clobbered
+    // function pointer or a Thumb bit lost on the way), and stopping at the
+    // block that contains it keeps LR pointing at the real caller.
+    bool is_code_region(uint32_t addr) const {
+        // The bottom page of the heap is the bootstrap area: the interworking
+        // return gadget (`mov r0,#0 ; ldr pc,[sp],#8`) and the small data
+        // imports (__sF, environ, __page_size, ctype tables) live there.
+        return (addr >= kImageBase0 && addr < kImageLimit) ||
+               (addr >= kStubBase && addr < kReturnSentinel) ||
+               (addr >= kPageArenaBase && addr < kPageArenaBase + kPageArenaSize) ||
+               (addr >= kHeapBase && addr < kHeapBase + 0x1000u);
+    }
+
+    // Watch writes into a library's .got so a clobbered import slot names the
+    // guest instruction that wrote it instead of the import that jumped.
+    static void got_watch_thunk(uc_engine* uc, uc_mem_type type, uint64_t address,
+                                int size, int64_t value, void* user_data) {
+        (void)type;
+        Emulator* self = static_cast<Emulator*>(user_data);
+        if (!self || self->got_watch_hits_ >= 64) return;
+        ++self->got_watch_hits_;
+        uint32_t pc = 0, lr = 0;
+        uc_reg_read(uc, UC_ARM_REG_PC, &pc);
+        uc_reg_read(uc, UC_ARM_REG_LR, &lr);
+        LOGW("GOT WRITE addr=%08llx size=%d value=%08llx at pc=%08x lr=%08x",
+             static_cast<unsigned long long>(address), size,
+             static_cast<unsigned long long>(static_cast<uint64_t>(value)), pc, lr);
+        self->log_guest_window("GOT WRITE site", pc & ~1u, 16, 16);
+    }
+
+    static void code_guard_thunk(uc_engine* uc, uint64_t address, uint32_t size,
+                                 void* user_data) {
+        (void)size;
+        Emulator* self = static_cast<Emulator*>(user_data);
+        if (!self) return;
+        if (!self->code_guard_hit_) {
+            self->block_hist_[self->block_hist_pos_] = static_cast<uint32_t>(address);
+            self->block_hist_pos_ = (self->block_hist_pos_ + 1) % kBlockHistLen;
+        }
+        if (self->code_guard_hit_) return;
+        if (self->is_code_region(static_cast<uint32_t>(address))) return;
+        self->code_guard_hit_ = true;
+
+        uint32_t pc = 0, lr = 0, sp = 0, cpsr = 0;
+        uint32_t r[13] = {0};
+        uc_reg_read(uc, UC_ARM_REG_PC, &pc);
+        uc_reg_read(uc, UC_ARM_REG_LR, &lr);
+        uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+        uc_reg_read(uc, UC_ARM_REG_CPSR, &cpsr);
+        for (int i = 0; i < 13; ++i) uc_reg_read(uc, UC_ARM_REG_R0 + i, &r[i]);
+        LOGE("WILD BRANCH: block %08llx is not code (pc=%08x lr=%08x sp=%08x cpsr=%08x "
+             "%s r0=%08x r1=%08x r2=%08x r3=%08x r4=%08x r5=%08x r12=%08x "
+             "last_import=%s)",
+             static_cast<unsigned long long>(address), pc, lr, sp, cpsr,
+             (cpsr & 0x20u) ? "THUMB" : "ARM", r[0], r[1], r[2], r[3], r[4], r[5],
+             r[12], g_last_import.c_str());
+        self->log_guest_window("WILD BRANCH bytes", static_cast<uint32_t>(address), 16, 16);
+        self->log_guest_window("WILD BRANCH lr-bytes", lr & ~1u, 16, 16);
+        // libmono's PLT/GOT for pthread_mutex_unlock: the slot the caller at
+        // lr=201990b4 jumps through, plus the PLT entry that reads it.
+        LOGE("WILD BRANCH libmono: GOT[3adc1c]=%08x GOT[3adc18]=%08x GOT[3adc20]=%08x",
+             self->read_u32(kImageBase0 + 0x3adc1cu),
+             self->read_u32(kImageBase0 + 0x3adc18u),
+             self->read_u32(kImageBase0 + 0x3adc20u));
+        self->log_guest_window("WILD BRANCH plt", kImageBase0 + 0x15444u, 8, 24);
+        self->log_guest_window("WILD BRANCH stack", sp, 0, 128);
+        {
+            std::string hist;
+            char cell[16];
+            for (int i = 1; i <= kBlockHistLen; ++i) {
+                const uint32_t b = self->block_hist_[(self->block_hist_pos_ - i +
+                                                      kBlockHistLen) % kBlockHistLen];
+                if (!b) continue;
+                std::snprintf(cell, sizeof cell, " %08x", b);
+                hist += cell;
+            }
+            LOGE("WILD BRANCH recent blocks (newest first):%s", hist.c_str());
+        }
+        uc_emu_stop(uc);
     }
 
     static void mem_fault_thunk(uc_engine* uc, uc_mem_type type, uint64_t address,
@@ -1147,7 +1272,21 @@ public:
         if (uc_context_alloc(uc_, &saved) != UC_ERR_OK) return false;
         uc_context_save(uc_, saved);
 
-        const uint32_t sp = align_down(kStackTop - 0x1000u * (depth_ + 1), 8);
+        // Each nested guest entry gets its own slice of the 64 MB guest stack.
+        // The slice used to be 4 KB, which Mono's loader (which recurses through
+        // mono_get_method_full -> mono_..._full for every assembly member) blows
+        // through immediately: the callee's frames overwrote the caller's saved
+        // {r11, lr} and the caller returned to whatever heap word happened to
+        // land on its frame. 2 MB leaves 32 nesting levels, far more than the
+        // framework ever needs, while still keeping every slice in the mapped
+        // stack region.
+        constexpr uint32_t kCallStackStride = 2u * 1024u * 1024u;
+        const uint32_t depth_slot = static_cast<uint32_t>(depth_ % 31) + 1u;
+        const uint32_t sp = align_down(kStackTop - kCallStackStride * depth_slot, 8);
+        if (depth_ >= 31) {
+            LOGW("call(%s): nesting depth %d exceeds the 31 guest stack slices", what,
+                 depth_);
+        }
 
         reg_write(UC_ARM_REG_SP, sp);
         reg_write(UC_ARM_REG_LR, kReturnSentinel);
@@ -1481,11 +1620,20 @@ private:
         // declared unresponsive. 250k keeps the slice within the budget while
         // costing only a few thousand extra uc_emu_start calls per frame.
         constexpr uint32_t kChunk = 250u * 1000u;
+        code_guard_hit_ = false;
         const auto started = std::chrono::steady_clock::now();
         uint64_t budget = kMaxInstructions;
         int state_retries = 0;
         for (;;) {
             err = uc_emu_start(uc_, pc, kReturnSentinel, 0, kChunk);
+            if (code_guard_hit_) {
+                // The block guard stopped the engine on a branch into data; the
+                // register file it logged is the one to diagnose, so do not
+                // resume or retry in the other instruction set.
+                emu_ok_ = false;
+                err = UC_ERR_INSN_INVALID;
+                return;
+            }
             if (err == UC_ERR_INSN_INVALID && state_retries < 16) {
                 // An ARM/Thumb interworking transition can be lost across a
                 // block boundary (the payload mixes both instruction sets).
@@ -1503,6 +1651,7 @@ private:
                     LOGW("call(%s): invalid %s instruction at pc=%08x lr=%08x; "
                          "retrying as %s", what, was_thumb ? "Thumb" : "ARM",
                          bad_pc, flr, was_thumb ? "ARM" : "Thumb");
+                    log_guest_window("insn-invalid bytes", bad_pc, 16, 16);
                     ++state_retries;
                     // uc_emu_start() derives the instruction set from the start
                     // address, overriding CPSR.T; encode the state in bit 0.
@@ -1618,6 +1767,13 @@ private:
     std::mutex regions_mtx_;
     std::vector<MemoryRegion> regions_;
     uc_hook    mem_hook_ = 0;
+    uc_hook    code_guard_ = 0;
+    bool       code_guard_hit_ = false;
+    uc_hook    got_watch_ = 0;
+    int        got_watch_hits_ = 0;
+    static constexpr int kBlockHistLen = 48;
+    uint32_t   block_hist_[kBlockHistLen] = {0};
+    int        block_hist_pos_ = 0;
     uint32_t   heap_cursor_ = kHeapBase;
     size_t     heap_active_bytes_ = 0;   // live malloc payload (free list excluded)
     size_t     heap_peak_bytes_ = 0;
@@ -2016,6 +2172,23 @@ private:
                     if (!target) { ++failed; break; }
                     emu_.write_u32(slot, type == R_ARM_ABS32 ? target + addend : target);
                     ++applied;
+#ifdef ZAI_VERBOSE_TRACE
+                    if (type == R_ARM_JUMP_SLOT || type == R_ARM_GLOB_DAT) {
+                        // A function import must resolve into code. Anything
+                        // else is a GOT slot that will jump into data.
+                        const bool plausible =
+                                (target >= kImageBase0 && target < kImageLimit) ||
+                                (target >= kStubBase && target < kReturnSentinel);
+                        if (!plausible) {
+                            Elf32_Sym s{};
+                            emu_.read(lib.bias + symtab + symi * sizeof s, &s, sizeof s);
+                            LOGE("%s: import %s -> implausible target %08x (slot %08x)",
+                                 lib.path.c_str(),
+                                 sym_name(lib, strtab, strsz, s.st_name).c_str(),
+                                 target, slot);
+                        }
+                    }
+#endif
                     break;
                 }
                 case R_ARM_NONE:

@@ -5,6 +5,10 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Diagnostic tracing (per-block wild-branch guard, guest byte windows, guest
+# svc/import dumps). Off by default: the release build carries no trace code.
+option(ZAI_VERBOSE_TRACE "Emit Zai-Bridge guest diagnostic tracing" OFF)
+
 # Ensure 16 KB page-size compatibility for Android 15/16
 add_link_options("-Wl,-z,max-page-size=16384")
 
@@ -88,6 +92,11 @@ if(ZAI_TRANSLATING_ABI)
         # actually decompresses the entries.
         z
     )
+
+    if(ZAI_VERBOSE_TRACE)
+        target_compile_definitions(wrapper PRIVATE ZAI_VERBOSE_TRACE)
+        message(STATUS "zai-bridge: ZAI_VERBOSE_TRACE enabled")
+    endif()
 
     # Unicorn's internal (TCG / softmmu) symbols must stay out of the exported
     # dynamic symbol table: only JNI_OnLoad and the JNI thunks should be exported.
