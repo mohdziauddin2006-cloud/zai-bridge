@@ -46,9 +46,45 @@ public final class GuestDexLoader extends DexClassLoader {
     }
 
     @Override
+    protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+        // Native 64-bit / passthrough guests (Unity 6 GameActivity, AppCompat, Play Services)
+        // must load their own androidx.* and game classes child-first so resource R IDs and
+        // library versions match the guest APK rather than Zai-Bridge's Material/AppCompat deps.
+        if (hostLibrary == null && name != null) {
+            Class<?> loaded = findLoadedClass(name);
+            if (loaded != null) {
+                return loaded;
+            }
+            boolean forceParentFirst = name.startsWith("java.")
+                    || name.startsWith("javax.")
+                    || name.startsWith("sun.")
+                    || name.startsWith("dalvik.")
+                    || name.startsWith("libcore.")
+                    || name.startsWith("org.xml.")
+                    || name.startsWith("org.xmlpull.")
+                    || name.startsWith("org.w3c.")
+                    || name.startsWith("org.json.")
+                    || name.startsWith("com.ziauddin.zaibridge.")
+                    || (name.startsWith("android.") && !name.startsWith("android.support."));
+            if (!forceParentFirst) {
+                try {
+                    Class<?> guestCls = findClass(name);
+                    if (resolve) {
+                        resolveClass(guestCls);
+                    }
+                    return guestCls;
+                } catch (ClassNotFoundException ignored) {
+                    // Fall back to parent classloader cleanly.
+                }
+            }
+        }
+        return super.loadClass(name, resolve);
+    }
+
+    @Override
     public String findLibrary(String name) {
         if (hostLibrary == null) {
-            // 32-bit passthrough host: the payload is a real loadable 32-bit .so.
+            // Native 64-bit / passthrough host: resolve from staged native64/native + split APKs.
             return super.findLibrary(name);
         }
         File alias = aliasFor(name);

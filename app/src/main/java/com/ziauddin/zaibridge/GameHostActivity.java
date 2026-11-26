@@ -311,8 +311,19 @@ public class GameHostActivity extends Activity {
                 }
 
                 final String pkgName = game != null ? game.packageName : gameDir.getName();
-                final String launcher = game != null && !game.launcherActivity.isEmpty()
+                final boolean isNative64 = com.ziauddin.zaibridge.core.GuestLauncher
+                        .isNative64Game(game, gameDir);
+                String rawLauncher = game != null && !game.launcherActivity.isEmpty()
                         ? game.launcherActivity : "";
+                com.ziauddin.zaibridge.core.BinaryXmlManifestReader.ParsedManifest manifest =
+                        com.ziauddin.zaibridge.core.BinaryXmlManifestReader
+                                .readFromApk(apk.getAbsolutePath());
+                if (rawLauncher.isEmpty()) {
+                    rawLauncher = manifest.launcherActivity;
+                }
+                rawLauncher = com.ziauddin.zaibridge.core.BinaryXmlManifestReader
+                        .normalizeClassName(pkgName, rawLauncher);
+                final String launcher = manifest.resolveActivityTarget(rawLauncher);
                 final boolean hasNativePayload = hasNativePayload(payload);
 
                 File optimized = new File(getCodeCacheDir(), "guest-" + gameDir.getName());
@@ -322,16 +333,29 @@ public class GameHostActivity extends Activity {
 
                 ClassLoader loader = null;
                 try {
-                    loader = new DexClassLoader(apk.getAbsolutePath(),
-                            optimized.getAbsolutePath(), payload.getAbsolutePath(),
-                            getClassLoader());
+                    String dexPath = com.ziauddin.zaibridge.core.GuestLauncher
+                            .buildCombinedDexPath(gameDir);
+                    String libPath = com.ziauddin.zaibridge.core.GuestLauncher
+                            .buildNativeLibrarySearchPath(this, gameDir, pkgName, isNative64);
+                    loader = new com.ziauddin.zaibridge.core.GuestDexLoader(
+                            dexPath,
+                            optimized.getAbsolutePath(),
+                            libPath,
+                            getClassLoader(),
+                            null,
+                            isNative64 ? new File(gameDir, "native64") : payload);
                     Thread.currentThread().setContextClassLoader(loader);
                 } catch (Throwable t) {
                     Log.e(TAG, "guest dex unavailable; starting native payload only", t);
                 }
                 guestLoader = loader;
 
-                if (loader != null && !hasNativePayload) {
+                if (loader != null && (isNative64 || !hasNativePayload)) {
+                    if (isNative64) {
+                        com.ziauddin.zaibridge.core.EglSwapHook.install();
+                        com.ziauddin.zaibridge.core.EglSwapHook.configure(
+                                com.ziauddin.zaibridge.data.GraphicsSettings.forGame(this, gameDir));
+                    }
                     pureJavaMode = true;
                     launchPureJava(loader, pkgName, launcher);
                     guestPrepared = true;
@@ -917,24 +941,37 @@ public class GameHostActivity extends Activity {
     // ---------------------------------------------------------------------
 
     private void forceSave() {
-        File written = SaveStateManager.save(this, gameDir, saveSlot);
-        Toast.makeText(this, written != null
-                        ? getString(R.string.save_written, SaveStateManager.labelOf(saveSlot))
-                        : getString(R.string.save_failed, SaveStateManager.labelOf(saveSlot)),
-                Toast.LENGTH_SHORT).show();
-        rebuildDrawer();
+        Toast.makeText(this, "Saving...", Toast.LENGTH_SHORT).show();
+        final int slot = saveSlot;
+        SURFACE_QUEUE.execute(() -> {
+            File written = SaveStateManager.save(this, gameDir, slot);
+            runOnUiThread(() -> {
+                if (isFinishing() || isDestroyed()) return;
+                Toast.makeText(this, written != null
+                                ? getString(R.string.save_written, SaveStateManager.labelOf(slot))
+                                : getString(R.string.save_failed, SaveStateManager.labelOf(slot)),
+                        Toast.LENGTH_SHORT).show();
+                rebuildDrawer();
+            });
+        });
     }
 
     private void forceLoad() {
-        int restored = SaveStateManager.restore(this, gameDir, saveSlot);
-        if (restored < 0) {
-            Toast.makeText(this, getString(R.string.save_missing,
-                    SaveStateManager.labelOf(saveSlot)), Toast.LENGTH_SHORT).show();
-            return;
-        }
-        Toast.makeText(this, getString(R.string.save_restored,
-                SaveStateManager.labelOf(saveSlot)), Toast.LENGTH_LONG).show();
-        restartGame();
+        final int slot = saveSlot;
+        SURFACE_QUEUE.execute(() -> {
+            int restored = SaveStateManager.restore(this, gameDir, slot);
+            runOnUiThread(() -> {
+                if (isFinishing() || isDestroyed()) return;
+                if (restored < 0) {
+                    Toast.makeText(this, getString(R.string.save_missing,
+                            SaveStateManager.labelOf(slot)), Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                Toast.makeText(this, getString(R.string.save_restored,
+                        SaveStateManager.labelOf(slot)), Toast.LENGTH_LONG).show();
+                restartGame();
+            });
+        });
     }
 
     /** Releases the guest, then relaunches the host so it starts from disk. */

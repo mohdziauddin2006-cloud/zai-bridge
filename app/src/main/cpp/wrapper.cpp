@@ -86,6 +86,7 @@
 #include <chrono>
 #include <mutex>
 #include <condition_variable>
+#include <deque>
 #include <memory>
 #include <thread>
 #include <cstring>
@@ -598,6 +599,61 @@ public:
             owner_host_tid_ = 0;
             depth_ = 0;
         }
+        if (owner_tid_ != 0) return false;
+        owner_tid_ = self;
+        owner_atomic_.store(self, std::memory_order_release);
+        owner_host_tid_ = static_cast<long>(::syscall(__NR_gettid));
+        depth_ = 1;
+        return true;
+    }
+
+    bool try_lock_for(int timeout_ms) {
+        const pthread_t self = pthread_self();
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (owner_tid_ == self) {
+            if (type_ == kGuestMutexRecursive) {
+                ++depth_;
+                return true;
+            }
+            return false;
+        }
+        if (owner_tid_ != 0 && !thread_alive(owner_tid_)) {
+            owner_tid_ = 0;
+            owner_atomic_.store(0, std::memory_order_release);
+            owner_host_tid_ = 0;
+            depth_ = 0;
+        }
+        if (owner_tid_ == 0) {
+            owner_tid_ = self;
+            owner_atomic_.store(self, std::memory_order_release);
+            owner_host_tid_ = static_cast<long>(::syscall(__NR_gettid));
+            depth_ = 1;
+            return true;
+        }
+        if (timeout_ms <= 0) return false;
+
+        const auto deadline = std::chrono::steady_clock::now()
+                            + std::chrono::milliseconds(timeout_ms);
+        waiters_.fetch_add(1, std::memory_order_acq_rel);
+        while (owner_tid_ != 0) {
+            if (owner_tid_ != self && !thread_alive(owner_tid_)) {
+                owner_tid_ = 0;
+                owner_atomic_.store(0, std::memory_order_release);
+                owner_host_tid_ = 0;
+                depth_ = 0;
+                break;
+            }
+            if (cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+                if (owner_tid_ != 0 && owner_tid_ != self && !thread_alive(owner_tid_)) {
+                    owner_tid_ = 0;
+                    owner_atomic_.store(0, std::memory_order_release);
+                    owner_host_tid_ = 0;
+                    depth_ = 0;
+                }
+                break;
+            }
+        }
+        waiters_.fetch_sub(1, std::memory_order_acq_rel);
         if (owner_tid_ != 0) return false;
         owner_tid_ = self;
         owner_atomic_.store(self, std::memory_order_release);
@@ -2657,6 +2713,66 @@ public:
     using ImportHandler = std::function<uint32_t()>;
 
     explicit JniBridge(Emulator& emu) : emu_(emu), linker_(emu) {}
+    ~JniBridge() { stop_ui_worker(); }
+
+    GuestMutex& emu_mutex() { return emu_mu_; }
+
+    static bool is_ui_main_thread() {
+        return static_cast<pid_t>(::syscall(__NR_gettid)) == ::getpid();
+    }
+
+    struct ScopedGuestLock {
+        GuestMutex& mu;
+        bool locked = false;
+        explicit ScopedGuestLock(GuestMutex& m) : mu(m), locked(true) { mu.lock(); }
+        ScopedGuestLock(GuestMutex& m, std::adopt_lock_t) : mu(m), locked(true) {}
+        ~ScopedGuestLock() { if (locked) mu.unlock(); }
+        ScopedGuestLock(const ScopedGuestLock&) = delete;
+        ScopedGuestLock& operator=(const ScopedGuestLock&) = delete;
+    };
+
+    void stop_ui_worker() {
+        std::deque<std::function<void()>> leftover;
+        {
+            std::lock_guard<std::mutex> lk(ui_worker_mtx_);
+            ui_worker_stop_ = true;
+            leftover.swap(ui_worker_tasks_);
+        }
+        ui_worker_cv_.notify_all();
+        if (ui_worker_thread_.joinable() &&
+            std::this_thread::get_id() != ui_worker_thread_.get_id()) {
+            ui_worker_thread_.join();
+        }
+    }
+
+    void enqueue_ui_task(std::function<void()> task) {
+        std::lock_guard<std::mutex> lk(ui_worker_mtx_);
+        if (ui_worker_stop_) return;
+        if (!ui_worker_started_) {
+            ui_worker_started_ = true;
+            ui_worker_thread_ = std::thread([this] {
+                EnvScope env_scope(t_env, vm_);
+                for (;;) {
+                    std::function<void()> job;
+                    {
+                        std::unique_lock<std::mutex> lk(ui_worker_mtx_);
+                        ui_worker_cv_.wait(lk, [this] {
+                            return ui_worker_stop_ || !ui_worker_tasks_.empty();
+                        });
+                        if (ui_worker_stop_ && ui_worker_tasks_.empty()) return;
+                        job = std::move(ui_worker_tasks_.front());
+                        ui_worker_tasks_.pop_front();
+                    }
+                    if (job) job();
+                }
+            });
+        }
+        // Cap backlog so rapid repeated touch/sensor spikes stay fresh without unbounded queue growth.
+        if (ui_worker_tasks_.size() < 64) {
+            ui_worker_tasks_.push_back(std::move(task));
+        }
+        ui_worker_cv_.notify_one();
+    }
 
     bool init(JavaVM* vm, JNIEnv* env) {
         t_env = env;
@@ -3216,13 +3332,102 @@ public:
     // ---- called from the generated ARM64 trampoline -----------------------
     uint64_t native_entry(uint32_t id, uint64_t* host_args) {
         EnvScope env_scope(t_env, vm_);
-        // The guest CPU is a single register file: two ART threads entering it
-        // at once would interleave into one another. Recursive because a guest
-        // ->Java->guest round trip re-enters from the same thread.
-        std::lock_guard<GuestMutex> emu_lock(emu_mu_);
-
         if (id >= natives_.size()) return 0;
         const NativeEntry& e = natives_[id];
+
+        // Never allow Android's Main UI thread to block >40ms on emu_mu_.
+        // When contended on a background GL/worker thread, enqueue async-safe
+        // void/boolean callbacks onto the dedicated UI async worker and return immediately.
+        const bool on_ui_thread = is_ui_main_thread();
+        bool acquired_immediately = false;
+        if (on_ui_thread && !emu_mu_.held_by_current_thread()) {
+            acquired_immediately = emu_mu_.try_lock_for(40);
+            if (!acquired_immediately) {
+                if ((e.ret_type == 'V' || e.ret_type == 'Z')
+                        && e.name != "nativeRender" && e.name != "render") {
+                    jobject thiz_g = nullptr;
+                    if (t_env && host_args[1]) {
+                        thiz_g = t_env->NewGlobalRef(reinterpret_cast<jobject>(host_args[1]));
+                    }
+                    struct CapturedArg {
+                        char kind;
+                        uint64_t val;
+                        jobject gref;
+                    };
+                    std::vector<CapturedArg> captured;
+                    captured.reserve(e.arg_types.size());
+                    size_t ii = 2;
+                    size_t fi = 8;
+                    for (char t : e.arg_types) {
+                        if (t == 'F' || t == 'D') {
+                            uint64_t bits = (fi < 16) ? host_args[fi] : 0;
+                            fi++;
+                            captured.push_back({t, bits, nullptr});
+                        } else {
+                            uint64_t v = (ii < 8) ? host_args[ii] : host_args[ii + 8];
+                            ii++;
+                            jobject g = nullptr;
+                            if ((t == 'L' || t == '[') && t_env && v) {
+                                g = t_env->NewGlobalRef(reinterpret_cast<jobject>(v));
+                            }
+                            captured.push_back({t, v, g});
+                        }
+                    }
+                    LOGW("UI-thread ANR guard: offloading %s%s onto guest UI async worker",
+                         e.name.c_str(), e.sig.c_str());
+                    enqueue_ui_task([this, id, thiz_g, captured]() mutable {
+                        if (id < natives_.size()) {
+                            ScopedGuestLock lk(emu_mu_);
+                            const NativeEntry& entry = natives_[id];
+                            std::vector<uint32_t> qrefs;
+                            auto qpush = [&](jobject obj) -> uint32_t {
+                                if (!obj) return 0;
+                                uint32_t h = to_guest_jobject(obj, true, false);
+                                if (h) qrefs.push_back(h);
+                                return h;
+                            };
+                            std::vector<uint32_t> qargs;
+                            qargs.push_back(env_shadow_);
+                            qargs.push_back(qpush(thiz_g));
+                            for (const auto& ca : captured) {
+                                if (ca.kind == 'D') {
+                                    if (qargs.size() & 1u) qargs.push_back(0);
+                                    qargs.push_back(static_cast<uint32_t>(ca.val));
+                                    qargs.push_back(static_cast<uint32_t>(ca.val >> 32));
+                                } else if (ca.kind == 'F') {
+                                    qargs.push_back(static_cast<uint32_t>(ca.val));
+                                } else if (ca.kind == 'J') {
+                                    if (qargs.size() & 1u) qargs.push_back(0);
+                                    qargs.push_back(static_cast<uint32_t>(ca.val));
+                                    qargs.push_back(static_cast<uint32_t>(ca.val >> 32));
+                                } else if (ca.kind == 'L' || ca.kind == '[') {
+                                    qargs.push_back(qpush(ca.gref));
+                                } else {
+                                    qargs.push_back(static_cast<uint32_t>(ca.val));
+                                }
+                            }
+                            uint32_t qret = 0;
+                            emu_.call(entry.guest_fn, qargs, qret, entry.name.c_str(), 0);
+                            sync_direct_buffers_to_host();
+                            for (uint32_t h : qrefs) delete_guest_jobject(h, false);
+                        }
+                        if (t_env) {
+                            if (thiz_g) t_env->DeleteGlobalRef(thiz_g);
+                            for (const auto& ca : captured) {
+                                if (ca.gref) t_env->DeleteGlobalRef(ca.gref);
+                            }
+                        }
+                    });
+                } else {
+                    LOGW("UI-thread ANR guard: skipped contended call %s%s",
+                         e.name.c_str(), e.sig.c_str());
+                }
+                return suspended_result(e);
+            }
+        } else {
+            emu_mu_.lock();
+        }
+        ScopedGuestLock emu_lock(emu_mu_, std::adopt_lock);
 
         // Trace the first few calls per method; RunLoop ticks are per-frame and
         // would otherwise drown the log.
@@ -11906,17 +12111,10 @@ public:
     // thread that has to do the work, drains it frame by frame. Once a frame has
     // been presented the budget is lifted and calls run to completion as before.
     int startup_budget_ms() {
-        if (frames_ > 0) return 0;
-        const auto now = std::chrono::steady_clock::now();
-        if (startup_begin_.time_since_epoch().count() == 0) startup_begin_ = now;
-        if (now - startup_begin_ > std::chrono::seconds(180)) return 0;
-        // Keep the UI main thread tightly bounded (250 ms) so Android never
-        // raises an input-dispatch ANR, while giving dedicated GL/render
-        // threads generous 1500 ms slices so cold Unity/Mono JIT boot completes
-        // cleanly even on slow software-rendered emulators or low-end phones.
         const bool is_main_thread =
                 (static_cast<pid_t>(::syscall(__NR_gettid)) == ::getpid());
-        return is_main_thread ? kMainThreadBudgetMs : 0;
+        if (is_main_thread) return kMainThreadBudgetMs;
+        return 0;
     }
 
     // A call that arrived while the guest was still inside a suspended one.
@@ -11932,9 +12130,15 @@ public:
         return e.ret_type == 'Z' ? 1u : 0u;
     }
 
-    static constexpr int kMainThreadBudgetMs = 250;
+    static constexpr int kMainThreadBudgetMs = 45;
     static constexpr int kRenderThreadBudgetMs = 1500;
     GuestMutex   emu_mu_;                             // serialises ART -> guest
+    std::mutex   ui_worker_mtx_;
+    std::condition_variable ui_worker_cv_;
+    std::deque<std::function<void()>> ui_worker_tasks_;
+    std::thread  ui_worker_thread_;
+    bool         ui_worker_started_ = false;
+    bool         ui_worker_stop_ = false;
     std::mutex   guest_signal_mtx_;
     std::unordered_map<long, GuestSignalBox*> guest_signal_boxes_;
     std::mutex   once_mtx_;                           // atomic pthread_once guard
@@ -12694,10 +12898,40 @@ static uint32_t g_guest_onLowMemory = 0;
 static uint32_t g_shadow_activity_addr = 0;
 static uint32_t g_shadow_callbacks_addr = 0;
 
+static void run_guest_callback_safely(const char* name, bool allow_async, std::function<void()> fn) {
+    if (!g_emulator || !g_bridge) return;
+    GuestMutex& mu = g_bridge->emu_mutex();
+    if (!JniBridge::is_ui_main_thread() || mu.held_by_current_thread()) {
+        JniBridge::ScopedGuestLock lk(mu);
+        fn();
+        return;
+    }
+    if (mu.try_lock_for(40)) {
+        JniBridge::ScopedGuestLock lk(mu, std::adopt_lock);
+        fn();
+        return;
+    }
+    if (allow_async) {
+        LOGW("UI-thread ANR guard: enqueuing ANativeActivity %s asynchronously", name);
+        JniBridge* bridge = g_bridge;
+        bridge->enqueue_ui_task([fn = std::move(fn)]() {
+            if (!g_emulator || !g_bridge) return;
+            JniBridge::ScopedGuestLock lk(g_bridge->emu_mutex());
+            fn();
+        });
+    } else {
+        LOGW("UI-thread ANR guard: skipped synchronous ANativeActivity %s (>40ms contended)", name);
+    }
+}
+
 static void host_fwd_void(uint32_t cb, const char* name) {
-    if (!cb || !g_emulator) return;
-    uint32_t r = 0;
-    g_emulator->call(cb, {g_shadow_activity_addr}, r, name);
+    if (!cb || !g_emulator || !g_bridge) return;
+    run_guest_callback_safely(name, true, [cb, name]() {
+        if (!g_emulator) return;
+        uint32_t r = 0;
+        const int budget = JniBridge::is_ui_main_thread() ? 45 : 0;
+        g_emulator->call(cb, {g_shadow_activity_addr}, r, name, budget);
+    });
 }
 
 static void hc_onStart(ANativeActivity* activity) {
@@ -12722,22 +12956,41 @@ static void hc_onStop(ANativeActivity* activity) {
 
 static void hc_onDestroy(ANativeActivity* activity) {
     (void)activity;
-    host_fwd_void(g_guest_onDestroy, "NA onDestroy");
+    if (!g_guest_onDestroy || !g_emulator || !g_bridge) return;
+    run_guest_callback_safely("NA onDestroy", false, []() {
+        if (!g_emulator) return;
+        uint32_t r = 0;
+        g_emulator->call(g_guest_onDestroy, {g_shadow_activity_addr}, r, "NA onDestroy", 45);
+    });
 }
 
 static void hc_onWindowFocusChanged(ANativeActivity* activity, int hasFocus) {
     (void)activity;
-    if (!g_guest_onWindowFocusChanged || !g_emulator) return;
-    uint32_t r = 0;
-    g_emulator->call(g_guest_onWindowFocusChanged,
-                     {g_shadow_activity_addr, static_cast<uint32_t>(hasFocus)},
-                     r, "NA onWindowFocusChanged");
+    if (!g_guest_onWindowFocusChanged || !g_emulator || !g_bridge) return;
+    run_guest_callback_safely("NA onWindowFocusChanged", true, [hasFocus]() {
+        if (!g_emulator) return;
+        uint32_t r = 0;
+        g_emulator->call(g_guest_onWindowFocusChanged,
+                         {g_shadow_activity_addr, static_cast<uint32_t>(hasFocus)},
+                         r, "NA onWindowFocusChanged", 45);
+    });
 }
 
 static void* hc_onSaveInstanceState(ANativeActivity* activity, size_t* outLen) {
     (void)activity;
     if (outLen) *outLen = 0;
-    if (!g_guest_onSaveInstanceState || !g_emulator) return nullptr;
+    if (!g_guest_onSaveInstanceState || !g_emulator || !g_bridge) return nullptr;
+
+    GuestMutex& mu = g_bridge->emu_mutex();
+    if (JniBridge::is_ui_main_thread() && !mu.held_by_current_thread()) {
+        if (!mu.try_lock_for(40)) {
+            LOGW("UI-thread ANR guard: skipped hc_onSaveInstanceState (>40ms contended)");
+            return nullptr;
+        }
+    } else {
+        mu.lock();
+    }
+    JniBridge::ScopedGuestLock lk(mu, std::adopt_lock);
 
     uint32_t guest_len_ptr = g_emulator->alloc(4, 4);
     if (!guest_len_ptr) return nullptr;
@@ -12746,7 +12999,7 @@ static void* hc_onSaveInstanceState(ANativeActivity* activity, size_t* outLen) {
     uint32_t guest_buf = 0;
     g_emulator->call(g_guest_onSaveInstanceState,
                      {g_shadow_activity_addr, guest_len_ptr},
-                     guest_buf, "NA onSaveInstanceState");
+                     guest_buf, "NA onSaveInstanceState", 45);
 
     uint32_t len = g_emulator->read_u32(guest_len_ptr);
     g_emulator->release(guest_len_ptr, 4);
@@ -12776,34 +13029,49 @@ static void hc_onNativeWindowCreated(ANativeActivity* activity, ANativeWindow* w
     (void)activity;
     g_host_window.store(window);
     if (g_bridge) g_bridge->set_host_window(window);
-    if (!g_guest_onNativeWindowCreated || !g_emulator) return;
-    const uint32_t gw = g_bridge ? g_bridge->to_guest_ref(window) : 0u;
-    uint32_t r = 0;
-    g_emulator->call(g_guest_onNativeWindowCreated, {g_shadow_activity_addr, gw}, r, "NA onNativeWindowCreated");
+    if (!g_guest_onNativeWindowCreated || !g_emulator || !g_bridge) return;
+    run_guest_callback_safely("NA onNativeWindowCreated", true, [window]() {
+        if (!g_emulator || !g_bridge) return;
+        const uint32_t gw = g_bridge->to_guest_ref(window);
+        uint32_t r = 0;
+        const int budget = JniBridge::is_ui_main_thread() ? 45 : 0;
+        g_emulator->call(g_guest_onNativeWindowCreated, {g_shadow_activity_addr, gw}, r, "NA onNativeWindowCreated", budget);
+    });
 }
 
 static void hc_onNativeWindowResized(ANativeActivity* activity, ANativeWindow* window) {
     (void)activity;
-    if (!g_guest_onNativeWindowResized || !g_emulator) return;
-    const uint32_t gw = g_bridge ? g_bridge->to_guest_ref(window) : 0u;
-    uint32_t r = 0;
-    g_emulator->call(g_guest_onNativeWindowResized, {g_shadow_activity_addr, gw}, r, "NA onNativeWindowResized");
+    if (!g_guest_onNativeWindowResized || !g_emulator || !g_bridge) return;
+    run_guest_callback_safely("NA onNativeWindowResized", true, [window]() {
+        if (!g_emulator || !g_bridge) return;
+        const uint32_t gw = g_bridge->to_guest_ref(window);
+        uint32_t r = 0;
+        const int budget = JniBridge::is_ui_main_thread() ? 45 : 0;
+        g_emulator->call(g_guest_onNativeWindowResized, {g_shadow_activity_addr, gw}, r, "NA onNativeWindowResized", budget);
+    });
 }
 
 static void hc_onNativeWindowRedrawNeeded(ANativeActivity* activity, ANativeWindow* window) {
     (void)activity;
-    if (!g_guest_onNativeWindowRedrawNeeded || !g_emulator) return;
-    const uint32_t gw = g_bridge ? g_bridge->to_guest_ref(window) : 0u;
-    uint32_t r = 0;
-    g_emulator->call(g_guest_onNativeWindowRedrawNeeded, {g_shadow_activity_addr, gw}, r, "NA onNativeWindowRedrawNeeded");
+    if (!g_guest_onNativeWindowRedrawNeeded || !g_emulator || !g_bridge) return;
+    run_guest_callback_safely("NA onNativeWindowRedrawNeeded", true, [window]() {
+        if (!g_emulator || !g_bridge) return;
+        const uint32_t gw = g_bridge->to_guest_ref(window);
+        uint32_t r = 0;
+        const int budget = JniBridge::is_ui_main_thread() ? 45 : 0;
+        g_emulator->call(g_guest_onNativeWindowRedrawNeeded, {g_shadow_activity_addr, gw}, r, "NA onNativeWindowRedrawNeeded", budget);
+    });
 }
 
 static void hc_onNativeWindowDestroyed(ANativeActivity* activity, ANativeWindow* window) {
     (void)activity;
-    if (g_guest_onNativeWindowDestroyed && g_emulator) {
-        const uint32_t gw = g_bridge ? g_bridge->to_guest_ref(window) : 0u;
-        uint32_t r = 0;
-        g_emulator->call(g_guest_onNativeWindowDestroyed, {g_shadow_activity_addr, gw}, r, "NA onNativeWindowDestroyed");
+    if (g_guest_onNativeWindowDestroyed && g_emulator && g_bridge) {
+        run_guest_callback_safely("NA onNativeWindowDestroyed", false, [window]() {
+            if (!g_emulator || !g_bridge) return;
+            const uint32_t gw = g_bridge->to_guest_ref(window);
+            uint32_t r = 0;
+            g_emulator->call(g_guest_onNativeWindowDestroyed, {g_shadow_activity_addr, gw}, r, "NA onNativeWindowDestroyed", 45);
+        });
     }
     if (g_bridge) g_bridge->set_host_window(nullptr);
     g_host_window.store(nullptr);
@@ -12811,35 +13079,47 @@ static void hc_onNativeWindowDestroyed(ANativeActivity* activity, ANativeWindow*
 
 static void hc_onInputQueueCreated(ANativeActivity* activity, AInputQueue* queue) {
     (void)activity;
-    if (!g_guest_onInputQueueCreated || !g_emulator) return;
-    const uint32_t gq = g_bridge ? g_bridge->to_guest_ref(queue) : 0u;
-    uint32_t r = 0;
-    g_emulator->call(g_guest_onInputQueueCreated, {g_shadow_activity_addr, gq}, r, "NA onInputQueueCreated");
+    if (!g_guest_onInputQueueCreated || !g_emulator || !g_bridge) return;
+    run_guest_callback_safely("NA onInputQueueCreated", true, [queue]() {
+        if (!g_emulator || !g_bridge) return;
+        const uint32_t gq = g_bridge->to_guest_ref(queue);
+        uint32_t r = 0;
+        g_emulator->call(g_guest_onInputQueueCreated, {g_shadow_activity_addr, gq}, r, "NA onInputQueueCreated", 45);
+    });
 }
 
 static void hc_onInputQueueDestroyed(ANativeActivity* activity, AInputQueue* queue) {
     (void)activity;
-    if (!g_guest_onInputQueueDestroyed || !g_emulator) return;
-    const uint32_t gq = g_bridge ? g_bridge->to_guest_ref(queue) : 0u;
-    uint32_t r = 0;
-    g_emulator->call(g_guest_onInputQueueDestroyed, {g_shadow_activity_addr, gq}, r, "NA onInputQueueDestroyed");
+    if (!g_guest_onInputQueueDestroyed || !g_emulator || !g_bridge) return;
+    run_guest_callback_safely("NA onInputQueueDestroyed", false, [queue]() {
+        if (!g_emulator || !g_bridge) return;
+        const uint32_t gq = g_bridge->to_guest_ref(queue);
+        uint32_t r = 0;
+        g_emulator->call(g_guest_onInputQueueDestroyed, {g_shadow_activity_addr, gq}, r, "NA onInputQueueDestroyed", 45);
+    });
 }
 
 static void hc_onContentRectChanged(ANativeActivity* activity, const ARect* rect) {
     (void)activity;
-    if (!g_guest_onContentRectChanged || !g_emulator) return;
-    uint32_t guest_rect = 0;
-    if (rect) {
-        guest_rect = g_emulator->alloc(sizeof(ARect), 4);
-        if (guest_rect) {
-            g_emulator->write(guest_rect, rect, sizeof(ARect));
+    if (!g_guest_onContentRectChanged || !g_emulator || !g_bridge) return;
+    ARect copy{};
+    bool has_rect = (rect != nullptr);
+    if (has_rect) copy = *rect;
+    run_guest_callback_safely("NA onContentRectChanged", true, [has_rect, copy]() {
+        if (!g_emulator) return;
+        uint32_t guest_rect = 0;
+        if (has_rect) {
+            guest_rect = g_emulator->alloc(sizeof(ARect), 4);
+            if (guest_rect) {
+                g_emulator->write(guest_rect, &copy, sizeof(ARect));
+            }
         }
-    }
-    uint32_t r = 0;
-    g_emulator->call(g_guest_onContentRectChanged, {g_shadow_activity_addr, guest_rect}, r, "NA onContentRectChanged");
-    if (guest_rect) {
-        g_emulator->release(guest_rect, sizeof(ARect));
-    }
+        uint32_t r = 0;
+        g_emulator->call(g_guest_onContentRectChanged, {g_shadow_activity_addr, guest_rect}, r, "NA onContentRectChanged", 45);
+        if (guest_rect) {
+            g_emulator->release(guest_rect, sizeof(ARect));
+        }
+    });
 }
 
 static ANativeActivityCallbacks g_host_callbacks = {};

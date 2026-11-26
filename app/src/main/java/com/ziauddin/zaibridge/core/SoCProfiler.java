@@ -236,7 +236,8 @@ public final class SoCProfiler {
                 || g.contains("MALI-G710") || g.contains("MALI-G615") || g.contains("MALI-G610")) {
             score += 3;
         } else if (g.contains("ADRENO 6") || g.contains("MALI-G77") || g.contains("MALI-G68")
-                || g.contains("MALI-G57") || g.contains("BXM-8")) {
+                || g.contains("MALI-G57") || g.contains("BXM-8") || g.contains("BXM-")
+                || g.contains("POWERVR B-SERIES")) {
             score += 2;
         } else {
             score += 1;

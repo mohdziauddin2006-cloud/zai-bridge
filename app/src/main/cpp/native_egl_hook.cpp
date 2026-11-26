@@ -70,6 +70,7 @@ using SwapFn = EGLBoolean (*)(EGLDisplay, EGLSurface);
 using SwapDamageFn = EGLBoolean (*)(EGLDisplay, EGLSurface, const EGLint*, EGLint);
 using BindFramebufferFn = void (*)(GLenum, GLuint);
 using ViewportFn = void (*)(GLint, GLint, GLsizei, GLsizei);
+using ScissorFn = void (*)(GLint, GLint, GLsizei, GLsizei);
 using CurrentDisplayFn = EGLDisplay (*)();
 using CurrentSurfaceFn = EGLSurface (*)(EGLint);
 using QuerySurfaceFn = EGLBoolean (*)(EGLDisplay, EGLSurface, EGLint, EGLint*);
@@ -79,6 +80,7 @@ SwapFn g_real_swap = nullptr;
 SwapDamageFn g_real_swap_damage = nullptr;
 BindFramebufferFn g_real_bind_framebuffer = nullptr;
 ViewportFn g_real_viewport = nullptr;
+ScissorFn g_real_scissor = nullptr;
 CurrentDisplayFn g_egl_current_display = nullptr;
 CurrentSurfaceFn g_egl_current_surface = nullptr;
 QuerySurfaceFn g_egl_query_surface = nullptr;
@@ -113,19 +115,36 @@ std::atomic<int> g_slots_patched{0};
 
 bool is_excluded(const char* name) {
     if (name == nullptr || name[0] == '\0') return true;  // main executable
+    // Never patch platform/system/vendor/APEX/GPU driver modules (e.g. PowerVR B-Series
+    // /vendor/lib64/egl/libEGL_powervr.so, libGLESv2_powervr.so, libIMGegl.so).
+    static const char* const kDenyPrefixes[] = {
+            "/system/",
+            "/vendor/",
+            "/apex/",
+            "/odm/",
+            "/product/",
+            "/system_ext/",
+    };
+    for (const char* prefix : kDenyPrefixes) {
+        if (std::strncmp(name, prefix, std::strlen(prefix)) == 0) return true;
+    }
     static const char* const kDeny[] = {
             "libwrapper.so",
-            "libEGL.so",
-            "libGLESv2.so",
-            "libGLESv1_CM.so",
-            "libvulkan.so",
+            "libEGL",
+            "libGLES",
+            "libvulkan",
+            "libIMG",
+            "libPVR",
+            "libusc",
+            "angle",
+            "swiftshader",
             "libc.so",
             "libm.so",
             "libdl.so",
-            "libandroid.so",
+            "libandroid",
             "libui.so",
             "libgui.so",
-            "libhwui.so",
+            "libhwui",
             "linker",
             "libutils.so",
             "libcutils.so",
@@ -133,7 +152,7 @@ bool is_excluded(const char* name) {
     for (const char* deny : kDeny) {
         if (std::strstr(name, deny) != nullptr) return true;
     }
-    // Guest renderers keep their original basename, e.g. libunity.so.
+    // Guest renderers keep their original basename, e.g. libunity.so / libil2cpp.so / libUE4.so.
     return false;
 }
 
@@ -321,6 +340,7 @@ void resolve_egl_once() {
         g_real_bind_framebuffer = reinterpret_cast<BindFramebufferFn>(
                 dlsym(gles, "glBindFramebuffer"));
         g_real_viewport = reinterpret_cast<ViewportFn>(dlsym(gles, "glViewport"));
+        g_real_scissor = reinterpret_cast<ScissorFn>(dlsym(gles, "glScissor"));
     }
 }
 
@@ -428,17 +448,20 @@ void trampoline_bind_framebuffer(GLenum target, GLuint framebuffer) {
         return;
     }
 
+    // Do not hijack GL_READ_FRAMEBUFFER or alter draw-target state on readback/blit queries.
+    if (target == GL_READ_FRAMEBUFFER) {
+        g_real_bind_framebuffer(target, framebuffer);
+        return;
+    }
+
     zai::GpuCompositor& compositor = zai::GpuCompositor::instance();
     if (framebuffer != 0) {
-        // The guest is binding its own render target (a shadow map, a post
-        // pass): stop claiming the internal target until it asks for the
-        // window again.
         t_guest_target = false;
         g_real_bind_framebuffer(target, framebuffer);
         return;
     }
 
-    if (!t_guest_target && compositor.internal_scaling()) {
+    if (compositor.internal_scaling()) {
         EGLDisplay dpy = g_egl_current_display != nullptr
                                  ? g_egl_current_display() : EGL_NO_DISPLAY;
         EGLSurface surf = g_egl_current_surface != nullptr
@@ -448,18 +471,20 @@ void trampoline_bind_framebuffer(GLenum target, GLuint framebuffer) {
         if (surface_size(dpy, surf, &width, &height)) {
             int internal_w = 0;
             int internal_h = 0;
+            t_in_trampoline = true;
             GLuint fbo = compositor.bind_internal_target(width, height,
                                                          &internal_w, &internal_h);
             if (fbo != 0) {
-                t_in_trampoline = true;
                 g_real_bind_framebuffer(target, fbo);
                 t_in_trampoline = false;
                 t_guest_target = true;
                 ++g_redirects;
                 return;
             }
+            t_in_trampoline = false;
         }
     }
+    t_guest_target = false;
     g_real_bind_framebuffer(target, framebuffer);
 }
 
@@ -470,8 +495,6 @@ void trampoline_viewport(GLint x, GLint y, GLsizei width, GLsizei height) {
         g_real_viewport(x, y, width, height);
         return;
     }
-    // The guest still thinks it renders at panel resolution; scale its viewport
-    // onto the internal target exactly like the FBO redirect above.
     const int scale = zai::GpuCompositor::instance().scale_percent();
     const float factor = static_cast<float>(scale) / 100.0f;
     const GLsizei scaled_w = static_cast<GLsizei>(static_cast<float>(width) * factor + 0.5f);
@@ -481,6 +504,24 @@ void trampoline_viewport(GLint x, GLint y, GLsizei width, GLsizei height) {
     g_real_viewport(scaled_x, scaled_y,
                     scaled_w > 0 ? scaled_w : width,
                     scaled_h > 0 ? scaled_h : height);
+}
+
+void trampoline_scissor(GLint x, GLint y, GLsizei width, GLsizei height) {
+    std::call_once(g_resolve_once, resolve_egl_once);
+    if (g_real_scissor == nullptr) return;
+    if (t_in_trampoline || !t_guest_target) {
+        g_real_scissor(x, y, width, height);
+        return;
+    }
+    const int scale = zai::GpuCompositor::instance().scale_percent();
+    const float factor = static_cast<float>(scale) / 100.0f;
+    const GLsizei scaled_w = static_cast<GLsizei>(static_cast<float>(width) * factor + 0.5f);
+    const GLsizei scaled_h = static_cast<GLsizei>(static_cast<float>(height) * factor + 0.5f);
+    const GLint scaled_x = static_cast<GLint>(static_cast<float>(x) * factor + 0.5f);
+    const GLint scaled_y = static_cast<GLint>(static_cast<float>(y) * factor + 0.5f);
+    g_real_scissor(scaled_x, scaled_y,
+                   scaled_w > 0 ? scaled_w : width,
+                   scaled_h > 0 ? scaled_h : height);
 }
 
 }  // namespace
@@ -557,8 +598,9 @@ Java_com_ziauddin_zaibridge_core_EglSwapHook_nativeInstallPltHooks(
             {"eglSwapBuffersWithDamageKHR", reinterpret_cast<void*>(&trampoline_swap_damage)},
             {"glBindFramebuffer", reinterpret_cast<void*>(&trampoline_bind_framebuffer)},
             {"glViewport", reinterpret_cast<void*>(&trampoline_viewport)},
+            {"glScissor", reinterpret_cast<void*>(&trampoline_scissor)},
     };
-    const int patched = zai::plthook::patch(kTargets, 4);
+    const int patched = zai::plthook::patch(kTargets, 5);
     if (patched == 0) {
         LOGI("PLT hook: no game module imports EGL/GLES yet; they will be patched "
              "after the renderer dlopen()s");

@@ -138,4 +138,12 @@
     <string name="filter_unity">Unity</string>
     <string name="filter_obb">OBB Ready</string>
     <string name="toggle_layout_view">Toggle grid or list view</string>
+
+    <!-- Mandatory Unity runtime string resources (safety net for split/virtualized games) -->
+    <string name="game_view_content_description">Game view</string>
+    <string name="FreeformWindowOrientation_landscape">landscape</string>
+    <string name="FreeformWindowOrientation_portrait">portrait</string>
+    <string name="FreeformWindowSize_maximize">maximize</string>
+    <string name="FreeformWindowSize_phone">phone</string>
+    <string name="FreeformWindowSize_tablet">tablet</string>
 </resources>

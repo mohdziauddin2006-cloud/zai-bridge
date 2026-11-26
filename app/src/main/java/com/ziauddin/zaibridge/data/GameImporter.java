@@ -539,17 +539,40 @@ public final class GameImporter {
 
     private static String pickLauncherActivity(PackageManager pm, PackageInfo info) {
         if (info == null) return "";
-        if (pm != null && info.packageName != null) {
+        String pkg = info.packageName != null ? info.packageName : "";
+        String apkPath = (info.applicationInfo != null) ? info.applicationInfo.sourceDir : null;
+        com.ziauddin.zaibridge.core.BinaryXmlManifestReader.ParsedManifest parsed =
+                (apkPath != null && !apkPath.isEmpty())
+                        ? com.ziauddin.zaibridge.core.BinaryXmlManifestReader.readFromApk(apkPath)
+                        : null;
+
+        if (pm != null && !pkg.isEmpty()) {
             try {
-                Intent launchIntent = pm.getLaunchIntentForPackage(info.packageName);
+                Intent launchIntent = pm.getLaunchIntentForPackage(pkg);
                 if (launchIntent != null && launchIntent.getComponent() != null) {
                     ComponentName cn = launchIntent.getComponent();
-                    if (cn.getClassName() != null && !cn.getClassName().isEmpty()) {
-                        return cn.getClassName();
+                    String cls = cn.getClassName();
+                    if (cls != null && !cls.isEmpty()) {
+                        try {
+                            ActivityInfo ai = pm.getActivityInfo(cn, 0);
+                            if (ai != null && ai.targetActivity != null && !ai.targetActivity.isEmpty()) {
+                                cls = ai.targetActivity;
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                        cls = com.ziauddin.zaibridge.core.BinaryXmlManifestReader
+                                .normalizeClassName(pkg, cls);
+                        if (parsed != null) {
+                            cls = parsed.resolveActivityTarget(cls);
+                        }
+                        if (!cls.isEmpty()) return cls;
                     }
                 }
             } catch (Throwable ignored) {
             }
+        }
+        if (parsed != null && parsed.launcherActivity != null && !parsed.launcherActivity.isEmpty()) {
+            return parsed.resolveActivityTarget(parsed.launcherActivity);
         }
         ActivityInfo[] activities = info.activities;
         if (activities == null || activities.length == 0) return "";

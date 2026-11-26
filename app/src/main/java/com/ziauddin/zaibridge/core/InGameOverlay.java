@@ -475,8 +475,6 @@ public final class InGameOverlay {
     }
 
     private View buildCheckpointRow(final String slotId) {
-        SaveStateManager.CheckpointInfo info = SaveStateManager.inspect(gameDir, slotId);
-
         LinearLayout row = new LinearLayout(hostContext);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
@@ -497,14 +495,14 @@ public final class InGameOverlay {
                 0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
         TextView name = new TextView(hostContext);
-        name.setText(info.displayName);
+        name.setText(slotId);
         name.setTextColor(0xFFE8EEF7);
         name.setTextSize(11f);
         name.setTypeface(null, Typeface.BOLD);
         col.addView(name);
 
         TextView meta = new TextView(hostContext);
-        meta.setText(info.formattedSummary());
+        meta.setText("Checking...");
         meta.setTextColor(0xFF8A99AD);
         meta.setTextSize(9f);
         col.addView(meta);
@@ -514,12 +512,26 @@ public final class InGameOverlay {
         saveBtn.setOnClickListener(v -> performForceSave(slotId));
         row.addView(saveBtn);
 
-        TextView loadBtn = actionPill("Load",
-                info.exists ? 0xFFFFB300 : 0xFF546273,
-                info.exists ? 0x22FFB300 : 0x12FFFFFF);
-        loadBtn.setEnabled(info.exists);
+        TextView loadBtn = actionPill("Load", 0xFF546273, 0x12FFFFFF);
+        loadBtn.setEnabled(false);
         loadBtn.setOnClickListener(v -> performForceLoad(slotId));
         row.addView(loadBtn);
+
+        IO_POOL.execute(() -> {
+            final SaveStateManager.CheckpointInfo info =
+                    SaveStateManager.inspect(gameDir, slotId);
+            handler.post(() -> {
+                name.setText(info.displayName);
+                meta.setText(info.formattedSummary());
+                loadBtn.setEnabled(info.exists);
+                loadBtn.setTextColor(info.exists ? 0xFFFFB300 : 0xFF546273);
+                GradientDrawable lbg = new GradientDrawable();
+                lbg.setColor(info.exists ? 0x22FFB300 : 0x12FFFFFF);
+                lbg.setCornerRadius(dp(9));
+                lbg.setStroke(dp(1), info.exists ? 0xFFFFB300 : 0xFF546273);
+                loadBtn.setBackground(lbg);
+            });
+        });
 
         return row;
     }

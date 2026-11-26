@@ -272,6 +272,10 @@ public class MainActivity extends AppCompatActivity implements GameAdapter.Liste
 
             mainHandler.post(() -> {
                 showLoading(false);
+                if (!BridgeRuntime.isInstrumentationInstalled()) {
+                    com.ziauddin.zaibridge.core.BridgeInstrumentation
+                            .install(getApplicationContext());
+                }
                 final boolean virtualized = BridgeRuntime.isInstrumentationInstalled();
                 Intent intent = new Intent(MainActivity.this, virtualized
                         ? ProxyGameActivity.class : GameHostActivity.class);

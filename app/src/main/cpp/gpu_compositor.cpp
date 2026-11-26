@@ -86,8 +86,8 @@ void main() {
 
     vec3 acc = c * 1.25;
     float wsum = 1.25;
-#define ZB_EA(sample, coeff) \
-    { float k = (coeff) / (1.0 + 18.0 * abs(luma(sample) - lc)); acc += (sample) * k; wsum += k; }
+#define ZB_EA(tap, coeff) \
+    { float k = (coeff) / (1.0 + 18.0 * abs(luma(tap) - lc)); acc += (tap) * k; wsum += k; }
     ZB_EA(n, 1.0)
     ZB_EA(s, 1.0)
     ZB_EA(e, 1.0)
@@ -486,19 +486,29 @@ struct Program {
 
 struct GlState {
     GLint fbo = 0;
+    GLint draw_fbo = 0;
+    GLint read_fbo = 0;
     GLint viewport[4] = {0, 0, 0, 0};
+    GLint scissor_box[4] = {0, 0, 0, 0};
     GLint program = 0;
     GLint active_texture = GL_TEXTURE0;
     GLint tex0 = 0;
     GLint tex1 = 0;
     GLint tex2 = 0;
+    GLint sampler0 = 0;
+    GLint sampler1 = 0;
+    GLint sampler2 = 0;
     GLint vao = 0;
     GLint array_buffer = 0;
+    GLint element_array_buffer = 0;
+    GLint renderbuffer = 0;
+    GLboolean color_mask[4] = {GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE};
     GLboolean blend = GL_FALSE;
     GLboolean depth = GL_FALSE;
     GLboolean scissor = GL_FALSE;
     GLboolean cull = GL_FALSE;
     GLboolean stencil = GL_FALSE;
+    GLboolean rasterizer_discard = GL_FALSE;
 
     struct Attrib {
         GLint enabled = 0;
@@ -560,6 +570,9 @@ struct GpuCompositor::Impl {
     // ---- GL -------------------------------------------------------------
     bool gl_ready = false;
     int gl_major = 0;
+    bool has_color_buffer_float = false;
+    bool has_color_buffer_half_float = false;
+    bool is_powervr = false;
     std::string version;
     std::string renderer;
     std::string vendor;
@@ -630,6 +643,38 @@ struct GpuCompositor::Impl {
         LOGE("compositor: %s", reason.c_str());
     }
 
+    static int parse_gles_major_from_version(const std::string& ver) {
+        // Standard GL_VERSION looks like "OpenGL ES 3.2 build ...".
+        // Earlier code checked ver[0] ('O'), which falsely returned 2 on ES 3.x!
+        const size_t es = ver.find("OpenGL ES");
+        size_t i = (es != std::string::npos) ? es + 9 : 0;
+        while (i < ver.size() && (ver[i] == ' ' || ver[i] == '-' || ver[i] == 'C' || ver[i] == 'M')) {
+            ++i;
+        }
+        if (i < ver.size() && ver[i] >= '1' && ver[i] <= '9') {
+            return ver[i] - '0';
+        }
+        return 2;
+    }
+
+    bool has_extension(const char* ext) const {
+        if (!ext || !*ext) return false;
+        if (gl_major >= 3) {
+            GLint count = 0;
+            glGetIntegerv(GL_NUM_EXTENSIONS, &count);
+            for (GLint i = 0; i < count; ++i) {
+                const GLubyte* s = glGetStringi(GL_EXTENSIONS, static_cast<GLuint>(i));
+                if (s && std::strcmp(reinterpret_cast<const char*>(s), ext) == 0) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        const GLubyte* exts = glGetString(GL_EXTENSIONS);
+        if (!exts) return false;
+        return std::strstr(reinterpret_cast<const char*>(exts), ext) != nullptr;
+    }
+
     int detect_context() {
         const GLubyte* v = glGetString(GL_VERSION);
         if (v == nullptr) return 0;
@@ -638,16 +683,41 @@ struct GpuCompositor::Impl {
         if (r != nullptr) renderer.assign(reinterpret_cast<const char*>(r));
         const GLubyte* ven = glGetString(GL_VENDOR);
         if (ven != nullptr) vendor.assign(reinterpret_cast<const char*>(ven));
-        const char first = version.empty() ? '2' : version[0];
-        return (first >= '0' && first <= '9') ? first - '0' : 2;
+
+        int major = parse_gles_major_from_version(version);
+        if (major < 3) {
+            GLint q_major = 0;
+            glGetIntegerv(GL_MAJOR_VERSION, &q_major);
+            if (glGetError() == GL_NO_ERROR && q_major >= 3) {
+                major = q_major;
+            }
+        }
+        gl_major = major;
+        is_powervr = (renderer.find("PowerVR") != std::string::npos
+                      || renderer.find("BXM") != std::string::npos
+                      || vendor.find("Imagination") != std::string::npos);
+        has_color_buffer_float = has_extension("GL_EXT_color_buffer_float");
+        has_color_buffer_half_float = has_extension("GL_EXT_color_buffer_half_float");
+        return major;
     }
 
     void save_state(GlState& s) {
-        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &s.fbo);
+        if (gl_major >= 3) {
+            glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &s.draw_fbo);
+            glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &s.read_fbo);
+            s.fbo = s.draw_fbo;
+        } else {
+            glGetIntegerv(GL_FRAMEBUFFER_BINDING, &s.fbo);
+            s.draw_fbo = s.read_fbo = s.fbo;
+        }
         glGetIntegerv(GL_VIEWPORT, s.viewport);
+        glGetIntegerv(GL_SCISSOR_BOX, s.scissor_box);
         glGetIntegerv(GL_CURRENT_PROGRAM, &s.program);
         glGetIntegerv(GL_ACTIVE_TEXTURE, &s.active_texture);
         glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &s.array_buffer);
+        glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &s.element_array_buffer);
+        glGetIntegerv(GL_RENDERBUFFER_BINDING, &s.renderbuffer);
+        glGetBooleanv(GL_COLOR_WRITEMASK, s.color_mask);
 
         glActiveTexture(GL_TEXTURE0);
         glGetIntegerv(GL_TEXTURE_BINDING_2D, &s.tex0);
@@ -655,6 +725,13 @@ struct GpuCompositor::Impl {
         glGetIntegerv(GL_TEXTURE_BINDING_2D, &s.tex1);
         glActiveTexture(GL_TEXTURE2);
         glGetIntegerv(GL_TEXTURE_BINDING_2D, &s.tex2);
+        if (gl_major >= 3) {
+            glGetIntegerv(GL_SAMPLER_BINDING, &s.sampler2);
+            glActiveTexture(GL_TEXTURE1);
+            glGetIntegerv(GL_SAMPLER_BINDING, &s.sampler1);
+            glActiveTexture(GL_TEXTURE0);
+            glGetIntegerv(GL_SAMPLER_BINDING, &s.sampler0);
+        }
         glActiveTexture(static_cast<GLenum>(s.active_texture));
 
         s.blend = glIsEnabled(GL_BLEND);
@@ -665,6 +742,7 @@ struct GpuCompositor::Impl {
 
         if (gl_major >= 3) {
             glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &s.vao);
+            s.rasterizer_discard = glIsEnabled(GL_RASTERIZER_DISCARD);
         } else {
             for (int i = 0; i < 4; ++i) {
                 GlState::Attrib& a = s.attribs[i];
@@ -680,8 +758,30 @@ struct GpuCompositor::Impl {
     }
 
     void restore_state(const GlState& s) {
-        glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(s.fbo));
+        if (gl_major >= 3) {
+            glBindVertexArray(static_cast<GLuint>(s.vao));
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(s.draw_fbo));
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(s.read_fbo));
+            glBindSampler(0, static_cast<GLuint>(s.sampler0));
+            glBindSampler(1, static_cast<GLuint>(s.sampler1));
+            glBindSampler(2, static_cast<GLuint>(s.sampler2));
+            if (s.rasterizer_discard) glEnable(GL_RASTERIZER_DISCARD);
+            else glDisable(GL_RASTERIZER_DISCARD);
+        } else {
+            glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(s.fbo));
+            for (int i = 0; i < 4; ++i) {
+                const GlState::Attrib& a = s.attribs[i];
+                glBindBuffer(GL_ARRAY_BUFFER, static_cast<GLuint>(a.buffer));
+                glVertexAttribPointer(i, a.size, static_cast<GLenum>(a.type),
+                                      static_cast<GLboolean>(a.normalized), a.stride,
+                                      a.pointer);
+                if (a.enabled) glEnableVertexAttribArray(i);
+                else glDisableVertexAttribArray(i);
+            }
+        }
         glViewport(s.viewport[0], s.viewport[1], s.viewport[2], s.viewport[3]);
+        glScissor(s.scissor_box[0], s.scissor_box[1], s.scissor_box[2], s.scissor_box[3]);
+        glColorMask(s.color_mask[0], s.color_mask[1], s.color_mask[2], s.color_mask[3]);
         glUseProgram(static_cast<GLuint>(s.program));
 
         glActiveTexture(GL_TEXTURE0);
@@ -699,19 +799,8 @@ struct GpuCompositor::Impl {
         if (s.stencil) glEnable(GL_STENCIL_TEST); else glDisable(GL_STENCIL_TEST);
 
         glBindBuffer(GL_ARRAY_BUFFER, static_cast<GLuint>(s.array_buffer));
-        if (gl_major >= 3) {
-            glBindVertexArray(static_cast<GLuint>(s.vao));
-        } else {
-            for (int i = 0; i < 4; ++i) {
-                const GlState::Attrib& a = s.attribs[i];
-                glBindBuffer(GL_ARRAY_BUFFER, static_cast<GLuint>(a.buffer));
-                glVertexAttribPointer(i, a.size, static_cast<GLenum>(a.type),
-                                      static_cast<GLboolean>(a.normalized), a.stride,
-                                      a.pointer);
-                if (a.enabled) glEnableVertexAttribArray(i);
-                else glDisableVertexAttribArray(i);
-            }
-        }
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLuint>(s.element_array_buffer));
+        glBindRenderbuffer(GL_RENDERBUFFER, static_cast<GLuint>(s.renderbuffer));
     }
 
     void destroy_target(Target& t) {
@@ -740,14 +829,12 @@ struct GpuCompositor::Impl {
         tsr_valid = false;
     }
 
-    bool make_target(Target& t, int w, int h, bool depth, bool nearest = false) {
-        if (w <= 0 || h <= 0) return false;
-        if (t.fbo != 0 && t.w == w && t.h == h) return true;
+    bool make_target_format(Target& t, int w, int h, bool depth, bool nearest,
+                            GLint internal_fmt, GLenum depth_fmt) {
         destroy_target(t);
-
         glGenTextures(1, &t.tex);
         glBindTexture(GL_TEXTURE_2D, t.tex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA,
+        glTexImage2D(GL_TEXTURE_2D, 0, internal_fmt, w, h, 0, GL_RGBA,
                      GL_UNSIGNED_BYTE, nullptr);
         const GLint filter = nearest ? GL_NEAREST : GL_LINEAR;
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
@@ -761,20 +848,49 @@ struct GpuCompositor::Impl {
         if (depth) {
             glGenRenderbuffers(1, &t.depth);
             glBindRenderbuffer(GL_RENDERBUFFER, t.depth);
-            glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, w, h);
-            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
-                                      GL_RENDERBUFFER, t.depth);
+            glRenderbufferStorage(GL_RENDERBUFFER, depth_fmt, w, h);
+            if (depth_fmt == GL_DEPTH24_STENCIL8) {
+                glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
+                                          GL_RENDERBUFFER, t.depth);
+            } else {
+                glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                          GL_RENDERBUFFER, t.depth);
+            }
         }
         const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
         if (status != GL_FRAMEBUFFER_COMPLETE) {
-            note_failure("incomplete FBO " + std::to_string(w) + "x" + std::to_string(h) +
-                         " status=" + std::to_string(static_cast<int>(status)));
             destroy_target(t);
             return false;
         }
         t.w = w;
         t.h = h;
         return true;
+    }
+
+    bool make_target(Target& t, int w, int h, bool depth, bool nearest = false) {
+        if (w <= 0 || h <= 0) return false;
+        if (t.fbo != 0 && t.w == w && t.h == h) return true;
+
+        // PowerVR B-Series / mobile GPU safe order:
+        // Default to sized GL_RGBA8 (+ GL_DEPTH24_STENCIL8 on GLES3) rather than float FBOs;
+        // cleanly fall back to unsized GL_RGBA + GL_DEPTH_COMPONENT16 if incomplete.
+        if (gl_major >= 3) {
+            if (make_target_format(t, w, h, depth, nearest, GL_RGBA8,
+                                   depth ? GL_DEPTH24_STENCIL8 : GL_DEPTH_COMPONENT16)) {
+                return true;
+            }
+            if (depth && make_target_format(t, w, h, true, nearest, GL_RGBA8,
+                                            GL_DEPTH_COMPONENT16)) {
+                return true;
+            }
+        }
+        if (make_target_format(t, w, h, depth, nearest, GL_RGBA, GL_DEPTH_COMPONENT16)) {
+            return true;
+        }
+        note_failure("incomplete FBO " + std::to_string(w) + "x" + std::to_string(h) +
+                     " (float_ext=" + std::to_string(has_color_buffer_float ? 1 : 0) +
+                     " half_float_ext=" + std::to_string(has_color_buffer_half_float ? 1 : 0) + ")");
+        return false;
     }
 
     GLuint compile(GLenum type, const char* body, const char* label) {
@@ -882,23 +998,35 @@ struct GpuCompositor::Impl {
     }
 
     void bind_quad() {
-        glBindBuffer(GL_ARRAY_BUFFER, vbo);
-        glEnableVertexAttribArray(0);
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
-                              reinterpret_cast<const void*>(0));
-        glEnableVertexAttribArray(1);
-        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
-                              reinterpret_cast<const void*>(2 * sizeof(float)));
+        if (gl_major >= 3 && vao != 0) {
+            glBindVertexArray(vao);
+        } else {
+            glBindBuffer(GL_ARRAY_BUFFER, vbo);
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
+                                  reinterpret_cast<const void*>(0));
+            glEnableVertexAttribArray(1);
+            glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
+                                  reinterpret_cast<const void*>(2 * sizeof(float)));
+        }
     }
 
     void prepare_draw(GLuint fbo, int w, int h) {
         glBindFramebuffer(GL_FRAMEBUFFER, fbo);
         glViewport(0, 0, w, h);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         glDisable(GL_BLEND);
         glDisable(GL_DEPTH_TEST);
         glDisable(GL_SCISSOR_TEST);
         glDisable(GL_CULL_FACE);
         glDisable(GL_STENCIL_TEST);
+        if (gl_major >= 3) {
+            glDisable(GL_RASTERIZER_DISCARD);
+            glBindSampler(0, 0);
+            glBindSampler(1, 0);
+            glBindSampler(2, 0);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        }
     }
 
     void set1i(GLuint p, const char* n, int v) {
@@ -923,10 +1051,26 @@ struct GpuCompositor::Impl {
         return bilinear;
     }
 
-    void capture(GLuint read_fbo, Target& dst, int w, int h) {
-        prepare_draw(read_fbo, w, h);
+    void capture(GLuint read_fbo, Target& dst, int src_w, int src_h) {
+        if (gl_major >= 3 && dst.fbo != 0) {
+            while (glGetError() != GL_NO_ERROR) {}
+            glDisable(GL_SCISSOR_TEST);
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, read_fbo);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dst.fbo);
+            GLint sample_buffers = 0;
+            glGetIntegerv(GL_SAMPLE_BUFFERS, &sample_buffers);
+            // ES 3.0+ requires GL_NEAREST when resolving a multisampled read FBO.
+            const GLenum filter = (sample_buffers > 0) ? GL_NEAREST : GL_LINEAR;
+            glBlitFramebuffer(0, 0, src_w, src_h, 0, 0, dst.w, dst.h,
+                              GL_COLOR_BUFFER_BIT, filter);
+            if (glGetError() == GL_NO_ERROR) {
+                return;
+            }
+        }
+        prepare_draw(read_fbo, dst.w, dst.h);
         glBindTexture(GL_TEXTURE_2D, dst.tex);
-        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, w, h);
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, dst.w, dst.h);
     }
 
     bool run_motion_pass(Target& out, const Target* base, const Target& prev,

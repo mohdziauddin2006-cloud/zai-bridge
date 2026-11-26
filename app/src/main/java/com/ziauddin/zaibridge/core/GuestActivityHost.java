@@ -66,13 +66,27 @@ public final class GuestActivityHost {
                 return false;
             }
 
-            guest = (Activity) cls.getDeclaredConstructor().newInstance();
+            Constructor<?> ctor = cls.getDeclaredConstructor();
+            ctor.setAccessible(true);
+            guest = (Activity) ctor.newInstance();
 
-            // Give the instance the guest's storage view and system services.
+            boolean isNative64 = GuestLauncher.isNative64Game(null, gameDir);
+            GuestContext guestContext = new GuestContext(
+                    host, gameDir, guestPackage, launcherActivity, isNative64, loader);
+
+            // Give the instance the guest's storage view, Resources, and system services.
             // mBase is the ContextWrapper field every Activity inherits.
             Field base = ContextWrapper.class.getDeclaredField("mBase");
             base.setAccessible(true);
-            base.set(guest, new GuestContext(host, gameDir, guestPackage, loader));
+            base.set(guest, guestContext);
+
+            setField(android.view.ContextThemeWrapper.class, guest, "mResources", guestContext.getResources());
+            setField(android.view.ContextThemeWrapper.class, guest, "mTheme", guestContext.getTheme());
+            setField(android.view.ContextThemeWrapper.class, guest, "mInflater", null);
+            setField(Activity.class, guest, "mApplication", guestContext.getGuestApplication());
+            setField(Activity.class, guest, "mActivityInfo",
+                    guestContext.resolveGuestActivityInfo(
+                            new android.content.ComponentName(guestPackage, launcherActivity)));
 
             Window window = createWindow();
             attached = window != null;
@@ -114,12 +128,16 @@ public final class GuestActivityHost {
                     .invoke(null);
             android.app.Instrumentation instrumentation =
                     new android.app.Instrumentation();
-            android.app.Application application = hostActivity != null
-                    ? hostActivity.getApplication() : null;
-            // Activity#getActivityInfo() is not public on API 34, so read the
-            // field the framework itself populated for the host Activity.
+            android.content.Context guestBase = guest.getBaseContext();
+            android.app.Application application = (guestBase instanceof GuestContext)
+                    ? ((GuestContext) guestBase).getGuestApplication()
+                    : (hostActivity != null ? hostActivity.getApplication() : null);
             android.content.pm.ActivityInfo info = null;
-            if (hostActivity != null) {
+            if (guestBase instanceof GuestContext) {
+                info = ((GuestContext) guestBase).resolveGuestActivityInfo(
+                        new android.content.ComponentName(guestPackage, activityName));
+            }
+            if (info == null && hostActivity != null) {
                 Field infoField = Activity.class.getDeclaredField("mActivityInfo");
                 infoField.setAccessible(true);
                 info = (android.content.pm.ActivityInfo) infoField.get(hostActivity);

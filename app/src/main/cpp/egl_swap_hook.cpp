@@ -175,8 +175,23 @@ int host_gles_major() {
     if (g_gl_get_string == nullptr) return 2;
     const GLubyte* version = g_gl_get_string(GL_VERSION);
     if (version == nullptr) return 2;
-    const char first = reinterpret_cast<const char*>(version)[0];
-    g_gl_major = (first >= '0' && first <= '9') ? first - '0' : 2;
+    const std::string ver(reinterpret_cast<const char*>(version));
+    const size_t es = ver.find("OpenGL ES");
+    size_t i = (es != std::string::npos) ? es + 9 : 0;
+    while (i < ver.size() && (ver[i] == ' ' || ver[i] == '-' || ver[i] == 'C' || ver[i] == 'M')) {
+        ++i;
+    }
+    int parsed = (i < ver.size() && ver[i] >= '1' && ver[i] <= '9') ? (ver[i] - '0') : 2;
+    EGLDisplay dpy = eglGetCurrentDisplay();
+    EGLContext ctx = eglGetCurrentContext();
+    if (parsed < 3 && dpy != EGL_NO_DISPLAY && ctx != EGL_NO_CONTEXT) {
+        EGLint client_ver = 0;
+        if (eglQueryContext(dpy, ctx, EGL_CONTEXT_CLIENT_VERSION, &client_ver) == EGL_TRUE
+                && client_ver >= 3) {
+            parsed = client_ver;
+        }
+    }
+    g_gl_major = parsed;
     return g_gl_major;
 }
 

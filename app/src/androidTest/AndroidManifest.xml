@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <uses-library
+            android:name="android.test.runner"
+            android:required="true" />
+    </application>
+    <instrumentation
+        android:name="android.test.InstrumentationTestRunner"
+        android:targetPackage="com.ziauddin.zaibridge"
+        android:label="Zai-Bridge Verification Suite" />
+</manifest>

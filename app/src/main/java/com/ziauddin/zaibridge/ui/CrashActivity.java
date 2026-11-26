@@ -56,31 +56,43 @@ public class CrashActivity extends AppCompatActivity {
             crashInfo = readLastCrashFile();
         }
 
-        String socLine = Build.HARDWARE;
-        try {
-            SoCProfiler.Profile profile = SoCProfiler.get(this);
-            socLine = profile.socName + " · " + profile.gpuName + " (" + profile.tierLabel + ")";
-        } catch (Throwable ignored) {
-        }
-
-        String deviceInfo = "Zai-Bridge v3.2.0 · Android " + Build.VERSION.RELEASE
+        final String bodyText = crashInfo != null ? crashInfo : errorMessage;
+        final String baseDeviceHeader = "Zai-Bridge v3.2.0 · Android " + Build.VERSION.RELEASE
                 + " (API " + Build.VERSION.SDK_INT + ")\n"
                 + "Device: " + Build.MANUFACTURER + " " + Build.MODEL + " (" + Build.DEVICE + ")\n"
-                + "SoC / GPU: " + socLine + "\n"
                 + "ABI: " + (Build.SUPPORTED_ABIS.length > 0 ? Build.SUPPORTED_ABIS[0] : "unknown");
 
-        tvDevice.setText(deviceInfo);
+        String initialDeviceInfo = baseDeviceHeader + "\nSoC / GPU: " + Build.HARDWARE;
+        tvDevice.setText(initialDeviceInfo);
         tvError.setText(errorMessage != null && !errorMessage.isEmpty()
                 ? errorMessage : "Fatal unhandled runtime exception");
         tvStack.setText(crashInfo != null && !crashInfo.isEmpty()
                 ? crashInfo : "No stack trace recorded.");
 
-        final String fullReport = deviceInfo + "\n\n" + (crashInfo != null ? crashInfo : errorMessage);
+        final StringBuilder fullReportHolder = new StringBuilder(
+                initialDeviceInfo + "\n\n" + bodyText);
+
+        new Thread(() -> {
+            try {
+                SoCProfiler.Profile profile = SoCProfiler.get(this);
+                String socLine = profile.socName + " · " + profile.gpuName
+                        + " (" + profile.tierLabel + ")";
+                String updatedInfo = baseDeviceHeader + "\nSoC / GPU: " + socLine;
+                runOnUiThread(() -> {
+                    if (isFinishing() || isDestroyed()) return;
+                    tvDevice.setText(updatedInfo);
+                    fullReportHolder.setLength(0);
+                    fullReportHolder.append(updatedInfo).append("\n\n").append(bodyText);
+                });
+            } catch (Throwable ignored) {
+            }
+        }, "zai-crash-soc").start();
 
         btnCopy.setOnClickListener(v -> {
             ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
             if (cm != null) {
-                cm.setPrimaryClip(ClipData.newPlainText("Zai-Bridge Diagnostic Report", fullReport));
+                cm.setPrimaryClip(ClipData.newPlainText(
+                        "Zai-Bridge Diagnostic Report", fullReportHolder.toString()));
                 Toast.makeText(this, "Diagnostic report copied to clipboard", Toast.LENGTH_SHORT).show();
             }
         });

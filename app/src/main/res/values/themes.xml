@@ -64,17 +64,19 @@
     </style>
 
     <!-- =====================================================================
-         Game host. The explicit NoTitleBar + Fullscreen parent is what removes
-         every trace of the host: no title bar, no decor window, and the
-         activity then clears the system bars itself.
+         Game host. Uses a Dark Material/AppCompat parent so AppCompatActivity,
+         GameActivity, and UnityPlayerGameActivity subclasses inflate cleanly
+         while preserving fullscreen, cutout, and zero-title-bar behavior.
     -->
-    <style name="Theme.ZaiBridge.GameHost" parent="@android:style/Theme.NoTitleBar.Fullscreen">
+    <style name="Theme.ZaiBridge.GameHost" parent="Theme.Material3.Dark.NoActionBar">
         <item name="android:windowBackground">@color/zb_black</item>
         <item name="android:colorBackground">@color/zb_black</item>
         <item name="android:windowNoTitle">true</item>
         <item name="android:windowFullscreen">true</item>
         <item name="android:windowContentOverlay">@null</item>
         <item name="android:windowActionBar">false</item>
+        <item name="windowNoTitle">true</item>
+        <item name="windowActionBar">false</item>
         <item name="android:windowLayoutInDisplayCutoutMode" tools:targetApi="27">shortEdges</item>
         <item name="android:windowLightStatusBar">false</item>
         <item name="android:windowDisablePreview">true</item>

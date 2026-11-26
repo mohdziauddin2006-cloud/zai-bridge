@@ -111,6 +111,9 @@ public final class BridgeInstrumentation extends Instrumentation {
             InstantiationException {
         if (ProxyGameActivity.class.getName().equals(className)) {
             Context ctx = BridgeApplication.get();
+            if (ctx == null) {
+                ctx = getTargetContext();
+            }
             if (ctx != null) {
                 Activity guest = GuestLauncher.createGuest(ctx, intent);
                 if (guest != null) {
@@ -119,6 +122,9 @@ public final class BridgeInstrumentation extends Instrumentation {
                             + guest.getClass().getName());
                     return guest;
                 }
+            } else {
+                GuestLauncher.recordLaunchError(
+                        "BridgeApplication context was null in Instrumentation.newActivity", null);
             }
             Log.w(TAG, "guest unavailable; falling back to the proxy Activity");
         }
@@ -128,6 +134,7 @@ public final class BridgeInstrumentation extends Instrumentation {
     @Override
     public void callActivityOnCreate(Activity activity, Bundle icicle) {
         Context ctx = BridgeApplication.get();
+        if (ctx == null) ctx = getTargetContext();
         final boolean guest = isGuest(activity);
         if (ctx != null && guest) {
             GuestLauncher.attachGuestContext(activity, ctx);
@@ -141,9 +148,7 @@ public final class BridgeInstrumentation extends Instrumentation {
             // orientation and may have asked for it. The imported manifest wins.
             GuestLauncher.confirmGuestOrientation(activity);
             // The guest inflated its view tree during onCreate; the surface can
-            // be handed to the core from the next layout pass onwards. Input is
-            // dispatched by the framework into the same window, so the probe
-            // only observes it.
+            // be handed to the core from the next layout pass onwards.
             GuestLauncher.hookSurface(activity);
             GuestLauncher.probeInput(activity);
             GuestLauncher.attachOverlayAndRefreshHooks(activity, ctx);
@@ -157,17 +162,11 @@ public final class BridgeInstrumentation extends Instrumentation {
     /**
      * Rewrites a guest's {@code startActivity} into another launch of the
      * proxy, carrying the new target class in {@code GUEST_ACTIVITY_CLASS}.
-     *
-     * <p>{@code Instrumentation.execStartActivity} is a hidden framework
-     * method (it does not exist in the public SDK stubs), so this override is
-     * declared without {@code @Override} and delegates through reflection.
-     * Dynamic dispatch still reaches it, because the runtime superclass method
-     * has exactly this signature.
      */
     public Instrumentation.ActivityResult execStartActivity(
             Context who, IBinder contextThread, IBinder token, Activity target,
             Intent intent, int requestCode, Bundle options) {
-        final Intent rewritten = rewriteGuestIntent(target, intent);
+        final Intent rewritten = rewriteGuestIntent(target, who, intent);
         final Intent effective = rewritten != null ? rewritten : intent;
         Instrumentation base = delegate;
         if (base == null || base == this) base = new Instrumentation();
@@ -179,7 +178,32 @@ public final class BridgeInstrumentation extends Instrumentation {
             return (Instrumentation.ActivityResult) method.invoke(base, who, contextThread,
                     token, target, effective, requestCode, options);
         } catch (Throwable t) {
-            Log.e(TAG, "execStartActivity: base delegate unavailable", t);
+            Log.e(TAG, "execStartActivity(Activity): base delegate unavailable", t);
+            return null;
+        }
+    }
+
+    /**
+     * Handles non-Activity {@code Context.startActivity} calls (e.g. from
+     * {@code GuestApplication} or {@code GuestContext}) where Android invokes the
+     * {@code String target} hidden overload.
+     */
+    public Instrumentation.ActivityResult execStartActivity(
+            Context who, IBinder contextThread, IBinder token, String target,
+            Intent intent, int requestCode, Bundle options) {
+        final Intent rewritten = rewriteGuestIntent(null, who, intent);
+        final Intent effective = rewritten != null ? rewritten : intent;
+        Instrumentation base = delegate;
+        if (base == null || base == this) base = new Instrumentation();
+        try {
+            Method method = Instrumentation.class.getDeclaredMethod("execStartActivity",
+                    Context.class, IBinder.class, IBinder.class, String.class,
+                    Intent.class, int.class, Bundle.class);
+            method.setAccessible(true);
+            return (Instrumentation.ActivityResult) method.invoke(base, who, contextThread,
+                    token, target, effective, requestCode, options);
+        } catch (Throwable t) {
+            Log.e(TAG, "execStartActivity(String): base delegate unavailable", t);
             return null;
         }
     }
@@ -188,25 +212,40 @@ public final class BridgeInstrumentation extends Instrumentation {
      * @return a copy of {@code intent} that launches ProxyGameActivity for the
      *         requested class, or null when the intent should be left alone.
      */
-    private static Intent rewriteGuestIntent(Activity target, Intent intent) {
-        if (intent == null || !isGuest(target)) return null;
-        ComponentName component = intent.getComponent();
-        if (component == null) return null;
-
+    private static Intent rewriteGuestIntent(Activity target, Context who, Intent intent) {
+        if (intent == null) return null;
         final String pkg = GuestLauncher.getGuestPackage();
         final String dir = GuestLauncher.getGameDir();
         final Context host = BridgeApplication.get();
         if (pkg == null || dir == null || host == null) return null;
-        if (!pkg.equals(component.getPackageName())) return null;
-        if (ProxyGameActivity.class.getName().equals(component.getClassName())) return null;
+
+        boolean fromGuest = isGuest(target)
+                || who instanceof GuestContext
+                || who instanceof GuestApplication
+                || (who != null && pkg.equals(who.getPackageName()));
+        if (!fromGuest) return null;
+
+        ComponentName component = intent.getComponent();
+        if (component == null) return null;
+
+        String compPkg = component.getPackageName();
+        if (!pkg.equals(compPkg) && !host.getPackageName().equals(compPkg)) {
+            return null;
+        }
+        String rawClass = component.getClassName();
+        if (rawClass == null || rawClass.isEmpty()
+                || ProxyGameActivity.class.getName().equals(rawClass)) {
+            return null;
+        }
+        String targetClass = BinaryXmlManifestReader.normalizeClassName(pkg, rawClass);
 
         Intent out = new Intent(intent);   // preserves every extra and flag
         out.setComponent(new ComponentName(host.getPackageName(),
                 ProxyGameActivity.class.getName()));
         out.putExtra(GuestLauncher.EXTRA_GAME_DIR, dir);
-        out.putExtra(GuestLauncher.EXTRA_GUEST_ACTIVITY, component.getClassName());
+        out.putExtra(GuestLauncher.EXTRA_GUEST_ACTIVITY, targetClass);
         Log.i(TAG, "execStartActivity: " + component.flattenToShortString()
-                + " -> ProxyGameActivity (guest class preserved in extras)");
+                + " -> ProxyGameActivity (guest class=" + targetClass + ")");
         return out;
     }
 

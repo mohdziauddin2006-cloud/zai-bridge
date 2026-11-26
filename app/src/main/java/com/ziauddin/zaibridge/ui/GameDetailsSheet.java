@@ -418,17 +418,26 @@ public final class GameDetailsSheet {
     // ------------------------------------------------------------------
 
     private void bindSocProfile(View content) {
-        final SoCProfiler.Profile profile = SoCProfiler.probe(activity);
-        // The tier names the device, the action rewrites the controls.
-        socProfile.setText(profile.detail());
+        socProfile.setText(android.os.Build.HARDWARE + " \u00b7 Detecting GPU...");
         View apply = content.findViewById(R.id.btn_apply_recommended);
-        apply.setOnClickListener(v -> {
-            copyInto(SoCProfiler.recommend(activity, profile));
-            draft.berserk = 0;
-            syncUi();
-            applyLive();
-            Toast.makeText(activity, R.string.recommended_applied, Toast.LENGTH_SHORT).show();
-        });
+        apply.setEnabled(false);
+
+        new Thread(() -> {
+            final SoCProfiler.Profile profile = SoCProfiler.probe(activity);
+            if (activity.isFinishing() || activity.isDestroyed()) return;
+            activity.runOnUiThread(() -> {
+                if (!dialog.isShowing() || activity.isFinishing() || activity.isDestroyed()) return;
+                socProfile.setText(profile.detail());
+                apply.setEnabled(true);
+                apply.setOnClickListener(v -> {
+                    copyInto(SoCProfiler.recommend(activity, profile));
+                    draft.berserk = 0;
+                    syncUi();
+                    applyLive();
+                    Toast.makeText(activity, R.string.recommended_applied, Toast.LENGTH_SHORT).show();
+                });
+            });
+        }, "zai-soc-probe").start();
     }
 
     private void bindBerserk() {
@@ -453,51 +462,74 @@ public final class GameDetailsSheet {
         View save = content.findViewById(R.id.btn_force_save);
         View load = content.findViewById(R.id.btn_force_load);
         save.setOnClickListener(v -> {
-            File written = SaveStateManager.save(activity, gameDir, saveSlot);
-            Toast.makeText(activity,
-                    written != null
-                            ? get(activity.getString(R.string.save_written),
-                                    SaveStateManager.labelOf(saveSlot))
-                            : get(activity.getString(R.string.save_failed),
-                                    SaveStateManager.labelOf(saveSlot)),
-                    Toast.LENGTH_SHORT).show();
-            refreshSaveStatus();
+            save.setEnabled(false);
+            load.setEnabled(false);
+            final int slot = saveSlot;
+            new Thread(() -> {
+                File written = SaveStateManager.save(activity, gameDir, slot);
+                activity.runOnUiThread(() -> {
+                    save.setEnabled(true);
+                    load.setEnabled(true);
+                    Toast.makeText(activity,
+                            written != null
+                                    ? get(activity.getString(R.string.save_written),
+                                            SaveStateManager.labelOf(slot))
+                                    : get(activity.getString(R.string.save_failed),
+                                            SaveStateManager.labelOf(slot)),
+                            Toast.LENGTH_SHORT).show();
+                    refreshSaveStatus();
+                });
+            }, "zai-force-save").start();
         });
         load.setOnClickListener(v -> {
-            int restored = SaveStateManager.restore(activity, gameDir, saveSlot);
-            if (restored < 0) {
-                Toast.makeText(activity,
-                        get(activity.getString(R.string.save_missing),
-                                SaveStateManager.labelOf(saveSlot)),
-                        Toast.LENGTH_SHORT).show();
-                return;
-            }
-            Toast.makeText(activity,
-                    get(activity.getString(R.string.save_restored),
-                            SaveStateManager.labelOf(saveSlot)),
-                    Toast.LENGTH_LONG).show();
-            // A running guest cannot have its database swapped underneath it:
-            // resume means relaunch from the restored state.
-            persist();
-            if (onPlay != null) {
-                dialog.dismiss();
-                onPlay.onPlay(game, draft);
-            }
+            save.setEnabled(false);
+            load.setEnabled(false);
+            final int slot = saveSlot;
+            new Thread(() -> {
+                int restored = SaveStateManager.restore(activity, gameDir, slot);
+                activity.runOnUiThread(() -> {
+                    save.setEnabled(true);
+                    load.setEnabled(true);
+                    if (restored < 0) {
+                        Toast.makeText(activity,
+                                get(activity.getString(R.string.save_missing),
+                                        SaveStateManager.labelOf(slot)),
+                                Toast.LENGTH_SHORT).show();
+                        return;
+                    }
+                    Toast.makeText(activity,
+                            get(activity.getString(R.string.save_restored),
+                                    SaveStateManager.labelOf(slot)),
+                            Toast.LENGTH_LONG).show();
+                    persist();
+                    if (onPlay != null) {
+                        dialog.dismiss();
+                        onPlay.onPlay(game, draft);
+                    }
+                });
+            }, "zai-force-load").start();
         });
         refreshSaveStatus();
     }
 
     private void refreshSaveStatus() {
         if (saveStatus == null || gameDir == null) return;
-        long stamp = SaveStateManager.timestamp(gameDir, saveSlot);
-        String label = SaveStateManager.labelOf(saveSlot);
-        if (stamp <= 0) {
-            saveStatus.setText(label + " · " + activity.getString(R.string.save_state_empty));
-            return;
-        }
-        String when = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US)
-                .format(new java.util.Date(stamp));
-        saveStatus.setText(label + " · " + when);
+        final int slot = saveSlot;
+        final String label = SaveStateManager.labelOf(slot);
+        saveStatus.setText(label + " · ...");
+        new Thread(() -> {
+            long stamp = SaveStateManager.timestamp(gameDir, slot);
+            activity.runOnUiThread(() -> {
+                if (saveStatus == null || slot != saveSlot) return;
+                if (stamp <= 0) {
+                    saveStatus.setText(label + " · " + activity.getString(R.string.save_state_empty));
+                    return;
+                }
+                String when = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US)
+                        .format(new java.util.Date(stamp));
+                saveStatus.setText(label + " · " + when);
+            });
+        }, "zai-save-status").start();
     }
 
     private static int slotOf(int chipId) {

@@ -60,10 +60,15 @@ public final class GuestLauncher {
     private static volatile String sessionGameDir;
     private static volatile ClassLoader guestLoader;
     private static volatile File guestLoaderDir;
+    private static volatile boolean guestLoaderNative64;
     private static volatile File guestGameDir;
     private static volatile String guestPackage;
     private static volatile String guestClass;
     private static volatile boolean guestNative64;
+    private static volatile GuestContext cachedGuestContext;
+    private static volatile File cachedGuestContextDir;
+    private static volatile String cachedGuestContextActivity;
+    private static volatile String lastLaunchError;
 
     private static final ExecutorService SURFACE_QUEUE = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "zai-bridge-surface");
@@ -74,37 +79,79 @@ public final class GuestLauncher {
     private GuestLauncher() {
     }
 
+    public static String getLastLaunchError() {
+        return lastLaunchError;
+    }
+
+    public static void clearLastLaunchError() {
+        lastLaunchError = null;
+    }
+
+    public static void recordLaunchError(String summary, Throwable t) {
+        StringBuilder sb = new StringBuilder();
+        if (summary != null && !summary.isEmpty()) {
+            sb.append(summary);
+        }
+        if (t != null) {
+            if (sb.length() > 0) sb.append("\n\n");
+            java.io.StringWriter sw = new java.io.StringWriter();
+            java.io.PrintWriter pw = new java.io.PrintWriter(sw);
+            t.printStackTrace(pw);
+            pw.flush();
+            sb.append(sw.toString());
+        }
+        lastLaunchError = sb.toString();
+    }
+
     // ------------------------------------------------------------------
     // Framework path (called from BridgeInstrumentation)
     // ------------------------------------------------------------------
 
     public static Activity createGuest(Context ctx, Intent intent) {
+        clearLastLaunchError();
         BridgeRuntime.ensureInitialized(ctx);
-        final String dir = intent.getStringExtra(EXTRA_GAME_DIR);
+        final String dir = intent == null ? null : intent.getStringExtra(EXTRA_GAME_DIR);
         if (dir == null || dir.isEmpty()) {
-            Log.w(TAG, "proxy launch without a game directory");
+            String msg = "Proxy launch invoked without EXTRA_GAME_DIR";
+            Log.w(TAG, msg);
+            recordLaunchError(msg, null);
             return null;
         }
         final File gameDir = new File(dir);
         final File apk = new File(gameDir, "game.apk");
         if (!apk.isFile()) {
-            Log.e(TAG, "incomplete import: " + dir);
+            String msg = "Incomplete import: missing base game.apk at " + apk.getAbsolutePath();
+            Log.e(TAG, msg);
+            recordLaunchError(msg, null);
             return null;
         }
 
         try {
             Game game = GameRepository.load(gameDir);
+            final String pkg = game != null && game.packageName != null && !game.packageName.isEmpty()
+                    ? game.packageName : gameDir.getName();
+
+            BinaryXmlManifestReader.ParsedManifest manifest =
+                    BinaryXmlManifestReader.readFromApk(apk.getAbsolutePath());
+
             String name = intent.getStringExtra(EXTRA_GUEST_ACTIVITY);
             if (name == null || name.isEmpty()) {
                 name = game != null && game.launcherActivity != null
                         ? game.launcherActivity : "";
             }
             if (name.isEmpty()) {
-                Log.e(TAG, "guest manifest declares no launchable Activity");
+                name = manifest.launcherActivity;
+            }
+            name = BinaryXmlManifestReader.normalizeClassName(pkg, name);
+            name = manifest.resolveActivityTarget(name);
+
+            if (name.isEmpty()) {
+                String msg = "Guest AndroidManifest.xml declares no launchable Activity (" + pkg + ")";
+                Log.e(TAG, msg);
+                recordLaunchError(msg, null);
                 return null;
             }
 
-            final String pkg = game != null ? game.packageName : gameDir.getName();
             final boolean isNative64 = isNative64Game(game, gameDir);
             guestPackage = pkg;
             guestGameDir = gameDir;
@@ -116,10 +163,17 @@ public final class GuestLauncher {
             GraphicsSettings graphics = GraphicsSettings.forGame(ctx, gameDir);
             EglSwapHook.configure(graphics);
 
-            unpackBundledAssets(apk, gameDir);
+            // NOTE: Do not run full asset zip extraction on the UI thread if prepareGame()
+            // already unpacked; unpackBundledAssets fast-returns when stamp exists.
+            if (!new File(gameDir, "data/.zai-assets-unpacked").isFile() && !isNative64) {
+                unpackBundledAssets(apk, gameDir);
+            }
 
-            ClassLoader loader = ensureGuestLoader(ctx, gameDir, isNative64);
+            ClassLoader loader = ensureGuestLoader(ctx, gameDir, pkg, isNative64);
             Thread.currentThread().setContextClassLoader(loader);
+
+            // Warm GuestContext right away if prepareGame didn't pre-warm it yet.
+            getOrCreateGuestContext(ctx.getApplicationContext(), gameDir, pkg, name, isNative64, loader);
 
             if (isNative64) {
                 // Close any lingering Unicorn session from an earlier 32-bit game.
@@ -139,10 +193,14 @@ public final class GuestLauncher {
 
             Class<?> cls = Class.forName(name, true, loader);
             if (!Activity.class.isAssignableFrom(cls)) {
-                Log.e(TAG, name + " is not an android.app.Activity");
+                String msg = name + " does not extend android.app.Activity (resolved for " + pkg + ")";
+                Log.e(TAG, msg);
+                recordLaunchError(msg, null);
                 return null;
             }
-            Activity guest = (Activity) cls.getDeclaredConstructor().newInstance();
+            java.lang.reflect.Constructor<?> ctor = cls.getDeclaredConstructor();
+            ctor.setAccessible(true);
+            Activity guest = (Activity) ctor.newInstance();
 
             // Refresh PLT/GOT hooks in case static initializers just dlopen'd guest .so libs.
             EglSwapHook.refreshNativeHooks();
@@ -152,15 +210,19 @@ public final class GuestLauncher {
             return guest;
         } catch (Throwable t) {
             Log.e(TAG, "guest Activity could not be created", t);
+            recordLaunchError("Failed instantiating guest Activity ("
+                    + t.getClass().getName() + ": " + t.getMessage() + ")", t);
             return null;
         }
     }
 
     /**
-     * Prepares runtime extraction, guest dex loading, and initializes the
-     * native session off the UI thread before launching the Activity.
+     * Prepares runtime extraction, guest dex loading, manifest resolution,
+     * {@link GuestContext} pre-binding, and initializes the native session off the UI thread
+     * before launching the Proxy Activity.
      */
     public static void prepareGame(Context ctx, File gameDir, Game game) {
+        clearLastLaunchError();
         BridgeRuntime.ensureInitialized(ctx);
         if (gameDir == null || !gameDir.isDirectory()) return;
 
@@ -173,10 +235,25 @@ public final class GuestLauncher {
         File apk = new File(gameDir, "game.apk");
         if (!apk.isFile()) return;
 
+        unpackBundledAssets(apk, gameDir);
+
         EglSwapHook.install();
         EglSwapHook.configure(GraphicsSettings.forGame(ctx, gameDir));
 
-        ClassLoader loader = ensureGuestLoader(ctx, gameDir, isNative64);
+        ClassLoader loader = ensureGuestLoader(ctx, gameDir, pkg, isNative64);
+        String launchClass = game != null && game.launcherActivity != null ? game.launcherActivity : "";
+        BinaryXmlManifestReader.ParsedManifest manifest =
+                BinaryXmlManifestReader.readFromApk(apk.getAbsolutePath());
+        if (launchClass.isEmpty()) {
+            launchClass = manifest.launcherActivity;
+        }
+        launchClass = BinaryXmlManifestReader.normalizeClassName(pkg, launchClass);
+        launchClass = manifest.resolveActivityTarget(launchClass);
+        guestClass = launchClass;
+
+        // Pre-warm GuestContext & Resources/AssetManager off UI thread so launch is instant.
+        getOrCreateGuestContext(ctx.getApplicationContext(), gameDir, pkg, launchClass, isNative64, loader);
+
         if (!isNative64) {
             final boolean hasPayload = hasNativePayload(new File(gameDir, "payload"));
             if (hasPayload) {
@@ -189,8 +266,9 @@ public final class GuestLauncher {
     }
 
     private static synchronized ClassLoader ensureGuestLoader(Context ctx, File gameDir,
-                                                              boolean isNative64) {
-        if (guestLoader != null && gameDir.equals(guestLoaderDir)) {
+                                                              String pkg, boolean isNative64) {
+        if (guestLoader != null && gameDir.equals(guestLoaderDir)
+                && guestLoaderNative64 == isNative64) {
             return guestLoader;
         }
 
@@ -203,16 +281,19 @@ public final class GuestLauncher {
 
         File nativeDir;
         String hostLibrary;
+        String searchPath;
         if (isNative64) {
             File dir64 = new File(gameDir, "native64");
             nativeDir = dir64.isDirectory() ? dir64 : new File(gameDir, "native");
-            // Passing hostLibrary = null lets GuestDexLoader.findLibrary() load
-            // the guest's real native 64-bit .so files directly on the host CPU.
+            // Passing hostLibrary = null lets GuestDexLoader load guest native 64-bit .so libs
+            // child-first and directly from staged native64/, installed native dir, or split APKs.
             hostLibrary = null;
+            searchPath = buildNativeLibrarySearchPath(ctx, gameDir, pkg, true);
         } else {
             nativeDir = new File(gameDir, "native");
             hostLibrary = UnicornBridge.isPassthrough()
                     ? null : GuestDexLoader.hostBridgeLibrary(ctx);
+            searchPath = buildNativeLibrarySearchPath(ctx, gameDir, pkg, false);
         }
 
         ClassLoader parent = isNative64
@@ -220,14 +301,101 @@ public final class GuestLauncher {
                 : GuestDexLoader.legacyParent(ctx, GuestLauncher.class.getClassLoader());
 
         ClassLoader loader = new GuestDexLoader(dexPath,
-                optimized.getAbsolutePath(), nativeDir.getAbsolutePath(),
+                optimized.getAbsolutePath(), searchPath,
                 parent, hostLibrary, nativeDir);
         guestLoader = loader;
         guestLoaderDir = gameDir;
+        guestLoaderNative64 = isNative64;
         UnicornBridge.setGuestLoader(loader);
         Log.i(TAG, "guest ClassLoader ready (mode=" + (isNative64 ? "native64" : "unicorn32")
-                + ", nativeDir=" + nativeDir.getName() + ")");
+                + ", searchPath=" + searchPath + ")");
         return loader;
+    }
+
+    public static String buildNativeLibrarySearchPath(Context ctx, File gameDir,
+                                                      String pkg, boolean isNative64) {
+        java.util.LinkedHashSet<String> entries = new java.util.LinkedHashSet<>();
+        if (isNative64) {
+            File dir64 = new File(gameDir, "native64");
+            if (dir64.isDirectory()) entries.add(dir64.getAbsolutePath());
+            File dir32 = new File(gameDir, "native");
+            if (dir32.isDirectory()) entries.add(dir32.getAbsolutePath());
+        } else {
+            File dir32 = new File(gameDir, "native");
+            if (dir32.isDirectory()) entries.add(dir32.getAbsolutePath());
+            File payload = new File(gameDir, "payload");
+            if (payload.isDirectory()) entries.add(payload.getAbsolutePath());
+        }
+
+        // If the package is currently installed on the device, include its nativeLibraryDir
+        // and any APK splits (handles extractNativeLibs=false AAB bundles).
+        String primaryAbi = isNative64
+                ? (Build.SUPPORTED_64_BIT_ABIS.length > 0 ? Build.SUPPORTED_64_BIT_ABIS[0] : "arm64-v8a")
+                : (Build.SUPPORTED_32_BIT_ABIS.length > 0 ? Build.SUPPORTED_32_BIT_ABIS[0] : "armeabi-v7a");
+
+        if (ctx != null && pkg != null && !pkg.isEmpty()) {
+            try {
+                android.content.pm.ApplicationInfo ai =
+                        ctx.getPackageManager().getApplicationInfo(pkg, 0);
+                if (ai != null) {
+                    if (ai.nativeLibraryDir != null && !ai.nativeLibraryDir.isEmpty()) {
+                        entries.add(ai.nativeLibraryDir);
+                    }
+                    if (ai.sourceDir != null && !ai.sourceDir.isEmpty()) {
+                        entries.add(ai.sourceDir + "!/lib/" + primaryAbi);
+                    }
+                    if (ai.splitSourceDirs != null) {
+                        for (String s : ai.splitSourceDirs) {
+                            if (s != null && !s.isEmpty()) {
+                                entries.add(s + "!/lib/" + primaryAbi);
+                            }
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+
+        File baseApk = new File(gameDir, "game.apk");
+        if (baseApk.isFile()) {
+            entries.add(baseApk.getAbsolutePath() + "!/lib/" + primaryAbi);
+        }
+        File splitsDir = new File(gameDir, "splits");
+        if (splitsDir.isDirectory()) {
+            File[] splits = splitsDir.listFiles((d, n) -> n.endsWith(".apk"));
+            if (splits != null) {
+                Arrays.sort(splits);
+                for (File split : splits) {
+                    if (split.isFile()) {
+                        entries.add(split.getAbsolutePath() + "!/lib/" + primaryAbi);
+                    }
+                }
+            }
+        }
+
+        StringBuilder sb = new StringBuilder();
+        for (String e : entries) {
+            if (sb.length() > 0) sb.append(File.pathSeparatorChar);
+            sb.append(e);
+        }
+        return sb.toString();
+    }
+
+    public static synchronized GuestContext getOrCreateGuestContext(
+            Context hostAppCtx, File gameDir, String pkg, String activityClass,
+            boolean isNative64, ClassLoader loader) {
+        if (cachedGuestContext != null
+                && gameDir != null
+                && gameDir.equals(cachedGuestContextDir)
+                && java.util.Objects.equals(activityClass, cachedGuestContextActivity)) {
+            return cachedGuestContext;
+        }
+        GuestContext gc = new GuestContext(
+                hostAppCtx, gameDir, pkg, activityClass, isNative64, loader);
+        cachedGuestContext = gc;
+        cachedGuestContextDir = gameDir;
+        cachedGuestContextActivity = activityClass;
+        return gc;
     }
 
     /**
@@ -289,22 +457,55 @@ public final class GuestLauncher {
         GameOrientation.apply(guest, game.orientation, game.label);
     }
 
+    private static void setFieldQuiet(Class<?> stopClass, Object target, String fieldName, Object value) {
+        if (target == null) return;
+        for (Class<?> c = target.getClass(); c != null; c = c.getSuperclass()) {
+            try {
+                java.lang.reflect.Field f = c.getDeclaredField(fieldName);
+                f.setAccessible(true);
+                f.set(target, value);
+                return;
+            } catch (NoSuchFieldException ignored) {
+                if (c == stopClass) break;
+            } catch (Throwable t) {
+                Log.w(TAG, "setFieldQuiet(" + fieldName + ") skipped: " + t.getMessage());
+                return;
+            }
+        }
+    }
+
     public static void attachGuestContext(Activity guest, Context ctx) {
         final File gameDir = guestGameDir;
         if (gameDir == null) return;
         try {
-            GuestContext guestContext = new GuestContext(ctx.getApplicationContext(),
-                    gameDir, guestPackage, guestLoader);
-            java.lang.reflect.Field base =
-                    android.content.ContextWrapper.class.getDeclaredField("mBase");
-            base.setAccessible(true);
-            base.set(guest, guestContext);
-            Log.i(TAG, "guest base context installed (files=" + guestContext.getFilesDir()
-                    + ", obb=" + guestContext.getObbDir() + ")");
-            // The Activity's own Resources table is separate from the
-            // application's, so the guest APK has to be merged into both before
-            // the guest's onCreate reads its assets (Unity opens
-            // bin/Data/settings.xml through Activity.getAssets()).
+            GuestContext guestContext = getOrCreateGuestContext(
+                    ctx.getApplicationContext(),
+                    gameDir,
+                    guestPackage,
+                    guestClass,
+                    guestNative64,
+                    guestLoader);
+
+            setFieldQuiet(android.content.ContextWrapper.class, guest, "mBase", guestContext);
+            setFieldQuiet(android.view.ContextThemeWrapper.class, guest, "mResources",
+                    guestContext.getResources());
+            setFieldQuiet(android.view.ContextThemeWrapper.class, guest, "mTheme",
+                    guestContext.getTheme());
+            setFieldQuiet(android.view.ContextThemeWrapper.class, guest, "mInflater", null);
+            setFieldQuiet(Activity.class, guest, "mApplication",
+                    guestContext.getGuestApplication());
+
+            android.content.ComponentName comp = new android.content.ComponentName(
+                    guestPackage != null ? guestPackage : guest.getPackageName(),
+                    guestClass != null ? guestClass : guest.getClass().getName());
+            android.content.pm.ActivityInfo guestAi =
+                    guestContext.resolveGuestActivityInfo(comp);
+            if (guestAi != null) {
+                setFieldQuiet(Activity.class, guest, "mActivityInfo", guestAi);
+            }
+
+            Log.i(TAG, "guest base context + Resources/PM/Application injected (files="
+                    + guestContext.getFilesDir() + ", obb=" + guestContext.getObbDir() + ")");
             guestContext.mergeInto(guest.getAssets());
         } catch (Throwable t) {
             Log.w(TAG, "guest context injection failed: " + t);
@@ -317,13 +518,13 @@ public final class GuestLauncher {
 
     /**
      * Called after the guest Activity's {@code onCreate}: re-scans ELF PLT/GOT
-     * tables for late-loaded 64-bit engines (Unity/Unreal/Cocos), unlocks peak
-     * display refresh rate for uncapped MFG, and attaches the floating HUD +
-     * Force-Save overlay onto the guest's window.
+     * tables on a worker thread for late-loaded 64-bit engines (Unity/Unreal/Cocos),
+     * unlocks peak display refresh rate for uncapped MFG, and attaches the floating
+     * HUD + Force-Save overlay onto the guest's window.
      */
     public static void attachOverlayAndRefreshHooks(Activity guest, Context hostCtx) {
         if (guest == null) return;
-        EglSwapHook.refreshNativeHooks();
+        SURFACE_QUEUE.execute(EglSwapHook::refreshNativeHooks);
 
         if (guestGameDir != null && hostCtx != null) {
             GraphicsSettings settings = GraphicsSettings.forGame(hostCtx, guestGameDir);
@@ -331,11 +532,10 @@ public final class GuestLauncher {
             InGameOverlay.attach(guest, hostCtx, guestGameDir, guestPackage, guestClass);
         }
 
-        // Schedule delayed hook refreshes for engines that dlopen libunity.so /
-        // libUE4.so / libmain.so asynchronously on a worker thread.
+        // Schedule delayed hook refreshes OFF the Main UI thread so dl_iterate_phdr never stalls UI.
         final Handler h = new Handler(Looper.getMainLooper());
-        h.postDelayed(EglSwapHook::refreshNativeHooks, 800);
-        h.postDelayed(EglSwapHook::refreshNativeHooks, 2500);
+        h.postDelayed(() -> SURFACE_QUEUE.execute(EglSwapHook::refreshNativeHooks), 800);
+        h.postDelayed(() -> SURFACE_QUEUE.execute(EglSwapHook::refreshNativeHooks), 2500);
     }
 
     /**
@@ -444,6 +644,10 @@ public final class GuestLauncher {
                 return false;
             }
         };
+        probe.setClickable(false);
+        probe.setFocusable(false);
+        probe.setFocusableInTouchMode(false);
+        probe.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
         ((ViewGroup) decor).addView(probe, new android.widget.FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
     }

@@ -18,6 +18,11 @@ bool contains(const std::string& haystack, const char* needle) {
     return haystack.find(needle) != std::string::npos;
 }
 
+bool is_ident_char(char c) {
+    const unsigned char u = static_cast<unsigned char>(c);
+    return std::isalnum(u) != 0 || c == '_';
+}
+
 std::string replace_all(std::string s, const char* from, const char* to) {
     const std::string f(from);
     if (f.empty()) return s;
@@ -25,6 +30,25 @@ std::string replace_all(std::string s, const char* from, const char* to) {
     while ((at = s.find(f, at)) != std::string::npos) {
         s.replace(at, f.size(), to);
         at += std::strlen(to);
+    }
+    return s;
+}
+
+std::string replace_word(std::string s, const char* from, const char* to) {
+    const size_t flen = std::strlen(from);
+    const size_t tlen = std::strlen(to);
+    if (flen == 0) return s;
+    size_t at = 0;
+    while ((at = s.find(from, at)) != std::string::npos) {
+        const bool left_ok = (at == 0) || !is_ident_char(s[at - 1]);
+        const size_t end = at + flen;
+        const bool right_ok = (end >= s.size()) || !is_ident_char(s[end]);
+        if (left_ok && right_ok) {
+            s.replace(at, flen, to);
+            at += tlen;
+        } else {
+            at += flen;
+        }
     }
     return s;
 }
@@ -115,14 +139,14 @@ Patch patch_shader_source(const std::string& source, Stage stage, int gles_major
         s = replace_all(s, "precision highp samplerCube;", "");
 
         if (stage == Stage::Vertex) {
-            s = replace_all(s, "in ", "attribute ");
-            s = replace_all(s, "out ", "varying ");
+            s = replace_word(s, "in", "attribute");
+            s = replace_word(s, "out", "varying");
         } else {
-            s = replace_all(s, "in ", "varying ");
+            s = replace_word(s, "in", "varying");
             // Drop the ES3 fragment output declaration and go back to
             // gl_FragColor. The output is always named fragColor by policy.
             s = replace_all(s, "out vec4 fragColor;", "");
-            s = replace_all(s, "fragColor", "gl_FragColor");
+            s = replace_word(s, "fragColor", "gl_FragColor");
         }
         s = replace_all(s, "texture(", "texture2D(");
         patch.added_precision = false;
@@ -138,15 +162,15 @@ Patch patch_shader_source(const std::string& source, Stage stage, int gles_major
     if (needs_translation) {
         const std::string before = s;
         if (stage == Stage::Vertex) {
-            s = replace_all(s, "attribute ", "in ");
-            s = replace_all(s, "varying ", "out ");
+            s = replace_word(s, "attribute", "in");
+            s = replace_word(s, "varying", "out");
         } else {
-            s = replace_all(s, "varying ", "in ");
+            s = replace_word(s, "varying", "in");
             s = replace_all(s, "texture2DProj(", "textureProj(");
             s = replace_all(s, "texture2D(", "texture(");
             s = replace_all(s, "textureCube(", "texture(");
             if (contains(s, "gl_FragColor")) {
-                s = replace_all(s, "gl_FragColor", "fragColor");
+                s = replace_word(s, "gl_FragColor", "fragColor");
                 if (!contains(s, "out vec4 fragColor")) {
                     const size_t insert_at = version_end;
                     s.insert(insert_at, "\nout vec4 fragColor;");
@@ -161,15 +185,18 @@ Patch patch_shader_source(const std::string& source, Stage stage, int gles_major
     }
 
     // ---- fragment precision ----------------------------------------------
-    // The single most common strict-driver rejection: a fragment shader with
-    // no default float precision. Inject one directly after the version line
-    // so it precedes every declaration.
+    // Inject a precision block portable across PowerVR, Mali, and Adreno
+    // when a legacy fragment shader declares none.
     if (stage == Stage::Fragment && !contains(s, "precision ")) {
         const size_t insert_at =
                 (version_at != std::string::npos) ? version_end : 0;
-        std::string header = "precision mediump float;\n";
-        if (insert_at == 0) header = "precision mediump float;\n" + header;
-        s.insert(insert_at, "\n" + header);
+        const std::string header =
+                "#ifdef GL_FRAGMENT_PRECISION_HIGH\n"
+                "precision highp float;\n"
+                "#else\n"
+                "precision mediump float;\n"
+                "#endif\n";
+        s.insert(insert_at, insert_at == 0 ? header : ("\n" + header));
         patch.added_precision = true;
     }
 
