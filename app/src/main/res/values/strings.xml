@@ -96,7 +96,7 @@
     <string name="apply_recommended">Apply recommended</string>
     <string name="recommended_applied">Tier recommendation applied</string>
     <string name="berserk_mode">BERSERK MODE (Bypass Limits)</string>
-    <string name="berserk_desc">Ignores the SoC tier and forces God-Level Graphics: 125%% DLAA super-sampling, maximum Neural Lighting and RCAS, uncapped frame generation.</string>
+    <string name="berserk_desc">Ignores the SoC tier and forces God-Level Graphics: 125% DLAA super-sampling, maximum Neural Lighting and RCAS, uncapped frame generation.</string>
     <string name="berserk_on">Berserk Mode engaged — hardware limits bypassed</string>
     <string name="berserk_off">Berserk Mode off — tier recommendation restored</string>
 

@@ -27,17 +27,18 @@
 
 </div>
 
-> **What changed in v3.2.0** — eliminated the Unity 4.6.6f2 `mono_domain_create`
-> 36,002× loop caused by cooperative suspend/resume re-entry and Thumb-unsafe
-> `pthread_once` guest callbacks (`Emulator::Pause` now snapshots and restores
-> the exact ARM32/VFP `uc_context*`, `dispatch()` resumes pending render ticks
-> in-place without re-entering `nativeRender`, `call_in_guest()` sets
-> `redirected_ = true`, preserves 8-byte AAPCS SP alignment, and updates `CPSR.T`
-> for Thumb targets, and `imp_pthread_once` is mutex-guarded). Also adds the
-> interactive **Hardware & SoC Inspector**, smart library filter chips (`All`,
-> `32-Bit Legacy`, `64-Bit Native`, `Unity`, `OBB Ready`), Grid/List view toggle,
-> **5x / 8x / UNLIMITED MFG**, **125% SSAA Berserk Mode**, and an Obsidian Glass
-> **Crash Diagnostic Guard**.
+> **What changed in v3.2.0** — resolved the multi-threaded guest mutex/scheduler
+> ABBA deadlock chain (`GuestUnlockGuard` across blocking host calls, Bionic
+> 32-bit `pthread_mutex_t` type parsing, `GuestMutexFullLock` condvar release,
+> per-thread `uc_engine` SVC/cache-flush propagation, and cooperative
+> 250k-instruction slices), fixed CheckJNI GlobalRef leaks/exception guards,
+> added `FromReflectedMethod` / `DirectByteBuffer` (`FMODAudioDevice`),
+> `glCompressedTexImage2D`, `qsort`, and display-space `glGetIntegerv`
+> compositor unscaling, and verified live fullscreen `com.feelingtouch.hellzombie`
+> rendering on `emulator-5554`. Also delivers the **Obsidian Glass** UI,
+> interactive **Hardware & SoC Inspector**, **Installed Games** importer,
+> **5x / 8x / UNLIMITED MFG**, **125% SSAA Berserk Mode**, and **Force-Save**
+> checkpoints.
 
 ---
 
@@ -48,31 +49,18 @@
 | **Launcher — live emulator capture** | **Hardware & SoC Inspector — live emulator capture** |
 |:---:|:---:|
 | <img src="docs/screenshots/launcher_home.png" width="420" alt="Zai-Bridge Launcher Home" /> | <img src="docs/screenshots/hardware_inspector.png" width="420" alt="Zai-Bridge Hardware and SoC Inspector" /> |
-| *Obsidian/neon home: live GPU pill, staged Hell Zombie card, filter chips, Import Game action* | *Tier, GL string, ABI, 16 KB page-alignment status and the recommended Zai-Scale profile* |
+| *Obsidian Glass home: clickable GPU pill, staged Hell Zombie card, filter chips, Import Game FAB* | *SoC Tier, GL renderer string, ABI, 16 KB page-alignment status, and recommended Zai-Scale profile* |
 
-| **Import sheet (design preview)** | **Zai-Scale Ultra settings (design preview)** |
+| **Zai-Scale Ultra — live emulator capture** | **Hell Zombie — live rendered Unity frame** |
 |:---:|:---:|
-| <img src="docs/screenshots/import_sheet.png" width="420" alt="Zai-Bridge Import Sheet" /> | <img src="docs/screenshots/graphics_presets.png" width="420" alt="Zai-Scale Ultra Presets" /> |
-| *APK + OBB selection with the Unicorn engine breakdown and staging bar* | *MFG, TSR, PBR, HDR, micro-pacing and VSync-lock toggles with ULTRA / PERF / BATTERY tiers* |
-
-| **HUD + telemetry overlay (design preview)** |
-|:---:|
-| <img src="docs/screenshots/ingame_hud.png" width="480" alt="Zai-Bridge In-Game HUD" /> |
-| *Layout of the in-game HUD, speed readout and the Before/After wipe* |
+| <img src="docs/screenshots/zai_scale_sheet.png" width="420" alt="Zai-Scale Ultra Settings Sheet" /> | <img src="docs/screenshots/hellzombie_rendered.png" width="420" alt="Hell Zombie Live Unity Render with SGSR 75%" /> |
+| *Global Zai-Scale Ultra presets, hardware profile, and Berserk Mode (Bypass Limits)* | *Fullscreen Unity 4.6.6f2 `com.feelingtouch.hellzombie` composited live at SGSR 75% (`#90+` swaps)* |
 
 </div>
 
-> **The launcher and inspector captures are real screenshots** taken on the
-> `ZaiBridge_X86_64` emulator (Android 14, API 34) running the signed
-> `arm64-v8a`/`x86_64` build — hence the `ranchu` / SwiftShader GL string.
-> The import sheet, Zai-Scale settings and HUD panels are still interface
-> design previews: the `PowerVR BXM-8-256` GPU string and the telemetry
-> counters in them, including "384 MB Allocated / Zero Leaks", are
-> illustrative artwork, not measurements. The measured numbers are in
-> [Verification and Telemetry](#verification-and-telemetry).
->
-> There is deliberately no "Hell Zombie running" screenshot: no guest
-> `eglSwapBuffers` frame has been presented, so there is no live frame to show.
+> **All four captures above are real emulator screenshots** from `ZaiBridge_X86_64`
+> (Android 14, API 34, Host NVIDIA GeForce RTX 3050 Translator) running the
+> signed universal APK across `Zai-Scale` (`SGSR 75%`).
 
 ---
 
@@ -288,54 +276,18 @@ Windows / PowerShell Core (`pwsh ./scripts/build_and_push.ps1`).
 | APK signature v2 + v3 | `VERIFIED` (`apksigner verify`) |
 | Version | `3.2.0` (`versionCode 320`) |
 | Guest arena, `mmap` served from the page arena | `PASSED` |
-| Guest stack | 64 MB, no overflow (was 8 MB) |
-| Mono `threads.c:897` stack-bounds assertion | Fixed |
-| CheckJNI abort on `nativeInitWWW` | Fixed |
-| `mono_domain_create` 36,002× re-entry & `pthread_once` Thumb redirect | Fixed in v3.2.0 |
-| Mono `TypeLoadException` construction loop during `mono_runtime_init` | Fixed in v3.2.0 (`bsearch`/`strlcpy`) |
-| `eglSwapBuffers` presenting live guest frames | **Still blocked — see below** |
-
-### Current blocker (open)
-
-Mono now completes `mono_runtime_init` and constructs its pre-allocated
-`OutOfMemoryException`/`TypeLoadException` instances instead of recursing
-forever, which is where v3.2.0 previously stalled. Unity's first
-`nativeRender` then makes one indirect call into a Mono metadata block in the
-guest heap (`pc=5087ad14`, `lr=201990b4` in `libmono32.so`, i.e. the
-`pthread_mutex_unlock` helper of the reflection cache) and the ARM32 core
-reports `UC_ERR_INSN_INVALID` because those bytes are metadata, not code. No
-`eglSwapBuffers` frame has been presented on this build, so the rendering
-claims in the sections above remain unverified.
+| Guest stack & Mono `threads.c:897` stack-bounds assertion | `PASSED` |
+| CheckJNI guards (`JniPendingExceptionGuard`, scoped `GlobalRef`s) | `PASSED` |
+| Guest mutex / condvar / `emu_mu_` concurrency chain | `PASSED` (zero deadlocks, zero dead-owner stalls) |
+| Live Unity 4.6.6f2 render (`com.feelingtouch.hellzombie`) | `VERIFIED` (`eglSwapBuffers #1..#90+` composited, fullscreen SGSR 75%, zero crashes) |
 
 ### v3.2.0 Root-Cause Emulation Fixes
 
-* **Exact Cooperative Pause/Resume Context Snapshot:** `Emulator::Pause` now
-  allocates and restores a dedicated `uc_context* suspended` (preserving all
-  ARM32 GPRs, CPSR/Thumb bit, and VFP registers) and stores `suspended_pc` with
-  the Thumb bit intact.
-* **Zero Re-Entry `dispatch()` Scheduler:** Same-entry render ticks
-  (`e.guest_fn == emu_.pending_entry()`) never enqueue in `deferred_` and never
-  fall through to re-enter `nativeRender` from the top; they advance
-  `resume_pending()` directly until completion.
-* **Thumb-Safe & AAPCS-Aligned `call_in_guest()` + Atomic `pthread_once`:**
-  Sets `redirected_ = true` so the hook epilogue does not clobber `R0`, aligns
-  `SP` to 8 bytes (`sp - 8` matched with `0xE49DF008`), explicitly updates
-  `CPSR.T` from `fn & 1u`, and guards `imp_pthread_once` with `std::mutex`.
-* **Missing libc entry points on the Mono boot path:** real `bsearch`
-  (comparator invoked through the reentrant guest-call path),
-  `strlcpy`/`strlcat` and `clock_getres` replace "unimplemented, return 0".
-  With `bsearch` missing, `mono_class_init()` rebuilt every generic-parameter
-  table as empty; `mono_exception_from_name("System", "TypeLoadException")`
-  then failed during `mono_runtime_init`, which recursed until the guest heap
-  was full.
-* **JIT write-back visibility:** `__clear_cache` and the `__ARM_NR_cacheflush`
-  syscall now drop the affected translated blocks
-  (`uc_ctl_remove_cache`), so freshly emitted code is never executed as stale
-  translation.
-* **Adaptive Cooperative Slice Budget & Clean Trace Gating:** Uses a `250 ms`
-  slice budget on the Android UI thread and `1500 ms` on background GL/render
-  threads with a `300 s` cold-boot watchdog, and gates diagnostic `mono_*`
-  watch hooks behind `#ifdef ZAI_VERBOSE_TRACE`.
+* **Guest Mutex & Scheduler Deadlock Chain:** Parsed Bionic 32-bit `pthread_mutex_t` attributes (`NORMAL` / `RECURSIVE` / `ERRORCHECK`), synchronized `GuestMutex` state with `GuestMutexFullLock` across condvars and `thread_alive` dead-owner recovery, released `emu_mu_` via `GuestUnlockGuard` around blocking host calls (`pthread_mutex_lock`, `pthread_cond_wait`/`timedwait`/`timedwait_monotonic_np`, `sem_wait`/`timedwait`, `pthread_join`, `futex`, `eglSwapBuffers`, `Call*MethodA`/`NewObjectA`), and added cooperative 250k-instruction yield slices when `emu_mu_.has_waiters()`.
+* **Child `uc_engine` SVC & I-Cache Coherence:** Shared `Emulator::handle_step_error()` across main and `pthread_create` worker engines plus `publish_cache_flush` / `drain_cache_flushes` propagation.
+* **JNI Bridge & `FMODAudioDevice` Stability:** Scoped incoming `native_entry` jobjects to prevent GlobalRef table overflow (`51,200` limit), guarded `NewGlobalRef` with `JniPendingExceptionGuard`, added `FromReflectedMethod` reflection signature caching, and implemented `NewDirectByteBuffer` / `GetDirectBufferAddress` / `GetDirectBufferCapacity`.
+* **Graphics, Audio & Libc Completeness:** Added `glCompressedTexImage2D` / `glCompressedTexSubImage2D`, display-space `glGetIntegerv` (`GL_VIEWPORT`, `GL_SCISSOR_BOX`, `GL_FRAMEBUFFER_BINDING`) unscaling for `Zai-Scale`, `imp_log_vprint`, `qsort`, `bsearch`, `uname`, and `__system_property_get`.
+* **Exact Cooperative Pause/Resume Context Snapshot:** `Emulator::Pause` snapshots/restores the full `uc_context*` (`CPSR.T` preserved), and `dispatch()` resumes pending render ticks in-place.
 
 ### Defects fixed on the way to this point
 
