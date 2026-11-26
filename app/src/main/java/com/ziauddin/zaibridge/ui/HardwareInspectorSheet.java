@@ -69,11 +69,11 @@ public final class HardwareInspectorSheet {
                     : "Native64 Direct + Unicorn ARM32 Core";
             String metrics = String.format(Locale.US,
                     "CPU: %d cores @ %.2f GHz\n"
-                            + "RAM: %.1f GB · ABI: %s · Android %s (API %d)\n"
+                            + "RAM: %d GB · ABI: %s · Android %s (API %d)\n"
                             + "16 KB Page Alignment: COMPLIANT (ELF max-page-size=16384)\n"
                             + "Runtime: %s",
                     p.cpuCores, p.maxClockMhz / 1000.0,
-                    p.totalRamMb / 1024.0, primaryAbi, Build.VERSION.RELEASE, Build.VERSION.SDK_INT,
+                    p.ramGb, primaryAbi, Build.VERSION.RELEASE, Build.VERSION.SDK_INT,
                     runtime);
 
             mainHandler.post(() -> {

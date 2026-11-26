@@ -1,7 +1,9 @@
 package com.ziauddin.zaibridge;
 
+import android.app.Activity;
 import android.content.ComponentName;
 import android.content.Context;
+import android.content.ContextWrapper;
 import android.content.Intent;
 import android.content.pm.ActivityInfo;
 import android.content.pm.ApplicationInfo;
@@ -31,20 +33,44 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 
 /**
- * On-device runtime verification for Zai-Bridge fixes:
+ * On-device runtime verification for Zai-Bridge v3.2.1 fixes:
  * <ul>
- *   <li>Phase 1: GuestResourcesWrapper (zero-ID / #0x0 non-throwing, Unity fallback strings,
- *       collision-safe host fallback), Theme.ZaiBridge.GameHost AppCompat compatibility,
+ *   <li>Phase 1: GuestResourcesWrapper (zero-ID / #0x0 non-throwing across all overloads,
+ *       Unity fallback strings, collision-safe host fallback), OEM OverrideResources multi-layer
+ *       injection on non-proxy Activity + Application, Theme.ZaiBridge.GameHost AppCompat support,
  *       GuestPackageManagerWrapper metadata interception, BinaryXmlManifestReader alias/class
  *       normalization, GuestContext OpPackageName/storage/Application virtualization.</li>
- *   <li>Phase 2: Non-blocking SoCProfiler & ProxyGameActivity error reporting.</li>
- *   <li>Phase 3: PowerVR BXM-8-256 / MT6855 SoC classification entries.</li>
+ *   <li>Phase 2: Live GL_RENDERER priority, shared die-ID clock disambiguation (MT6855),
+ *       nominal RAM snapping, and PowerVR BXM-8-256 SoC classification.</li>
  * </ul>
  */
 public class BridgeFixesVerificationTest extends InstrumentationTestCase {
 
     private Context targetContext() {
         return getInstrumentation().getTargetContext();
+    }
+
+    @SuppressWarnings("deprecation")
+    private static final class FakeOemOverrideResources extends Resources {
+        FakeOemOverrideResources(Resources base) {
+            super(base.getAssets(), base.getDisplayMetrics(), base.getConfiguration());
+        }
+
+        @Override
+        public CharSequence getText(int id) throws NotFoundException {
+            if (id == 0) {
+                throw new NotFoundException("String resource ID #0x0 (simulated OEM OverrideResources)");
+            }
+            return super.getText(id);
+        }
+
+        @Override
+        public String getString(int id) throws NotFoundException {
+            if (id == 0) {
+                throw new NotFoundException("String resource ID #0x0 (simulated OEM OverrideResources)");
+            }
+            return super.getString(id);
+        }
     }
 
     public void testGuestResourcesWrapperZeroIdAndUnityFallbackStrings() {
@@ -54,12 +80,20 @@ public class BridgeFixesVerificationTest extends InstrumentationTestCase {
                 hostRes, hostRes, "com.dts.freefiremax", host.getPackageName());
 
         // Critical regression check: ID 0 must never throw Resources$NotFoundException #0x0
-        assertEquals("", wrapper.getString(0));
-        assertEquals("", wrapper.getString(0, "fmt"));
-        assertEquals("", wrapper.getText(0).toString());
+        assertEquals("Game view", wrapper.getString(0));
+        assertEquals("Game view", wrapper.getString(0, "fmt"));
+        assertEquals("Game view", wrapper.getText(0).toString());
         assertEquals("fallback-val", wrapper.getText(0, "fallback-val").toString());
-        assertEquals("", wrapper.getQuantityString(0, 1));
-        assertEquals("", wrapper.getQuantityText(0, 5).toString());
+        assertEquals("Game view", wrapper.getQuantityString(0, 1));
+        assertEquals("Game view", wrapper.getQuantityText(0, 5).toString());
+        assertFalse(wrapper.getBoolean(0));
+        assertEquals(0, wrapper.getInteger(0));
+        assertEquals(0f, wrapper.getFloat(0), 0.001f);
+        assertEquals(0, wrapper.getColor(0));
+        assertNull(wrapper.getDrawable(0));
+        assertNull(wrapper.getLayout(0));
+        assertNull(wrapper.getXml(0));
+        assertEquals(0, wrapper.getStringArray(0).length);
 
         // Mandatory Unity runtime strings resolved cleanly for any guest package name
         int descId = wrapper.getIdentifier("game_view_content_description", "string", "com.dts.freefiremax");
@@ -78,6 +112,65 @@ public class BridgeFixesVerificationTest extends InstrumentationTestCase {
             assertTrue("missing string fallback: " + pair[0], id != 0);
             assertEquals(pair[1], wrapper.getString(id));
         }
+    }
+
+    public void testOemOverrideResourcesMultiLayerInjection() throws Throwable {
+        final Context host = targetContext();
+        final Resources oemOverrideRes = new FakeOemOverrideResources(host.getResources());
+        final File cacheGameDir = new File(host.getCacheDir(), "oem-test-game");
+        cacheGameDir.mkdirs();
+
+        final GuestContext guestCtx = new GuestContext(
+                host,
+                cacheGameDir,
+                "com.kolka.boostrider",
+                "com.unity3d.player.UnityPlayerGameActivity",
+                true,
+                host.getClassLoader());
+
+        final Activity[] holder = new Activity[1];
+        runTestOnUiThread(() -> {
+            Activity simulatedUnityGuest = new Activity() {
+                // Non-proxy Activity simulating UnityPlayerActivity instantiated by BridgeInstrumentation.
+            };
+            // Attach a fake OEM wrapper chain holding FakeOemOverrideResources
+            final Context oemBase = new ContextWrapper(host) {
+                @SuppressWarnings("unused")
+                private Resources mOverrideResources = oemOverrideRes;
+                @Override
+                public Resources getResources() {
+                    return mOverrideResources;
+                }
+            };
+            try {
+                java.lang.reflect.Field fBase = ContextWrapper.class.getDeclaredField("mBase");
+                fBase.setAccessible(true);
+                fBase.set(simulatedUnityGuest, oemBase);
+
+                java.lang.reflect.Field fRes = ContextThemeWrapper.class.getDeclaredField("mResources");
+                fRes.setAccessible(true);
+                fRes.set(simulatedUnityGuest, oemOverrideRes);
+            } catch (Throwable t) {
+                fail("Failed setting up simulated OEM Activity: " + t);
+            }
+
+            GuestLauncher.injectGuestResourcesMultiLayer(simulatedUnityGuest, guestCtx, host);
+            holder[0] = simulatedUnityGuest;
+        });
+
+        Activity guest = holder[0];
+        assertNotNull(guest);
+        assertTrue("Activity.getResources() must be GuestResourcesWrapper",
+                guest.getResources() instanceof GuestResourcesWrapper);
+        assertTrue("ApplicationContext.getResources() must be GuestResourcesWrapper",
+                guest.getApplicationContext().getResources() instanceof GuestResourcesWrapper);
+        assertEquals("Game view", guest.getResources().getString(0));
+        int resId = guest.getResources().getIdentifier(
+                "game_view_content_description", "string", "com.kolka.boostrider");
+        assertTrue(resId != 0);
+        assertEquals("Game view", guest.getResources().getString(resId));
+        assertSame(guestCtx.getGuestApplication(), guest.getApplication());
+        GuestLauncher.restoreHostResourcesIfIdle();
     }
 
     public void testGameHostThemeSupportsAppCompatAndMaterial() {
@@ -210,17 +303,44 @@ public class BridgeFixesVerificationTest extends InstrumentationTestCase {
         JSONArray socs = root.getJSONArray("socs");
         for (int i = 0; i < socs.length(); i++) {
             JSONObject s = socs.getJSONObject(i);
-            if ("Dimensity 7025".equals(s.optString("family"))) {
-                assertTrue(s.optString("gpu").contains("PowerVR") && s.optString("gpu").contains("BXM"));
-                foundMt6855PowerVr = true;
+            String fam = s.optString("family");
+            if ("Dimensity 7025".equals(fam) || "Dimensity 7020".equals(fam)
+                    || "Dimensity 7025 Ultra".equals(fam) || "Dimensity 930".equals(fam)) {
+                assertTrue(fam + " must use PowerVR IMG BXM-8-256",
+                        "PowerVR IMG BXM-8-256".equals(s.optString("gpu")));
+                if ("Dimensity 7025".equals(fam)) foundMt6855PowerVr = true;
             }
         }
-        assertTrue("Dimensity 7025 / MT6855 must map to PowerVR B-Series BXM-8-256", foundMt6855PowerVr);
+        assertTrue("Dimensity 7025 / MT6855 must map to PowerVR IMG BXM-8-256", foundMt6855PowerVr);
+
+        // Verify shared die-ID clock disambiguation for MT6855
+        String[] d7025 = SoCProfiler.resolveSharedDieFamily("mt6855 powervr b-series bxm-8-256", 2_500_000L, null, null, null);
+        assertEquals("Dimensity 7025", d7025[0]);
+        assertEquals("PowerVR IMG BXM-8-256", d7025[2]);
+
+        String[] d7020 = SoCProfiler.resolveSharedDieFamily("mt6855 powervr b-series bxm-8-256", 2_200_000L, null, null, null);
+        assertEquals("Dimensity 7020", d7020[0]);
+        assertEquals("PowerVR IMG BXM-8-256", d7020[2]);
+
+        // Verify nominal RAM snapping (handles kernel reserve offsets cleanly)
+        final long gb = 1024L * 1024L * 1024L;
+        assertEquals(8, SoCProfiler.snapNominalRamGb((long) (7.4 * gb)));
+        assertEquals(12, SoCProfiler.snapNominalRamGb((long) (11.2 * gb)));
+        assertEquals(16, SoCProfiler.snapNominalRamGb((long) (15.1 * gb)));
+        assertEquals(6, SoCProfiler.snapNominalRamGb((long) (5.6 * gb)));
+        assertEquals(4, SoCProfiler.snapNominalRamGb((long) (3.7 * gb)));
 
         assertFalse("Instrumentation thread is distinct from main looper",
                 Looper.getMainLooper().getThread() == Thread.currentThread());
         SoCProfiler.Profile prof = SoCProfiler.get(host);
         assertNotNull(prof);
         assertTrue(prof.tier >= 1 && prof.tier <= 5);
+        assertTrue(prof.ramGb >= 1);
+
+        com.ziauddin.zaibridge.data.SoCProfiler.Profile dataProf =
+                com.ziauddin.zaibridge.data.SoCProfiler.probe(host);
+        assertNotNull(dataProf);
+        assertEquals(prof.gpuName, dataProf.gpu);
+        assertEquals(prof.ramGb, dataProf.ramGb);
     }
 }

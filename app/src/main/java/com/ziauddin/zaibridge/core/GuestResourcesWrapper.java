@@ -74,9 +74,21 @@ public final class GuestResourcesWrapper extends Resources {
         this.hostPackage = hostPackage;
     }
 
+    private static final String SAFE_ZERO_STRING = "Game view";
+
     @NonNull
     public Resources getGuestPrimary() {
         return guestPrimary;
+    }
+
+    @NonNull
+    public GuestResourcesWrapper withConfiguration(
+            @Nullable Configuration config, @Nullable DisplayMetrics metrics) {
+        Resources updatedGuest = new Resources(
+                guestPrimary.getAssets(),
+                metrics != null ? metrics : guestPrimary.getDisplayMetrics(),
+                config != null ? config : guestPrimary.getConfiguration());
+        return new GuestResourcesWrapper(updatedGuest, hostResources, guestPackage, hostPackage);
     }
 
     private int toSyntheticHostId(int hostId) {
@@ -156,7 +168,7 @@ public final class GuestResourcesWrapper extends Resources {
     public String getString(int id) throws NotFoundException {
         if (id == 0) {
             logZeroIdOnce("getString");
-            return "";
+            return SAFE_ZERO_STRING;
         }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) {
@@ -174,7 +186,7 @@ public final class GuestResourcesWrapper extends Resources {
     public String getString(int id, Object... formatArgs) throws NotFoundException {
         if (id == 0) {
             logZeroIdOnce("getString(formatArgs)");
-            return "";
+            return SAFE_ZERO_STRING;
         }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) {
@@ -192,7 +204,7 @@ public final class GuestResourcesWrapper extends Resources {
     public CharSequence getText(int id) throws NotFoundException {
         if (id == 0) {
             logZeroIdOnce("getText");
-            return "";
+            return SAFE_ZERO_STRING;
         }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) {
@@ -209,7 +221,7 @@ public final class GuestResourcesWrapper extends Resources {
     public CharSequence getText(int id, CharSequence def) {
         if (id == 0) {
             logZeroIdOnce("getText(def)");
-            return def != null ? def : "";
+            return def != null ? def : SAFE_ZERO_STRING;
         }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) {
@@ -221,7 +233,7 @@ public final class GuestResourcesWrapper extends Resources {
         } catch (Throwable ignored) {
         }
         CharSequence hostVal = hostResources.getText(id, def);
-        return hostVal != null ? hostVal : (def != null ? def : "");
+        return hostVal != null ? hostVal : (def != null ? def : SAFE_ZERO_STRING);
     }
 
     @NonNull
@@ -229,7 +241,7 @@ public final class GuestResourcesWrapper extends Resources {
     public CharSequence getQuantityText(int id, int quantity) throws NotFoundException {
         if (id == 0) {
             logZeroIdOnce("getQuantityText");
-            return "";
+            return SAFE_ZERO_STRING;
         }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) return hostResources.getQuantityText(hostId, quantity);
@@ -245,7 +257,7 @@ public final class GuestResourcesWrapper extends Resources {
     public String getQuantityString(int id, int quantity) throws NotFoundException {
         if (id == 0) {
             logZeroIdOnce("getQuantityString");
-            return "";
+            return SAFE_ZERO_STRING;
         }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) return hostResources.getQuantityString(hostId, quantity);
@@ -261,7 +273,7 @@ public final class GuestResourcesWrapper extends Resources {
     public String getQuantityString(int id, int quantity, Object... formatArgs) throws NotFoundException {
         if (id == 0) {
             logZeroIdOnce("getQuantityString(formatArgs)");
-            return "";
+            return SAFE_ZERO_STRING;
         }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) return hostResources.getQuantityString(hostId, quantity, formatArgs);
@@ -275,6 +287,10 @@ public final class GuestResourcesWrapper extends Resources {
     @NonNull
     @Override
     public String[] getStringArray(int id) throws NotFoundException {
+        if (id == 0) {
+            logZeroIdOnce("getStringArray");
+            return new String[0];
+        }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) return hostResources.getStringArray(hostId);
         try {
@@ -287,6 +303,10 @@ public final class GuestResourcesWrapper extends Resources {
     @NonNull
     @Override
     public CharSequence[] getTextArray(int id) throws NotFoundException {
+        if (id == 0) {
+            logZeroIdOnce("getTextArray");
+            return new CharSequence[0];
+        }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) return hostResources.getTextArray(hostId);
         try {
@@ -299,6 +319,10 @@ public final class GuestResourcesWrapper extends Resources {
     @NonNull
     @Override
     public int[] getIntArray(int id) throws NotFoundException {
+        if (id == 0) {
+            logZeroIdOnce("getIntArray");
+            return new int[0];
+        }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) return hostResources.getIntArray(hostId);
         try {
@@ -310,6 +334,10 @@ public final class GuestResourcesWrapper extends Resources {
 
     @Override
     public boolean getBoolean(int id) throws NotFoundException {
+        if (id == 0) {
+            logZeroIdOnce("getBoolean");
+            return false;
+        }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) return hostResources.getBoolean(hostId);
         try {
@@ -321,6 +349,10 @@ public final class GuestResourcesWrapper extends Resources {
 
     @Override
     public int getInteger(int id) throws NotFoundException {
+        if (id == 0) {
+            logZeroIdOnce("getInteger");
+            return 0;
+        }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) return hostResources.getInteger(hostId);
         try {
@@ -333,6 +365,10 @@ public final class GuestResourcesWrapper extends Resources {
     @SuppressLint("NewApi")
     @Override
     public float getFloat(int id) {
+        if (id == 0) {
+            logZeroIdOnce("getFloat");
+            return 0f;
+        }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) {
             if (Build.VERSION.SDK_INT >= 29) return hostResources.getFloat(hostId);
@@ -355,6 +391,10 @@ public final class GuestResourcesWrapper extends Resources {
 
     @Override
     public int getColor(int id) throws NotFoundException {
+        if (id == 0) {
+            logZeroIdOnce("getColor");
+            return 0;
+        }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) return hostResources.getColor(hostId);
         try {
@@ -366,6 +406,10 @@ public final class GuestResourcesWrapper extends Resources {
 
     @Override
     public int getColor(int id, @Nullable Theme theme) throws NotFoundException {
+        if (id == 0) {
+            logZeroIdOnce("getColor(theme)");
+            return 0;
+        }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) return hostResources.getColor(hostId, null);
         try {
@@ -378,6 +422,10 @@ public final class GuestResourcesWrapper extends Resources {
     @NonNull
     @Override
     public ColorStateList getColorStateList(int id) throws NotFoundException {
+        if (id == 0) {
+            logZeroIdOnce("getColorStateList");
+            return ColorStateList.valueOf(0);
+        }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) return hostResources.getColorStateList(hostId);
         try {
@@ -390,6 +438,10 @@ public final class GuestResourcesWrapper extends Resources {
     @NonNull
     @Override
     public ColorStateList getColorStateList(int id, @Nullable Theme theme) throws NotFoundException {
+        if (id == 0) {
+            logZeroIdOnce("getColorStateList(theme)");
+            return ColorStateList.valueOf(0);
+        }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) return hostResources.getColorStateList(hostId, null);
         try {
@@ -401,6 +453,10 @@ public final class GuestResourcesWrapper extends Resources {
 
     @Override
     public float getDimension(int id) throws NotFoundException {
+        if (id == 0) {
+            logZeroIdOnce("getDimension");
+            return 0f;
+        }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) return hostResources.getDimension(hostId);
         try {
@@ -412,6 +468,10 @@ public final class GuestResourcesWrapper extends Resources {
 
     @Override
     public int getDimensionPixelOffset(int id) throws NotFoundException {
+        if (id == 0) {
+            logZeroIdOnce("getDimensionPixelOffset");
+            return 0;
+        }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) return hostResources.getDimensionPixelOffset(hostId);
         try {
@@ -423,6 +483,10 @@ public final class GuestResourcesWrapper extends Resources {
 
     @Override
     public int getDimensionPixelSize(int id) throws NotFoundException {
+        if (id == 0) {
+            logZeroIdOnce("getDimensionPixelSize");
+            return 0;
+        }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) return hostResources.getDimensionPixelSize(hostId);
         try {
@@ -434,6 +498,10 @@ public final class GuestResourcesWrapper extends Resources {
 
     @Override
     public float getFraction(int id, int base, int pbase) {
+        if (id == 0) {
+            logZeroIdOnce("getFraction");
+            return 0f;
+        }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) return hostResources.getFraction(hostId, base, pbase);
         try {
@@ -445,6 +513,10 @@ public final class GuestResourcesWrapper extends Resources {
 
     @Override
     public Drawable getDrawable(int id) throws NotFoundException {
+        if (id == 0) {
+            logZeroIdOnce("getDrawable");
+            return null;
+        }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) return hostResources.getDrawable(hostId);
         try {
@@ -456,6 +528,10 @@ public final class GuestResourcesWrapper extends Resources {
 
     @Override
     public Drawable getDrawable(int id, @Nullable Theme theme) throws NotFoundException {
+        if (id == 0) {
+            logZeroIdOnce("getDrawable(theme)");
+            return null;
+        }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) return hostResources.getDrawable(hostId, null);
         try {
@@ -467,6 +543,10 @@ public final class GuestResourcesWrapper extends Resources {
 
     @Override
     public Drawable getDrawableForDensity(int id, int density) throws NotFoundException {
+        if (id == 0) {
+            logZeroIdOnce("getDrawableForDensity");
+            return null;
+        }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) return hostResources.getDrawableForDensity(hostId, density);
         try {
@@ -479,6 +559,10 @@ public final class GuestResourcesWrapper extends Resources {
     @Nullable
     @Override
     public Drawable getDrawableForDensity(int id, int density, @Nullable Theme theme) {
+        if (id == 0) {
+            logZeroIdOnce("getDrawableForDensity(theme)");
+            return null;
+        }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) return hostResources.getDrawableForDensity(hostId, density, null);
         try {
@@ -491,6 +575,10 @@ public final class GuestResourcesWrapper extends Resources {
     @NonNull
     @Override
     public Typeface getFont(int id) throws NotFoundException {
+        if (id == 0) {
+            logZeroIdOnce("getFont");
+            return Typeface.DEFAULT;
+        }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) return hostResources.getFont(hostId);
         try {
@@ -502,6 +590,10 @@ public final class GuestResourcesWrapper extends Resources {
 
     @Override
     public Movie getMovie(int id) throws NotFoundException {
+        if (id == 0) {
+            logZeroIdOnce("getMovie");
+            return null;
+        }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) return hostResources.getMovie(hostId);
         try {
@@ -511,9 +603,12 @@ public final class GuestResourcesWrapper extends Resources {
         }
     }
 
-    @NonNull
     @Override
     public XmlResourceParser getLayout(int id) throws NotFoundException {
+        if (id == 0) {
+            logZeroIdOnce("getLayout");
+            return null;
+        }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) return hostResources.getLayout(hostId);
         try {
@@ -523,9 +618,12 @@ public final class GuestResourcesWrapper extends Resources {
         }
     }
 
-    @NonNull
     @Override
     public XmlResourceParser getAnimation(int id) throws NotFoundException {
+        if (id == 0) {
+            logZeroIdOnce("getAnimation");
+            return null;
+        }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) return hostResources.getAnimation(hostId);
         try {
@@ -535,9 +633,12 @@ public final class GuestResourcesWrapper extends Resources {
         }
     }
 
-    @NonNull
     @Override
     public XmlResourceParser getXml(int id) throws NotFoundException {
+        if (id == 0) {
+            logZeroIdOnce("getXml");
+            return null;
+        }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) return hostResources.getXml(hostId);
         try {
@@ -550,6 +651,10 @@ public final class GuestResourcesWrapper extends Resources {
     @NonNull
     @Override
     public TypedArray obtainTypedArray(int id) throws NotFoundException {
+        if (id == 0) {
+            logZeroIdOnce("obtainTypedArray");
+            return hostResources.obtainAttributes(null, new int[0]);
+        }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) return hostResources.obtainTypedArray(hostId);
         try {
@@ -567,6 +672,10 @@ public final class GuestResourcesWrapper extends Resources {
     @NonNull
     @Override
     public InputStream openRawResource(int id) throws NotFoundException {
+        if (id == 0) {
+            logZeroIdOnce("openRawResource");
+            return new java.io.ByteArrayInputStream(new byte[0]);
+        }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) return hostResources.openRawResource(hostId);
         try {
@@ -579,6 +688,10 @@ public final class GuestResourcesWrapper extends Resources {
     @NonNull
     @Override
     public InputStream openRawResource(int id, TypedValue value) throws NotFoundException {
+        if (id == 0) {
+            logZeroIdOnce("openRawResource(value)");
+            return new java.io.ByteArrayInputStream(new byte[0]);
+        }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) return hostResources.openRawResource(hostId, value);
         try {
@@ -590,6 +703,10 @@ public final class GuestResourcesWrapper extends Resources {
 
     @Override
     public AssetFileDescriptor openRawResourceFd(int id) throws NotFoundException {
+        if (id == 0) {
+            logZeroIdOnce("openRawResourceFd");
+            return null;
+        }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) return hostResources.openRawResourceFd(hostId);
         try {
@@ -601,6 +718,11 @@ public final class GuestResourcesWrapper extends Resources {
 
     @Override
     public void getValue(int id, TypedValue outValue, boolean resolveRefs) throws NotFoundException {
+        if (id == 0) {
+            logZeroIdOnce("getValue");
+            if (outValue != null) outValue.type = TypedValue.TYPE_NULL;
+            return;
+        }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) {
             hostResources.getValue(hostId, outValue, resolveRefs);
@@ -625,6 +747,11 @@ public final class GuestResourcesWrapper extends Resources {
     @Override
     public void getValueForDensity(int id, int density, TypedValue outValue, boolean resolveRefs)
             throws NotFoundException {
+        if (id == 0) {
+            logZeroIdOnce("getValueForDensity");
+            if (outValue != null) outValue.type = TypedValue.TYPE_NULL;
+            return;
+        }
         Integer hostId = resolveSyntheticHostId(id);
         if (hostId != null) {
             hostResources.getValueForDensity(hostId, density, outValue, resolveRefs);
@@ -639,6 +766,10 @@ public final class GuestResourcesWrapper extends Resources {
 
     @Override
     public String getResourceName(int resid) throws NotFoundException {
+        if (resid == 0) {
+            logZeroIdOnce("getResourceName");
+            return "";
+        }
         Integer hostId = resolveSyntheticHostId(resid);
         if (hostId != null) return hostResources.getResourceName(hostId);
         try {
@@ -650,6 +781,10 @@ public final class GuestResourcesWrapper extends Resources {
 
     @Override
     public String getResourcePackageName(int resid) throws NotFoundException {
+        if (resid == 0) {
+            logZeroIdOnce("getResourcePackageName");
+            return guestPackage;
+        }
         Integer hostId = resolveSyntheticHostId(resid);
         if (hostId != null) return hostResources.getResourcePackageName(hostId);
         try {
@@ -661,6 +796,10 @@ public final class GuestResourcesWrapper extends Resources {
 
     @Override
     public String getResourceTypeName(int resid) throws NotFoundException {
+        if (resid == 0) {
+            logZeroIdOnce("getResourceTypeName");
+            return "";
+        }
         Integer hostId = resolveSyntheticHostId(resid);
         if (hostId != null) return hostResources.getResourceTypeName(hostId);
         try {
@@ -672,6 +811,10 @@ public final class GuestResourcesWrapper extends Resources {
 
     @Override
     public String getResourceEntryName(int resid) throws NotFoundException {
+        if (resid == 0) {
+            logZeroIdOnce("getResourceEntryName");
+            return "";
+        }
         Integer hostId = resolveSyntheticHostId(resid);
         if (hostId != null) return hostResources.getResourceEntryName(hostId);
         try {

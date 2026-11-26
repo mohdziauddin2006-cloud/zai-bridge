@@ -37,6 +37,16 @@ public final class GuestApplication extends Application {
     }
 
     @Override
+    public Context createConfigurationContext(android.content.res.Configuration overrideConfiguration) {
+        return guestContext.createConfigurationContext(overrideConfiguration);
+    }
+
+    @Override
+    public Context createDisplayContext(android.view.Display display) {
+        return guestContext.createDisplayContext(display);
+    }
+
+    @Override
     public Resources getResources() {
         return guestContext.getResources();
     }

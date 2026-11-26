@@ -74,19 +74,7 @@ public final class GuestActivityHost {
             GuestContext guestContext = new GuestContext(
                     host, gameDir, guestPackage, launcherActivity, isNative64, loader);
 
-            // Give the instance the guest's storage view, Resources, and system services.
-            // mBase is the ContextWrapper field every Activity inherits.
-            Field base = ContextWrapper.class.getDeclaredField("mBase");
-            base.setAccessible(true);
-            base.set(guest, guestContext);
-
-            setField(android.view.ContextThemeWrapper.class, guest, "mResources", guestContext.getResources());
-            setField(android.view.ContextThemeWrapper.class, guest, "mTheme", guestContext.getTheme());
-            setField(android.view.ContextThemeWrapper.class, guest, "mInflater", null);
-            setField(Activity.class, guest, "mApplication", guestContext.getGuestApplication());
-            setField(Activity.class, guest, "mActivityInfo",
-                    guestContext.resolveGuestActivityInfo(
-                            new android.content.ComponentName(guestPackage, launcherActivity)));
+            GuestLauncher.injectGuestResourcesMultiLayer(guest, guestContext, host);
 
             Window window = createWindow();
             attached = window != null;

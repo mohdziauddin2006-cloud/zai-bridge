@@ -41,6 +41,7 @@
 #include <GLES3/gl3.h>
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -113,10 +114,25 @@ std::atomic<int> g_modules_scanned{0};
 std::atomic<int> g_slots_seen{0};
 std::atomic<int> g_slots_patched{0};
 
+bool contains_icase(const char* haystack, const char* needle) {
+    if (!haystack || !needle || !*needle) return false;
+    const size_t nlen = std::strlen(needle);
+    for (const char* p = haystack; *p != '\0'; ++p) {
+        size_t i = 0;
+        while (i < nlen && p[i] != '\0' &&
+               std::tolower(static_cast<unsigned char>(p[i])) ==
+               std::tolower(static_cast<unsigned char>(needle[i]))) {
+            ++i;
+        }
+        if (i == nlen) return true;
+    }
+    return false;
+}
+
 bool is_excluded(const char* name) {
     if (name == nullptr || name[0] == '\0') return true;  // main executable
-    // Never patch platform/system/vendor/APEX/GPU driver modules (e.g. PowerVR B-Series
-    // /vendor/lib64/egl/libEGL_powervr.so, libGLESv2_powervr.so, libIMGegl.so).
+    // Never patch platform/system/vendor/APEX/OEM GPU driver modules across
+    // Qualcomm Adreno, ARM Mali/Immortalis, PowerVR/IMG, Samsung Xclipse, or ANGLE.
     static const char* const kDenyPrefixes[] = {
             "/system/",
             "/vendor/",
@@ -132,6 +148,10 @@ bool is_excluded(const char* name) {
             "libwrapper.so",
             "libEGL",
             "libGLES",
+            "libGLES_mali",
+            "libmali",
+            "libadreno",
+            "libxclipse",
             "libvulkan",
             "libIMG",
             "libPVR",
@@ -150,7 +170,7 @@ bool is_excluded(const char* name) {
             "libcutils.so",
     };
     for (const char* deny : kDeny) {
-        if (std::strstr(name, deny) != nullptr) return true;
+        if (contains_icase(name, deny)) return true;
     }
     // Guest renderers keep their original basename, e.g. libunity.so / libil2cpp.so / libUE4.so.
     return false;

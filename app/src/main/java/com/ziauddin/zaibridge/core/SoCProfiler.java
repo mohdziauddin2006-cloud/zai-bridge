@@ -21,17 +21,17 @@ import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileReader;
 import java.io.InputStream;
+import java.lang.reflect.Method;
 import java.util.Locale;
 
 /**
  * Universal Smartphone SoC & GPU Hardware Profiler and Auto-Recommender.
  *
- * <p>Combines the bundled {@code assets/soc_database.json} (covering Qualcomm
- * Snapdragon, MediaTek Helio/Dimensity, Samsung Exynos/Xclipse, Google Tensor,
- * HiSilicon Kirin/Maleoon, Xiaomi XRING O1, Unisoc/Spreadtrum, NVIDIA Tegra,
- * and Intel Atom) with dynamic live hardware probing ({@code GL_RENDERER},
- * CPU core count, peak clock MHz, and total RAM) so every current and future
- * Android device is accurately classified into Tiers 1–5.
+ * <p>Combines live EGL {@code GL_RENDERER} probing, per-core {@code cpuinfo_max_freq}
+ * clock speeds, system properties ({@code Build.SOC_MODEL}, {@code ro.soc.model},
+ * {@code ro.board.platform}), nominal RAM tier snapping, and
+ * {@code assets/soc_database.json} across Qualcomm, MediaTek, Samsung Exynos,
+ * Google Tensor, HiSilicon Kirin, Xiaomi XRING, and Unisoc chipsets.
  */
 public final class SoCProfiler {
 
@@ -47,6 +47,7 @@ public final class SoCProfiler {
         public final int cpuCores;
         public final int maxClockMhz;
         public final long totalRamMb;
+        public final int ramGb;
         public final boolean matchedFromDb;
 
         // Tier-recommended defaults
@@ -60,7 +61,7 @@ public final class SoCProfiler {
 
         public Profile(String socName, String vendor, String gpuName,
                        int tier, String tierLabel, String tierDescription,
-                       int cpuCores, int maxClockMhz, long totalRamMb,
+                       int cpuCores, int maxClockMhz, long totalRamMb, int ramGb,
                        boolean matchedFromDb,
                        int recUpscaler, int recScalePercent, int recSharpnessPercent,
                        int recNeuralPercent, int recFrameGen, int recTemporal, int recAutoMfg) {
@@ -73,6 +74,7 @@ public final class SoCProfiler {
             this.cpuCores = cpuCores;
             this.maxClockMhz = maxClockMhz;
             this.totalRamMb = totalRamMb;
+            this.ramGb = ramGb;
             this.matchedFromDb = matchedFromDb;
             this.recUpscaler = recUpscaler;
             this.recScalePercent = recScalePercent;
@@ -110,8 +112,8 @@ public final class SoCProfiler {
         public String summaryLine() {
             StringBuilder sb = new StringBuilder();
             sb.append(socName).append(" · ").append(tierLabel);
-            if (totalRamMb > 0) {
-                sb.append(String.format(Locale.US, " · %.1f GB RAM", totalRamMb / 1024.0));
+            if (ramGb > 0) {
+                sb.append(" · ").append(ramGb).append(" GB RAM");
             }
             if (cpuCores > 0 && maxClockMhz > 0) {
                 sb.append(String.format(Locale.US, " · %d-core %.2f GHz",
@@ -137,50 +139,95 @@ public final class SoCProfiler {
     }
 
     private static Profile probeInternal(Context context) {
-        final String gpu = probeGpuRenderer();
+        final String liveGpu = probeGpuRenderer();
         final String socRaw = collectSocIdentifiers();
         final int cores = Math.max(1, Runtime.getRuntime().availableProcessors());
-        final int maxMhz = readMaxCpuClockMhz(cores);
-        final long ramMb = readTotalRamMb(context);
+        final long maxKhz = readMaxCpuClockKhz(cores);
+        final int maxMhz = (int) (maxKhz / 1000L);
+        final long ramBytes = readTotalRamBytes(context);
+        final long ramMb = ramBytes / (1024L * 1024L);
+        final int nominalRamGb = snapNominalRamGb(ramBytes);
 
-        final String haystack = (socRaw + " " + gpu).toUpperCase(Locale.ROOT);
+        final String haystack = normalizeHaystack(socRaw + " " + liveGpu);
 
         JSONObject db = loadDatabase(context);
         String matchedName = null;
         String matchedVendor = null;
+        String matchedDbGpu = null;
         int matchedTier = 0;
 
         if (db != null) {
-            JSONArray entries = db.optJSONArray("entries");
-            if (entries != null) {
-                for (int i = 0; i < entries.length(); i++) {
-                    JSONObject e = entries.optJSONObject(i);
+            JSONArray socs = db.optJSONArray("socs");
+            if (socs == null) socs = db.optJSONArray("entries");
+            int bestTokenLen = 0;
+            if (socs != null) {
+                for (int i = 0; i < socs.length(); i++) {
+                    JSONObject e = socs.optJSONObject(i);
                     if (e == null) continue;
-                    JSONArray patterns = e.optJSONArray("patterns");
+                    JSONArray patterns = e.optJSONArray("match");
+                    if (patterns == null) patterns = e.optJSONArray("patterns");
                     if (patterns == null) continue;
                     for (int p = 0; p < patterns.length(); p++) {
-                        String pat = patterns.optString(p, "").toUpperCase(Locale.ROOT);
-                        if (!pat.isEmpty() && haystack.contains(pat)) {
-                            matchedName = e.optString("name", "Unknown SoC");
-                            matchedVendor = e.optString("vendor", "Generic");
+                        String pat = normalizeHaystack(patterns.optString(p, ""));
+                        if (!pat.isEmpty() && haystack.contains(pat) && pat.length() > bestTokenLen) {
+                            bestTokenLen = pat.length();
+                            matchedName = e.optString("family", e.optString("name", "Unknown SoC"));
+                            matchedVendor = e.optString("maker", e.optString("vendor", "Generic"));
+                            matchedDbGpu = e.optString("gpu", "");
                             matchedTier = e.optInt("tier", 2);
-                            break;
                         }
                     }
-                    if (matchedTier > 0) break;
+                }
+            }
+
+            // If no SoC token matched, try matching GPU families in "gpus"
+            if (matchedTier <= 0) {
+                JSONArray gpus = db.optJSONArray("gpus");
+                int bestGpuToken = 0;
+                if (gpus != null) {
+                    for (int i = 0; i < gpus.length(); i++) {
+                        JSONObject g = gpus.optJSONObject(i);
+                        if (g == null) continue;
+                        JSONArray patterns = g.optJSONArray("match");
+                        if (patterns == null) continue;
+                        for (int p = 0; p < patterns.length(); p++) {
+                            String pat = normalizeHaystack(patterns.optString(p, ""));
+                            if (!pat.isEmpty() && haystack.contains(pat) && pat.length() > bestGpuToken) {
+                                bestGpuToken = pat.length();
+                                matchedTier = g.optInt("tier", 0);
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        boolean fromDb = matchedTier > 0;
-        if (!fromDb) {
-            // Dynamic hardware heuristic for brand-new / future / unlisted SoCs
-            matchedTier = scoreDynamicHardwareTier(gpu, cores, maxMhz, ramMb);
+        // Disambiguate shared die IDs (MT6855, SM8250, MT6877) using live clock speed.
+        String[] sharedDisambiguated = resolveSharedDieFamily(
+                haystack, maxKhz, matchedName, matchedVendor, matchedDbGpu);
+        matchedName = sharedDisambiguated[0];
+        matchedVendor = sharedDisambiguated[1];
+        matchedDbGpu = sharedDisambiguated[2];
+
+        boolean fromDb = matchedTier > 0 && matchedName != null && !matchedName.isEmpty();
+        if (matchedTier <= 0) {
+            matchedTier = scoreDynamicHardwareTier(liveGpu, cores, maxMhz, nominalRamGb * 1024L);
+        }
+        if (matchedName == null || matchedName.isEmpty()) {
             matchedName = primaryHardwareLabel();
+        }
+        if (matchedVendor == null || matchedVendor.isEmpty()) {
             matchedVendor = Build.MANUFACTURER != null ? Build.MANUFACTURER : "Android";
         }
 
-        // Load tier recommendation preset from soc_database.json (or safe fallback)
+        // Live EGL GL_RENDERER ALWAYS wins over static JSON database strings.
+        final boolean hasLiveGpu = liveGpu != null
+                && !liveGpu.isEmpty()
+                && !"Unknown GPU".equalsIgnoreCase(liveGpu);
+        final String finalGpu = hasLiveGpu
+                ? liveGpu
+                : (matchedDbGpu != null && !matchedDbGpu.isEmpty() ? matchedDbGpu : "Unknown GPU");
+
         String tierLabel = defaultTierLabel(matchedTier);
         String tierDesc = "";
         int recUpscaler = GraphicsSettings.UPSCALER_FSR;
@@ -197,12 +244,12 @@ public final class SoCProfiler {
                 for (int i = 0; i < tiers.length(); i++) {
                     JSONObject t = tiers.optJSONObject(i);
                     if (t != null && t.optInt("tier", 0) == matchedTier) {
-                        tierLabel = t.optString("label", tierLabel);
+                        tierLabel = t.optString("name", t.optString("label", tierLabel));
                         tierDesc = t.optString("description", "");
                         recUpscaler = t.optInt("upscaler", recUpscaler);
-                        recScale = t.optInt("scalePercent", recScale);
-                        recSharp = t.optInt("sharpnessPercent", recSharp);
-                        recNeural = t.optInt("neuralPercent", recNeural);
+                        recScale = t.optInt("scale", t.optInt("scalePercent", recScale));
+                        recSharp = t.optInt("sharpness", t.optInt("sharpnessPercent", recSharp));
+                        recNeural = t.optInt("neural", t.optInt("neuralPercent", recNeural));
                         recFg = t.optInt("frameGen", recFg);
                         recTemp = t.optInt("temporal", recTemp);
                         recAuto = t.optInt("autoMfg", recAuto);
@@ -213,19 +260,108 @@ public final class SoCProfiler {
         }
 
         Profile profile = new Profile(
-                matchedName, matchedVendor, gpu, matchedTier, tierLabel, tierDesc,
-                cores, maxMhz, ramMb, fromDb,
+                matchedName, matchedVendor, finalGpu, matchedTier, tierLabel, tierDesc,
+                cores, maxMhz, ramMb, nominalRamGb, fromDb,
                 recUpscaler, recScale, recSharp, recNeural, recFg, recTemp, recAuto);
         Log.i(TAG, "SoCProfiler detected: " + profile.summaryLine()
-                + " | GPU=" + gpu + " (db=" + fromDb + ")");
+                + " | GPU=" + finalGpu + " (live=" + hasLiveGpu + ", db=" + fromDb + ")");
         return profile;
+    }
+
+    /**
+     * Resolves chips that share a silicon die identifier using live peak CPU frequency
+     * (in kHz) and model substrings.
+     */
+    public static String[] resolveSharedDieFamily(
+            String normalizedHaystack,
+            long maxKhz,
+            String matchedName,
+            String matchedVendor,
+            String matchedDbGpu) {
+        String h = normalizedHaystack == null ? "" : normalizedHaystack;
+        if (h.contains("mt6855") || "Dimensity 7025".equals(matchedName)
+                || "Dimensity 7020".equals(matchedName) || "Dimensity 930".equals(matchedName)) {
+            matchedVendor = "MediaTek";
+            matchedDbGpu = "PowerVR IMG BXM-8-256";
+            if (h.contains("7025 ultra")) {
+                matchedName = "Dimensity 7025 Ultra";
+            } else if (h.contains("dimensity 930")) {
+                matchedName = "Dimensity 930";
+            } else if (h.contains("dimensity 7020")) {
+                matchedName = "Dimensity 7020";
+            } else if (h.contains("dimensity 7025")) {
+                matchedName = "Dimensity 7025";
+            } else if (maxKhz >= 2_400_000L) {
+                matchedName = "Dimensity 7025";
+            } else if (maxKhz >= 2_000_000L) {
+                matchedName = "Dimensity 7020";
+            } else {
+                matchedName = "Dimensity 7025";
+            }
+        } else if (h.contains("sm8250") && !h.contains("870") && !h.contains("865")) {
+            matchedVendor = "Qualcomm";
+            if (maxKhz >= 3_100_000L) {
+                matchedName = "Snapdragon 870";
+            } else if (maxKhz >= 2_950_000L) {
+                matchedName = "Snapdragon 865+";
+            } else {
+                matchedName = "Snapdragon 865";
+            }
+        } else if (h.contains("mt6877") && !h.contains("900") && !h.contains("7050")
+                && !h.contains("1080")) {
+            matchedVendor = "MediaTek";
+            if (maxKhz >= 2_500_000L) {
+                matchedName = "Dimensity 7050 / 1080";
+            } else {
+                matchedName = "Dimensity 900";
+            }
+        }
+        return new String[]{matchedName, matchedVendor, matchedDbGpu};
+    }
+
+    /**
+     * Snaps raw kernel-reported {@code ActivityManager.MemoryInfo.totalMem} bytes to the
+     * nominal physical LPDDR capacity tier ({@code 2, 3, 4, 6, 8, 12, 16, 24 GB}), accounting
+     * for firmware/modem/ION carveouts that hide ~0.3–1.2 GB from Linux.
+     */
+    public static int snapNominalRamGb(long totalBytes) {
+        if (totalBytes <= 0) return 0;
+        double rawGb = totalBytes / (1024.0 * 1024.0 * 1024.0);
+        if (rawGb > 20.5 && rawGb <= 24.5) return 24;
+        if (rawGb > 14.5 && rawGb <= 16.5) return 16;
+        if (rawGb > 10.5 && rawGb <= 12.5) return 12;
+        if (rawGb > 6.5 && rawGb <= 8.5) return 8;
+        if (rawGb > 4.8 && rawGb <= 6.5) return 6;
+        if (rawGb > 3.2 && rawGb <= 4.8) return 4;
+        if (rawGb > 2.5 && rawGb <= 3.2) return 3;
+        if (rawGb > 1.5 && rawGb <= 2.5) return 2;
+        return (int) Math.max(1, Math.round(rawGb));
+    }
+
+    private static String normalizeHaystack(String value) {
+        if (value == null) return "";
+        String lower = value.toLowerCase(Locale.ROOT)
+                .replace("(tm)", " ").replace("(r)", " ")
+                .replace("processor", " ").replace("technologies", " ");
+        StringBuilder out = new StringBuilder(lower.length());
+        boolean space = true;
+        for (int i = 0; i < lower.length(); ++i) {
+            char c = lower.charAt(i);
+            if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '-') {
+                out.append(c);
+                space = false;
+            } else if (!space) {
+                out.append(' ');
+                space = true;
+            }
+        }
+        return out.toString().trim();
     }
 
     private static int scoreDynamicHardwareTier(String gpu, int cores, int maxMhz, long ramMb) {
         String g = gpu == null ? "" : gpu.toUpperCase(Locale.ROOT);
         int score = 0;
 
-        // GPU class hints
         if (g.contains("ADRENO 8") || g.contains("ADRENO 9") || g.contains("IMMORTALIS-G9")
                 || g.contains("XCLIPSE 940") || g.contains("XCLIPSE 950") || g.contains("XCLIPSE 960")) {
             score += 5;
@@ -233,7 +369,8 @@ public final class SoCProfiler {
                 || g.contains("XCLIPSE 920") || g.contains("MALI-G720") || g.contains("MALEOON 9")) {
             score += 4;
         } else if (g.contains("ADRENO 7") || g.contains("ADRENO 65") || g.contains("ADRENO 66")
-                || g.contains("MALI-G710") || g.contains("MALI-G615") || g.contains("MALI-G610")) {
+                || g.contains("MALI-G710") || g.contains("MALI-G615") || g.contains("MALI-G610")
+                || g.contains("DXT")) {
             score += 3;
         } else if (g.contains("ADRENO 6") || g.contains("MALI-G77") || g.contains("MALI-G68")
                 || g.contains("MALI-G57") || g.contains("BXM-8") || g.contains("BXM-")
@@ -243,13 +380,11 @@ public final class SoCProfiler {
             score += 1;
         }
 
-        // Peak CPU clock hints
         if (maxMhz >= 3400) score += 4;
         else if (maxMhz >= 2900) score += 3;
         else if (maxMhz >= 2300) score += 2;
         else if (maxMhz >= 1800) score += 1;
 
-        // RAM capacity hints
         if (ramMb >= 11000) score += 3;
         else if (ramMb >= 7000) score += 2;
         else if (ramMb >= 3800) score += 1;
@@ -267,13 +402,17 @@ public final class SoCProfiler {
         switch (tier) {
             case 5: return "Tier 5: Ultra-Flagship";
             case 4: return "Tier 4: Flagship";
-            case 3: return "Tier 3: Mid-Range";
-            case 2: return "Tier 2: Budget";
-            default: return "Tier 1: Entry / Legacy";
+            case 3: return "Tier 3: Performance";
+            case 2: return "Tier 2: Mainstream";
+            default: return "Tier 1: Entry";
         }
     }
 
     private static String primaryHardwareLabel() {
+        String propSoc = readSystemProp("ro.soc.model");
+        if (!propSoc.isEmpty() && !"unknown".equalsIgnoreCase(propSoc)) {
+            return propSoc;
+        }
         if (Build.VERSION.SDK_INT >= 31 && Build.SOC_MODEL != null
                 && !Build.SOC_MODEL.isEmpty() && !"unknown".equalsIgnoreCase(Build.SOC_MODEL)) {
             return Build.SOC_MODEL;
@@ -284,11 +423,34 @@ public final class SoCProfiler {
         return Build.BOARD != null ? Build.BOARD : "Android Device";
     }
 
+    private static String readSystemProp(String key) {
+        try {
+            Class<?> sp = Class.forName("android.os.SystemProperties");
+            Method get = sp.getMethod("get", String.class, String.class);
+            Object v = get.invoke(null, key, "");
+            return v instanceof String ? ((String) v).trim() : "";
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
     private static String collectSocIdentifiers() {
         StringBuilder sb = new StringBuilder();
         if (Build.VERSION.SDK_INT >= 31) {
             if (Build.SOC_MANUFACTURER != null) sb.append(Build.SOC_MANUFACTURER).append(' ');
             if (Build.SOC_MODEL != null) sb.append(Build.SOC_MODEL).append(' ');
+        }
+        String[] propKeys = {
+                "ro.soc.model",
+                "ro.soc.manufacturer",
+                "ro.board.platform",
+                "ro.mediatek.platform",
+                "ro.hardware",
+                "ro.product.board"
+        };
+        for (String key : propKeys) {
+            String val = readSystemProp(key);
+            if (!val.isEmpty()) sb.append(val).append(' ');
         }
         if (Build.HARDWARE != null) sb.append(Build.HARDWARE).append(' ');
         if (Build.BOARD != null) sb.append(Build.BOARD).append(' ');
@@ -310,42 +472,54 @@ public final class SoCProfiler {
         return sb.toString();
     }
 
-    private static int readMaxCpuClockMhz(int cores) {
+    private static long readMaxCpuClockKhz(int cores) {
         long maxKhz = 0;
         for (int i = 0; i < Math.min(cores, 16); i++) {
             File f = new File("/sys/devices/system/cpu/cpu" + i + "/cpufreq/cpuinfo_max_freq");
-            if (!f.isFile()) continue;
-            try (BufferedReader r = new BufferedReader(new FileReader(f))) {
-                String line = r.readLine();
-                if (line != null) {
-                    long khz = Long.parseLong(line.trim());
-                    if (khz > maxKhz) maxKhz = khz;
+            long v = readLongFile(f);
+            if (v > maxKhz) maxKhz = v;
+        }
+        if (maxKhz <= 0) {
+            File[] policies = new File("/sys/devices/system/cpu/cpufreq").listFiles();
+            if (policies != null) {
+                for (File p : policies) {
+                    long v = readLongFile(new File(p, "cpuinfo_max_freq"));
+                    if (v > maxKhz) maxKhz = v;
                 }
-            } catch (Throwable ignored) {
             }
         }
-        return (int) (maxKhz / 1000L);
+        return maxKhz;
     }
 
-    private static long readTotalRamMb(Context context) {
+    private static long readLongFile(File f) {
+        if (f == null || !f.isFile()) return 0;
+        try (BufferedReader r = new BufferedReader(new FileReader(f))) {
+            String line = r.readLine();
+            return line != null ? Long.parseLong(line.trim()) : 0;
+        } catch (Throwable ignored) {
+            return 0;
+        }
+    }
+
+    private static long readTotalRamBytes(Context context) {
         try {
             ActivityManager am = (ActivityManager) context.getSystemService(Context.ACTIVITY_SERVICE);
             if (am != null) {
                 ActivityManager.MemoryInfo mi = new ActivityManager.MemoryInfo();
                 am.getMemoryInfo(mi);
-                return mi.totalMem / (1024L * 1024L);
+                return mi.totalMem;
             }
         } catch (Throwable ignored) {
         }
         return 0L;
     }
 
-    private static String probeGpuRenderer() {
+    public static String probeGpuRenderer() {
         try {
             EGLDisplay display = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY);
-            if (display == EGL14.EGL_NO_DISPLAY) return "Unknown GPU";
+            if (display == EGL14.EGL_NO_DISPLAY) return fallbackNativeGpu();
             int[] version = new int[2];
-            if (!EGL14.eglInitialize(display, version, 0, version, 1)) return "Unknown GPU";
+            if (!EGL14.eglInitialize(display, version, 0, version, 1)) return fallbackNativeGpu();
             try {
                 int[] cfgAttr = {
                         EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
@@ -355,31 +529,48 @@ public final class SoCProfiler {
                 EGLConfig[] cfgs = new EGLConfig[1];
                 int[] num = new int[1];
                 if (!EGL14.eglChooseConfig(display, cfgAttr, 0, cfgs, 0, 1, num, 0) || num[0] <= 0) {
-                    return "Unknown GPU";
+                    return fallbackNativeGpu();
                 }
                 int[] ctxAttr = { EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE };
                 EGLContext ctx = EGL14.eglCreateContext(display, cfgs[0], EGL14.EGL_NO_CONTEXT, ctxAttr, 0);
-                if (ctx == EGL14.EGL_NO_CONTEXT) return "Unknown GPU";
+                if (ctx == EGL14.EGL_NO_CONTEXT) return fallbackNativeGpu();
                 int[] pbAttr = { EGL14.EGL_WIDTH, 1, EGL14.EGL_HEIGHT, 1, EGL14.EGL_NONE };
                 EGLSurface surf = EGL14.eglCreatePbufferSurface(display, cfgs[0], pbAttr, 0);
-                String renderer = "Unknown GPU";
+                String renderer = "";
                 if (surf != EGL14.EGL_NO_SURFACE) {
                     if (EGL14.eglMakeCurrent(display, surf, surf, ctx)) {
                         String r = GLES20.glGetString(GLES20.GL_RENDERER);
-                        if (r != null && !r.isEmpty()) renderer = r;
+                        if (r != null && !r.isEmpty()) renderer = r.trim();
                         EGL14.eglMakeCurrent(display, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE,
                                 EGL14.EGL_NO_CONTEXT);
                     }
                     EGL14.eglDestroySurface(display, surf);
                 }
                 EGL14.eglDestroyContext(display, ctx);
-                return renderer;
+                return renderer.isEmpty() ? fallbackNativeGpu() : renderer;
             } finally {
                 EGL14.eglTerminate(display);
             }
         } catch (Throwable t) {
-            return "Unknown GPU";
+            return fallbackNativeGpu();
         }
+    }
+
+    private static String fallbackNativeGpu() {
+        try {
+            String info = EglSwapHook.graphicsInfo();
+            if (info != null && info.startsWith("gpu=")) {
+                String gpu = info.substring(4);
+                int cut = gpu.indexOf(" cpu=");
+                if (cut > 0) gpu = gpu.substring(0, cut);
+                int sep = gpu.indexOf(" / ");
+                if (sep > 0) gpu = gpu.substring(0, sep);
+                gpu = gpu.trim();
+                if (!gpu.isEmpty()) return gpu;
+            }
+        } catch (Throwable ignored) {
+        }
+        return "Unknown GPU";
     }
 
     private static JSONObject loadDatabase(Context context) {

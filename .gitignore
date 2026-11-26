@@ -4,9 +4,16 @@ build/
 app/build/
 local.properties
 
-# Unsigned intermediates and v4 signature sidecars
+# Release & test APKs belong on GitHub Releases, not Git commits
+*.apk
 *.unaligned.apk
 *.idsig
+
+# Logs & temporary capture clutter
+*.log
+.tmp_*
+guest_log.txt
+shot_*.png
 
 # Android Studio / IntelliJ
 .idea/

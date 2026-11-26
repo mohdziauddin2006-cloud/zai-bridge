@@ -138,12 +138,24 @@ public final class BridgeInstrumentation extends Instrumentation {
         final boolean guest = isGuest(activity);
         if (ctx != null && guest) {
             GuestLauncher.attachGuestContext(activity, ctx);
+            GuestLauncher.reassertGuestResources(activity);
+
+            android.content.res.Resources actRes = activity.getResources();
+            android.content.res.Resources appRes = activity.getApplicationContext() != null
+                    ? activity.getApplicationContext().getResources() : null;
+            Log.i(TAG, "resources pre-onCreate check: activityWrapped="
+                    + (actRes instanceof GuestResourcesWrapper)
+                    + " (" + (actRes != null ? actRes.getClass().getSimpleName() : "null") + "), "
+                    + "appWrapped=" + (appRes instanceof GuestResourcesWrapper)
+                    + " (" + (appRes != null ? appRes.getClass().getSimpleName() : "null") + ")");
+
             // Before performCreate: the guest's onCreate may inflate the very
             // SurfaceView whose dimensions a late rotation would invalidate.
             GuestLauncher.applyGuestOrientation(activity);
         }
         super.callActivityOnCreate(activity, icicle);
         if (ctx != null && guest) {
+            GuestLauncher.reassertGuestResources(activity);
             // A guest that probed the display size in onCreate saw the pre-rotation
             // orientation and may have asked for it. The imported manifest wins.
             GuestLauncher.confirmGuestOrientation(activity);
@@ -256,9 +268,29 @@ public final class BridgeInstrumentation extends Instrumentation {
     // ------------------------------------------------------------------
 
     @Override
+    public void callActivityOnPostCreate(Activity activity, Bundle savedInstanceState) {
+        if (isGuest(activity)) GuestLauncher.reassertGuestResources(activity);
+        super.callActivityOnPostCreate(activity, savedInstanceState);
+        if (isGuest(activity)) GuestLauncher.reassertGuestResources(activity);
+    }
+
+    @Override
+    public void callActivityOnStart(Activity activity) {
+        if (isGuest(activity)) GuestLauncher.reassertGuestResources(activity);
+        super.callActivityOnStart(activity);
+    }
+
+    @Override
+    public void callActivityOnRestart(Activity activity) {
+        if (isGuest(activity)) GuestLauncher.reassertGuestResources(activity);
+        super.callActivityOnRestart(activity);
+    }
+
+    @Override
     public void callActivityOnResume(Activity activity) {
         Log.i(TAG, "lifecycle onResume " + activity.getClass().getName());
         if (isGuest(activity)) {
+            GuestLauncher.reassertGuestResources(activity);
             EglSwapHook.refreshNativeHooks();
         }
         super.callActivityOnResume(activity);
@@ -273,7 +305,12 @@ public final class BridgeInstrumentation extends Instrumentation {
     @Override
     public void callActivityOnDestroy(Activity activity) {
         Log.i(TAG, "lifecycle onDestroy " + activity.getClass().getName());
+        final boolean wasGuest = isGuest(activity);
+        GUESTS.remove(activity);
         super.callActivityOnDestroy(activity);
+        if (wasGuest && GUESTS.isEmpty()) {
+            GuestLauncher.restoreHostResourcesIfIdle();
+        }
     }
 
     public Instrumentation delegate() {

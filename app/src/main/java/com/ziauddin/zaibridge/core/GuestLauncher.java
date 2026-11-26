@@ -457,6 +457,14 @@ public final class GuestLauncher {
         GameOrientation.apply(guest, game.orientation, game.label);
     }
 
+    private static final Object RESOURCES_INJECT_LOCK = new Object();
+    private static final java.util.Map<Object, android.content.res.Resources> SAVED_SHARED_RESOURCES =
+            new java.util.IdentityHashMap<>();
+    private static final java.util.Map<Activity, GuestContext> BOUND_GUEST_CONTEXTS =
+            new java.util.WeakHashMap<>();
+    private static final java.util.Set<Activity> CONFIG_HOOKED_ACTIVITIES =
+            java.util.Collections.newSetFromMap(new java.util.WeakHashMap<>());
+
     private static void setFieldQuiet(Class<?> stopClass, Object target, String fieldName, Object value) {
         if (target == null) return;
         for (Class<?> c = target.getClass(); c != null; c = c.getSuperclass()) {
@@ -474,6 +482,194 @@ public final class GuestLauncher {
         }
     }
 
+    private static void replaceAllResourcesFields(
+            Object target,
+            android.content.res.Resources guestRes,
+            boolean trackOriginalForRestore) {
+        if (target == null || guestRes == null) return;
+        final android.content.res.Resources sysRes = android.content.res.Resources.getSystem();
+        for (Class<?> c = target.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+            for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                try {
+                    String name = f.getName();
+                    boolean isResField = "mResources".equals(name)
+                            || android.content.res.Resources.class.isAssignableFrom(f.getType());
+                    f.setAccessible(true);
+                    Object cur = f.get(target);
+                    if (!isResField && cur instanceof android.content.res.Resources) {
+                        isResField = true;
+                    }
+                    if (!isResField) continue;
+                    if (cur == guestRes || cur == sysRes || "mSystem".equals(name)) continue;
+                    if (trackOriginalForRestore && cur instanceof android.content.res.Resources
+                            && !(cur instanceof GuestResourcesWrapper)) {
+                        synchronized (RESOURCES_INJECT_LOCK) {
+                            if (!SAVED_SHARED_RESOURCES.containsKey(target)) {
+                                SAVED_SHARED_RESOURCES.put(target, (android.content.res.Resources) cur);
+                            }
+                        }
+                    }
+                    f.set(target, guestRes);
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+    }
+
+    private static Context getWrapperBaseQuiet(Context ctx) {
+        if (ctx instanceof android.content.ContextWrapper) {
+            return ((android.content.ContextWrapper) ctx).getBaseContext();
+        }
+        return null;
+    }
+
+    private static void injectContextChainResources(
+            Context start,
+            android.content.res.Resources guestRes,
+            boolean trackSharedForRestore,
+            java.util.Set<Object> visited) {
+        Context cur = start;
+        while (cur != null && visited.add(cur)) {
+            replaceAllResourcesFields(cur, guestRes, trackSharedForRestore);
+            // Also reach LoadedApk (mPackageInfo) inside ContextImpl across OEM ROMs.
+            for (Class<?> c = cur.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+                try {
+                    java.lang.reflect.Field pkgInfoField = c.getDeclaredField("mPackageInfo");
+                    pkgInfoField.setAccessible(true);
+                    Object loadedApk = pkgInfoField.get(cur);
+                    if (loadedApk != null && visited.add(loadedApk)) {
+                        replaceAllResourcesFields(loadedApk, guestRes, true);
+                    }
+                    break;
+                } catch (NoSuchFieldException ignored) {
+                } catch (Throwable ignored) {
+                    break;
+                }
+            }
+            cur = getWrapperBaseQuiet(cur);
+        }
+    }
+
+    /**
+     * Multi-layer universal {@link GuestResourcesWrapper} injection covering
+     * Transsion {@code OverrideResources}, Xiaomi {@code MiuiResources},
+     * OPPO/OnePlus/Realme {@code OplusResources}, Samsung {@code SemResources},
+     * Vivo {@code VivoResources}, and AOSP {@code ContextImpl}/{@code LoadedApk}.
+     */
+    public static void injectGuestResourcesMultiLayer(
+            Activity activity, GuestContext guestContext, Context hostCtx) {
+        if (activity == null || guestContext == null) return;
+        try {
+            HiddenApi.exemptAll();
+        } catch (Throwable ignored) {
+        }
+
+        final android.content.res.Resources guestRes = guestContext.getResources();
+        final Context origBase = activity.getBaseContext();
+        final java.util.Set<Object> visited =
+                java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+
+        // 1. Patch Activity's original per-Activity ContextImpl / OEM wrappers before swapping mBase.
+        if (origBase != null && !(origBase instanceof GuestContext)) {
+            injectContextChainResources(origBase, guestRes, false, visited);
+        }
+
+        // 2. Replace Activity.mBase -> GuestContext (if not already swapped).
+        if (!(origBase instanceof GuestContext)) {
+            setFieldQuiet(android.content.ContextWrapper.class, activity, "mBase", guestContext);
+        }
+
+        // 3. Patch Activity's ContextThemeWrapper.mResources + GuestApplication + LoadedApk.
+        injectContextChainResources(activity, guestRes, false, visited);
+        injectContextChainResources(guestContext, guestRes, true, visited);
+        injectContextChainResources(guestContext.getGuestApplication(), guestRes, true, visited);
+        if (hostCtx != null) {
+            injectContextChainResources(hostCtx.getApplicationContext(), guestRes, true, visited);
+        }
+
+        // 4. Resolve safe guest theme ID and reset mTheme/mInflater so Android builds Theme cleanly
+        //    from GuestResourcesWrapper rather than cached OEM OverrideResources/MiuiResources.
+        String targetActName = (guestClass != null && !guestClass.isEmpty())
+                ? guestClass
+                : (guestContext.getPrimaryActivityClass() != null && !guestContext.getPrimaryActivityClass().isEmpty()
+                        ? guestContext.getPrimaryActivityClass()
+                        : activity.getClass().getName());
+        android.content.ComponentName comp = new android.content.ComponentName(
+                guestContext.getPackageName(), targetActName);
+        android.content.pm.ActivityInfo guestAi = guestContext.resolveGuestActivityInfo(comp);
+        if (guestAi != null) {
+            setFieldQuiet(Activity.class, activity, "mActivityInfo", guestAi);
+        }
+        setFieldQuiet(Activity.class, activity, "mApplication",
+                guestContext.getGuestApplication());
+
+        int themeRes = guestContext.resolveGuestThemeRes(guestAi);
+        if (themeRes != 0) {
+            setFieldQuiet(android.view.ContextThemeWrapper.class, activity,
+                    "mThemeResource", themeRes);
+        }
+        setFieldQuiet(android.view.ContextThemeWrapper.class, activity, "mTheme", null);
+        setFieldQuiet(android.view.ContextThemeWrapper.class, activity, "mInflater", null);
+
+        synchronized (RESOURCES_INJECT_LOCK) {
+            BOUND_GUEST_CONTEXTS.put(activity, guestContext);
+        }
+        registerConfigReenforcementIfNeeded(activity);
+    }
+
+    private static void registerConfigReenforcementIfNeeded(final Activity activity) {
+        synchronized (RESOURCES_INJECT_LOCK) {
+            if (!CONFIG_HOOKED_ACTIVITIES.add(activity)) return;
+        }
+        try {
+            activity.registerComponentCallbacks(new android.content.ComponentCallbacks() {
+                @Override
+                public void onConfigurationChanged(android.content.res.Configuration newConfig) {
+                    reassertGuestResources(activity);
+                }
+
+                @Override
+                public void onLowMemory() {
+                }
+            });
+        } catch (Throwable ignored) {
+        }
+    }
+
+    public static void reassertGuestResources(Activity activity) {
+        if (activity == null) return;
+        GuestContext gc;
+        synchronized (RESOURCES_INJECT_LOCK) {
+            gc = BOUND_GUEST_CONTEXTS.get(activity);
+        }
+        if (gc == null && activity.getBaseContext() instanceof GuestContext) {
+            gc = (GuestContext) activity.getBaseContext();
+        }
+        if (gc == null) return;
+        boolean activityOk = activity.getResources() instanceof GuestResourcesWrapper;
+        boolean appOk = activity.getApplicationContext() != null
+                && activity.getApplicationContext().getResources() instanceof GuestResourcesWrapper;
+        if (!activityOk || !appOk) {
+            injectGuestResourcesMultiLayer(activity, gc, gc.getHostBaseContext());
+        }
+    }
+
+    public static void restoreHostResourcesIfIdle() {
+        synchronized (RESOURCES_INJECT_LOCK) {
+            if (SAVED_SHARED_RESOURCES.isEmpty()) return;
+            for (java.util.Map.Entry<Object, android.content.res.Resources> entry :
+                    SAVED_SHARED_RESOURCES.entrySet()) {
+                Object target = entry.getKey();
+                android.content.res.Resources orig = entry.getValue();
+                if (target != null && orig != null) {
+                    setFieldQuiet(Object.class, target, "mResources", orig);
+                }
+            }
+            SAVED_SHARED_RESOURCES.clear();
+        }
+        Log.i(TAG, "restored host LoadedApk/Application original Resources after guest exit");
+    }
+
     public static void attachGuestContext(Activity guest, Context ctx) {
         final File gameDir = guestGameDir;
         if (gameDir == null) return;
@@ -486,33 +682,13 @@ public final class GuestLauncher {
                     guestNative64,
                     guestLoader);
 
-            setFieldQuiet(android.content.ContextWrapper.class, guest, "mBase", guestContext);
-            setFieldQuiet(android.view.ContextThemeWrapper.class, guest, "mResources",
-                    guestContext.getResources());
-            setFieldQuiet(android.view.ContextThemeWrapper.class, guest, "mTheme",
-                    guestContext.getTheme());
-            setFieldQuiet(android.view.ContextThemeWrapper.class, guest, "mInflater", null);
-            setFieldQuiet(Activity.class, guest, "mApplication",
-                    guestContext.getGuestApplication());
+            injectGuestResourcesMultiLayer(guest, guestContext, ctx);
 
-            android.content.ComponentName comp = new android.content.ComponentName(
-                    guestPackage != null ? guestPackage : guest.getPackageName(),
-                    guestClass != null ? guestClass : guest.getClass().getName());
-            android.content.pm.ActivityInfo guestAi =
-                    guestContext.resolveGuestActivityInfo(comp);
-            if (guestAi != null) {
-                setFieldQuiet(Activity.class, guest, "mActivityInfo", guestAi);
-            }
-
-            Log.i(TAG, "guest base context + Resources/PM/Application injected (files="
+            Log.i(TAG, "multi-layer guest context + Resources/PM/Application injected (files="
                     + guestContext.getFilesDir() + ", obb=" + guestContext.getObbDir() + ")");
             guestContext.mergeInto(guest.getAssets());
         } catch (Throwable t) {
             Log.w(TAG, "guest context injection failed: " + t);
-        }
-
-        if (!guestNative64) {
-            applyLegacyTheme(guest);
         }
     }
 

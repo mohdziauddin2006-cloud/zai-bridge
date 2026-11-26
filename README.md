@@ -1,312 +1,144 @@
 <div align="center">
+  <img src="docs/banner.svg" alt="Zai-Bridge v3.2.1" width="100%" />
 
-<img src="docs/banner.svg" alt="Zai-Bridge v3.2.0 — Universal 32-to-64-Bit Android Translation Container with Zai-Scale Ultra Graphics" width="100%" />
+  <p>
+    <a href="https://github.com/mohdziauddin2006-cloud/zai-bridge/releases/latest">
+      <img src="https://img.shields.io/badge/Release-v3.2.1-00E5FF?style=for-the-badge" alt="Release v3.2.1" />
+    </a>
+    <img src="https://img.shields.io/badge/Android-8.0%20--%2016%2B-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android 8.0 to 16+" />
+    <img src="https://img.shields.io/badge/ABIs-arm64--v8a%20%7C%20armeabi--v7a%20%7C%20x86__64%20%7C%20x86-FFB300?style=for-the-badge" alt="Universal 4-ABI APK" />
+    <a href="LICENSE">
+      <img src="https://img.shields.io/badge/License-MIT-94A3B8?style=for-the-badge" alt="MIT License" />
+    </a>
+  </p>
 
-# Zai-Bridge (v3.2.0)
-### Universal 32-to-64-Bit Android Translation Container & Zai-Scale Ultra™ Neural Engine
-
-[![Android](https://img.shields.io/badge/Android-8.0%E2%80%9316%2B-00E5FF?style=for-the-badge&logo=android&logoColor=white&labelColor=07090E)](https://developer.android.com)
-[![Release](https://img.shields.io/badge/Release-v3.2.0-FFB300?style=for-the-badge&logo=github&logoColor=white&labelColor=07090E)](https://github.com/mohdziauddin2006-cloud/zai-bridge/releases)
-[![ABIs](https://img.shields.io/badge/ABIs-arm64--v8a%20%7C%20armeabi--v7a%20%7C%20x86__64%20%7C%20x86-00E5FF?style=for-the-badge&labelColor=07090E)](#compatibility)
-[![Core](https://img.shields.io/badge/Core-Unicorn%20ARM32-FFB300?style=for-the-badge&labelColor=07090E)](https://github.com/unicorn-engine/unicorn)
-[![Heap](https://img.shields.io/badge/Guest%20Arena-768%20MB%20%2F%204%20KB%20pages-00E5FF?style=for-the-badge&labelColor=07090E)](#guest-memory-model)
-[![Graphics](https://img.shields.io/badge/Graphics-Zai--Scale%20Ultra%20Uncapped%20MFG-FFB300?style=for-the-badge&labelColor=07090E)](#zai-scale-ultra-preset-comparison)
-[![License](https://img.shields.io/badge/License-MIT-00E5FF?style=for-the-badge&labelColor=07090E)](LICENSE)
-
-<p align="center">
-  <a href="#interface-preview"><b>📸 Interface</b></a> •
-  <a href="#architecture"><b>🏛️ Architecture</b></a> •
-  <a href="#guest-memory-model"><b>🧠 Memory Model</b></a> •
-  <a href="#zai-scale-ultra-preset-comparison"><b>⚡ Zai-Scale Ultra</b></a> •
-  <a href="#soc-tiers"><b>📱 SoC Tiers</b></a> •
-  <a href="#force-save--checkpoints"><b>💾 Force-Save</b></a> •
-  <a href="#verification-and-telemetry"><b>🧪 Verification</b></a>
-</p>
-
-[**Download Universal APK (v3.2.0)**](https://github.com/mohdziauddin2006-cloud/zai-bridge/releases)
-
+  <p>
+    <strong><a href="https://github.com/mohdziauddin2006-cloud/zai-bridge/releases/latest">Download the latest universal APK (Zai-Bridge-v3.2.1-Universal.apk)</a></strong>
+  </p>
 </div>
 
-> **What changed in v3.2.0** — resolved the multi-threaded guest mutex/scheduler
-> ABBA deadlock chain (`GuestUnlockGuard` across blocking host calls, Bionic
-> 32-bit `pthread_mutex_t` type parsing, `GuestMutexFullLock` condvar release,
-> per-thread `uc_engine` SVC/cache-flush propagation, and cooperative
-> 250k-instruction slices), fixed CheckJNI GlobalRef leaks/exception guards,
-> added `FromReflectedMethod` / `DirectByteBuffer` (`FMODAudioDevice`),
-> `glCompressedTexImage2D`, `qsort`, and display-space `glGetIntegerv`
-> compositor unscaling, and verified live fullscreen `com.feelingtouch.hellzombie`
-> rendering on `emulator-5554`. Also delivers the **Obsidian Glass** UI,
-> interactive **Hardware & SoC Inspector**, **Installed Games** importer,
-> **5x / 8x / UNLIMITED MFG**, **125% SSAA Berserk Mode**, and **Force-Save**
-> checkpoints.
+Zai-Bridge is an Android application container built to keep older **32-bit (`armeabi-v7a`)** Unity and native NDK games running on 64-bit-only phones, while also hosting **64-bit (`arm64-v8a`)** and split-APK games inside a unified OpenGL ES 3.0 post-processing shell.
+
+No root, no custom kernel, and no patched ROM is required. One universal APK ships all four ABIs (`arm64-v8a`, `armeabi-v7a`, `x86_64`, `x86`) with 16 KB ELF alignment for Android 15 and 16.
 
 ---
 
-## Interface Preview
+## What It Does
+
+- **Runs 32-bit ARM (`armeabi-v7a`) games on 64-bit phones**: Loads guest ARMv7 ELF libraries into an isolated 768 MB arena backed by the Unicorn CPU engine, resolves dynamic imports, and bridges `libc`, `pthread`, `zlib`, `OpenSL ES`, `JNI`, and `EGL`/`GLESv2`/`GLESv3` calls onto the host 64-bit process.
+- **Hosts 64-bit and Split-APK games across Android 8 to 16+**: Virtualizes guest `Activity`, `Application`, `ClassLoader`, `PackageManager`, and `Resources`/`AssetManager` bindings across stock AOSP and OEM skins (One UI, HyperOS/MIUI, ColorOS/OxygenOS/Realme UI, Funtouch/OriginOS, XOS/HiOS) so base and split APKs load their own resources without crashing on OEM `Resources` subclasses.
+- **Applies Zai-Scale Ultra GLES3 compositing**: Intercepts frames at the EGL boundary (Java surface path for 32-bit guests and PLT/GOT hooks for native 64-bit titles) for SGSR, FSR (EASU + RCAS), or DLSS-5 neural/temporal scaling, 2x–8x / Unlimited optical-flow frame generation, and live split-screen wipe comparison.
+- **Inspects live SoC and GPU hardware accurately**: Queries the live EGL `GL_RENDERER` first rather than blindly trusting static tables, reads per-core `cpuinfo_max_freq` in kHz to separate shared silicon IDs (such as MediaTek `MT6855` across Dimensity 7020 / 7025 / PowerVR BXM-8-256), and snaps physical RAM cleanly to standard hardware tiers (`2–24 GB`).
+
+---
+
+## Screenshots
+
+| Launcher Library | Live Hardware Inspector |
+| :---: | :---: |
+| <img src="docs/screenshots/launcher_home.png" alt="Zai-Bridge Launcher Library" width="260" /> | <img src="docs/screenshots/hardware_inspector.png" alt="Hardware Inspector Sheet" width="260" /> |
+| **Zai-Scale Ultra Controls** | **32-bit Guest Rendering Live** |
+| <img src="docs/screenshots/zai_scale_sheet.png" alt="Zai-Scale Ultra Configuration" width="260" /> | <img src="docs/screenshots/hellzombie_rendered.png" alt="Hell Zombie Running on 64-bit Host" width="440" /> |
+
+---
+
+## How It Works
 
 <div align="center">
-
-| **Launcher — live emulator capture** | **Hardware & SoC Inspector — live emulator capture** |
-|:---:|:---:|
-| <img src="docs/screenshots/launcher_home.png" width="420" alt="Zai-Bridge Launcher Home" /> | <img src="docs/screenshots/hardware_inspector.png" width="420" alt="Zai-Bridge Hardware and SoC Inspector" /> |
-| *Obsidian Glass home: clickable GPU pill, staged Hell Zombie card, filter chips, Import Game FAB* | *SoC Tier, GL renderer string, ABI, 16 KB page-alignment status, and recommended Zai-Scale profile* |
-
-| **Zai-Scale Ultra — live emulator capture** | **Hell Zombie — live rendered Unity frame** |
-|:---:|:---:|
-| <img src="docs/screenshots/zai_scale_sheet.png" width="420" alt="Zai-Scale Ultra Settings Sheet" /> | <img src="docs/screenshots/hellzombie_rendered.png" width="420" alt="Hell Zombie Live Unity Render with SGSR 75%" /> |
-| *Global Zai-Scale Ultra presets, hardware profile, and Berserk Mode (Bypass Limits)* | *Fullscreen Unity 4.6.6f2 `com.feelingtouch.hellzombie` composited live at SGSR 75% (`#90+` swaps)* |
-
+  <img src="docs/zai-scale-pipeline.svg" alt="Zai-Scale Ultra Graphics Pipeline" width="100%" />
 </div>
 
-> **All four captures above are real emulator screenshots** from `ZaiBridge_X86_64`
-> (Android 14, API 34, Host NVIDIA GeForce RTX 3050 Translator) running the
-> signed universal APK across `Zai-Scale` (`SGSR 75%`).
-
----
-
-## Architecture
-
-```mermaid
-flowchart TD
-    subgraph Host["Android 8.0-16 64-bit host process"]
-        A["Guest 32-bit game APK + OBB"] --> B["GuestDexLoader<br/>read-only DEX ClassLoader"]
-        B --> C["ProxyGameActivity / GameHostActivity<br/>BridgeInstrumentation + GuestContext"]
-        C --> D["libwrapper.so<br/>ARM64 / x86_64 entry points"]
-    end
-
-    subgraph Core["Zai-Bridge v3.2.0 translation core"]
-        D --> E["ANativeActivity 64-to-32 struct bridge<br/>shadow callbacks, input & sensor forwarding"]
-        D --> F["JNI 32-to-64 trampoline bridge<br/>per-method RegisterNatives, global-ref cache"]
-        E --> G["Unicorn ARM32 engine<br/>Thumb-2, TPIDRURO TLS, snapshot pause/resume"]
-        F --> G
-        G --> H["Guest 32-bit libraries<br/>libmain.so, libunity.so, libmono.so"]
-    end
-
-    subgraph Mem["Guest memory model (new in v3.1.0)"]
-        H --> M1["448 MB coalescing malloc heap<br/>0x50000000"]
-        H --> M2["320 MB page arena, 4 KB pages<br/>0x6C000000"]
-        H --> M3["GC budget via getenv<br/>MONO_GC_PARAMS, GC_MAXIMUM_HEAP_SIZE"]
-        H --> M4["Synthetic /proc/meminfo, /proc/self/maps<br/>sysconf, getrlimit, pthread stack bounds"]
-    end
-
-    subgraph Gfx["Zai-Scale Ultra neural graphics pipeline"]
-        H --> I["eglSwapBuffers intercept<br/>zero-copy FBO capture"]
-        I --> J["Temporal super resolution<br/>12-tap Lanczos-2 + 3x3 YCoCg clamp"]
-        J --> K["Neural PBR lighting<br/>ACES tonemap + RCAS sharpening"]
-        K --> L["Optical-flow frame generator<br/>2x / 3x / 4x / Uncapped"]
-        L --> N["Present SurfaceView<br/>split-screen wipe + HUD"]
-    end
-
-    subgraph Save["Force-Save checkpoints"]
-        C -.-> S["Quick Save + Slot 1-3<br/>shared_prefs, files, databases, external files"]
-        S -.-> C
-    end
-```
-
-<div align="center">
-  <img src="docs/zai-scale-pipeline.svg" alt="Zai-Scale Ultra frame pipeline" width="100%" />
-</div>
-
----
-
-## Guest Memory Model
-
-The whole point of v3.1.0: a 32-bit guest that calls `mmap`, `malloc`, `sysconf`
-and reads `/proc/meminfo` must get answers that describe *one consistent
-machine*, not the 64-bit phone it is running on.
+Depending on what an imported APK contains, Zai-Bridge routes execution down one of two native paths while sharing the same graphics boundary:
 
 ```mermaid
 flowchart LR
-    subgraph Arena["768 MB guest arena"]
-        A["0x50000000<br/>448 MB malloc heap<br/>first-fit + coalescing free list"]
-        B["0x6C000000<br/>320 MB page arena<br/>81,920 x 4 KB pages<br/>bitmap + per-page protection"]
-    end
-    A --> C["active_heap_bytes / peak_heap_bytes<br/>size-class census / alloc sites"]
-    B --> D["mmap_active_pages / reclaimed_bytes<br/>MADV_DONTNEED refcount-free discard"]
+    APK["Imported Game (APK / Split APKs / XAPK / OBB)"] --> IMP["ImportService + GuestDexLoader"]
+    IMP -->|32-bit armeabi-v7a only| U32["Unicorn ARM32 Core (libwrapper.so)<br/>768 MB Arena + libc / pthread / JNI / OpenSLES"]
+    IMP -->|64-bit arm64-v8a or Matching ABI| N64["ProxyGameActivity + BridgeInstrumentation<br/>Multi-Layer OEM Resources + PLT/GOT Hook"]
+    U32 --> EGL["EGL / GLES Boundary<br/>Shader Patcher + Config Fallback"]
+    N64 --> EGL
+    EGL --> COMP["Zai-Scale Ultra GLES3 Compositor<br/>SGSR / FSR / DLSS-5 + Optical-Flow MFG"]
+    COMP --> DISP["Android Surface / Display"]
 ```
 
-| Region | Range | Size | Granularity | Notes |
-|---|---|:---:|---|---|
-| Guest libraries | `0x20000000` – `0x40000000` | 512 MB (32 slots) | per-`PT_LOAD` | `segments` recorded for `/proc/self/maps` |
-| Stubs / sentinels | `0x40000000`, `0x400F0000`, `0x400F0010` | — | — | return + longjmp sentinels |
-| Malloc heap | `0x50000000` – `0x6C000000` | 448 MB | block | coalescing, in-place `realloc` growth |
-| Page arena | `0x6C000000` – `0x80000000` | 320 MB | 4 KB | `mmap`/`munmap`/`madvise`/`mprotect` |
-| Guest stack | up to `0xB0000000` | 64 MB | — | guest thread stacks 2 MB, registered |
-
-What the guest now sees:
-
-| Probe | Answer |
-|---|---|
-| `getenv("MONO_GC_PARAMS")` | `max-heap-size=160m,initial-heap-size=32m` |
-| `getenv("GC_MAXIMUM_HEAP_SIZE")` | `167772160` |
-| `/proc/meminfo` | `MemTotal: 524288 kB`, `MemFree: 196608 kB`, `MemAvailable: 262144 kB` |
-| `/proc/self/maps` | regenerated per open: every library `PT_LOAD`, both stacks, live heap, page arena |
-| `sysconf(_SC_PHYS_PAGES / _SC_AVPHYS_PAGES)` | `131072` / `65536` (agrees with meminfo) |
-| `getrlimit(RLIMIT_STACK)` | the real 64 MB guest stack |
-| `pthread_attr_getstack` | the full mapped block, not `base..SP` |
+On `arm64-v8a` and `x86_64` hosts, `libwrapper.so` links statically against Unicorn Engine to translate `armeabi-v7a` machine code. On native `armeabi-v7a` and `x86` hosts, `wrapper_passthrough.cpp` runs without CPU emulation. `libbridge_alias_shim.so` forwards guest `System.loadLibrary` lookups cleanly into the single loaded runtime instance without duplicating native state.
 
 ---
 
-## Zai-Scale Ultra Preset Comparison
+## Zai-Scale Ultra Modes
 
-| Preset | Upscaler Mode | Internal Render Scale | RCAS Sharpness | Neural PBR & HDR | Multi-Frame Gen (MFG) | Target Output |
-|---|---|:---:|:---:|:---:|:---:|:---:|
-| **Vanilla Off** | Native Passthrough | `100%` | `0%` | `0%` | `Off (1x)` | Native 30/60 FPS |
-| **FSR Perf + 2x** | FSR 1.0 EASU + RCAS | `67%` | `45%` | `25%` | `2x` | 1080p @ 60 FPS |
-| **FSR Quality + 2x** | FSR Temporal + YCoCg | `77%` | `50%` | `40%` | `2x` | 1080p @ 60 FPS |
-| **DLSS-5 Ultra + 3x** | DLSS-5 12-tap Lanczos | `85%` | `55%` | `65%` | `3x` | 1440p @ 90 FPS |
-| **DLSS-5 Overdrive + 4x** | DLSS-5 12-tap + TSR | `100%` | `65%` | `85%` | `4x (auto)` | 1440p @ 120 FPS |
-| **BERSERK / Uncapped** | DLAA 125% + full TSR | `125%` | `100%` | `100%` | `Unlimited` | Panel-independent, paced by guest frame time |
+All settings can be applied globally or per game (stored inside each title's `meta.json`):
 
-`Unlimited` frame generation is budgeted from the guest's own present interval,
-not from the display refresh rate, so it keeps synthesising frames as long as
-the guest keeps presenting.
+| Mode / Preset | Upscaler | Render Scale | Sharpness | Neural Detail | Frame Gen | Notes |
+| --- | --- | --- | --- | --- | --- | --- |
+| **Off** | Off | 100% | 0% | 0% | Off | Native rendering with passthrough swap |
+| **SGSR Battery** | SGSR | 75% | 35% | 10% | Off | Single-pass 12-tap edge-aware scaling |
+| **FSR Performance** | FSR | 50% | 45% | 10% | 2x (Auto) | Temporal FSR + adaptive multi-frame gen |
+| **FSR Quality** | FSR | 75% | 35% | 25% | 2x | Balanced EASU + RCAS + temporal clamp |
+| **DLSS-5 Ultra** | DLSS-5 | 85% | 45% | 55% | 3x (Auto) | Temporal TSR ring + specular detail pass |
+| **DLSS-5 Overdrive** | DLSS-5 | 67% | 65% | 80% | 4x (Auto) | High-multiplier optical-flow interpolation |
+| **Berserk Mode** | DLSS-5 | 125% (DLAA) | 100% | 100% | UNLIMITED | Super-samples above panel, bypasses SoC caps |
 
----
-
-## SoC Tiers
-
-`app/src/main/assets/soc_database.json` holds **184 SoC families** plus 19 GPU
-groups (74 GPU match tokens). Each entry is matched against
-`Build.SOC_MODEL` / `HARDWARE` / `BOARD` and the live `GL_RENDERER` string —
-the longest matching token wins — and the resulting tier seeds the default preset.
-
-| Tier | Representative SoCs | Default Preset |
-|---|---|---|
-| **Tier 1: Entry** | Snapdragon 200–450, MT65xx, Unisoc SC98xx, Exynos 850 | FSR 1.0 EASU · 67% scale · 50% RCAS · 10% neural · no MFG |
-| **Tier 2: Mainstream** | Helio G85–G99, Snapdragon 6xx/7xx, Exynos 1280, Unisoc T6xx–T7xx, Tensor G1 | FSR 1.0 EASU · 75% · 45% · 20% · 2x MFG |
-| **Tier 3: Performance** | Dimensity 700–8100, Snapdragon 7+ Gen 2/3, Exynos 1380/1480 | FSR temporal · 75% · 45% · 35% · 2x MFG |
-| **Tier 4: Flagship** | Snapdragon 8 Gen 1/2/3, Dimensity 9000–9200, Tensor G2/G3, Kirin 9000s | DLSS-5 + TSR · 85% · 45% · 55% · 3x MFG |
-| **Tier 5: Ultra-Flagship** | Snapdragon 8 Elite (Gen 5/6), Dimensity 9400 / 9600 Pro, Tensor G4/G5, XRING O1 | DLSS-5 + TSR · 100% · 50% · 70% · 4x MFG |
-
-**BERSERK MODE** ignores the tier entirely: 125% DLAA, maximum neural lighting
-and RCAS, unlimited frame generation, on any device.
+Custom tuning exposes manual Upscaler selection (`Off`, `SGSR`, `FSR`, `DLSS-5`), Scale (`50%` / `67%` / `75%` / `85%` / `100%` / `125%`), Sharpness (`0–100%`), Neural (`0–100%`), Frame Gen (`Off`, `2x`, `3x`, `4x`, `5x`, `8x`, `UNLIMITED`), Auto MFG, and an interactive **Split Compare** slider.
 
 ---
 
-## Force Save & Checkpoints
+## Universal SoC Tiers
 
-| Action | What it captures | Where it lands |
-|---|---|---|
-| **Quick Save** | `shared_prefs/`, `files/`, `databases/`, redirected `Android/data/<pkg>/files/` | single timestamped zip in app storage |
-| **Slot 1 / 2 / 3** | same set, named slot | overwritten only when you say so |
-| **Force Load / Resume** | restores a slot, then relaunches the guest activity | back into the translated session |
+`SoCProfiler` inspects `Build.SOC_MODEL`, `ro.hardware`, `ro.board.platform`, live `/sys/devices/system/cpu/*/cpufreq/cpuinfo_max_freq`, and the live EGL `GL_RENDERER` string before selecting a safe default profile from `soc_database.json`:
 
-Checkpoints exist because a translated guest can be killed by the platform at
-any time; restoring a slot gets the guest back to a known-good save without
-replaying the import.
+| Tier | Representative GPUs & SoCs | Default Upscaler | Scale | Frame Gen |
+| --- | --- | --- | --- | --- |
+| **Tier 1: Entry** | PowerVR GE8320/GE8300, Mali-G52/450, Adreno 308–405 | SGSR | 67% | Off |
+| **Tier 2: Mainstream** | Mali-G57/G68/G72, PowerVR BXM-8-256 (Dimensity 7020/7025), Adreno 509–612 | SGSR | 75% | 2x Auto |
+| **Tier 3: Performance** | Adreno 618–643, Mali-G76/G77, Xclipse 530/540, Dimensity 8100–8300 | FSR | 75% | 2x Auto |
+| **Tier 4: Flagship** | Adreno 650–730, Mali-G78/G710/G715, Xclipse 920, Tensor G1–G4 | DLSS-5 | 85% | 3x Auto |
+| **Tier 5: Ultra-Flagship** | Adreno 740–840, Immortalis-G715/G720/G925, Xclipse 940–960, Tensor G5 | DLSS-5 | 100% | 4x Auto |
 
----
-
-## Features
-
-- **Stock Android 8.0–16 compatible**: no reflection or `System.loadLibrary` in
-  `Application.attachBaseContext()`, so OEM ROMs (OneUI, HyperOS, ColorOS,
-  Pixel AOSP) with SELinux enforcing and Android 14+ read-only DEX start cleanly.
-- **Self-contained universal container**: ANGLE GLES, SwiftShader Vulkan, SDL2,
-  OpenAL, OpenSSL, SQLite3 and legacy DEX support across `arm64-v8a`,
-  `armeabi-v7a`, `x86_64`, `x86`.
-- **Unity 4.x / 5.x / 2017+ and `ANativeActivity` support**: per-method
-  `RegisterNatives` isolation with `ExceptionClear()`, handle-scoped
-  `guest_dlsym` so each library's own `JNI_OnLoad` runs, and full 64-to-32
-  marshalling for `ANativeActivity`, `ANativeWindow`, `AInputQueue`,
-  `AAssetManager` and `ASensorManager`.
-- **Installed 64-bit and split-APK capture**: `native_egl_hook.cpp` walks
-  `dl_iterate_phdr()` and rewrites `eglSwapBuffers`, `glBindFramebuffer` and
-  `glViewport` PLT/GOT slots for AArch64, ARM32, x86_64 and i386;
-  `vulkan_hook.cpp` interposes `vkGetInstanceProcAddr` / `vkGetDeviceProcAddr`
-  to keep `vkQueuePresentKHR` instrumented.
-- **Zai-Scale Ultra post-processing**: 12-tap Lanczos-2 + 3x3 YCoCg TSR,
-  DLAA up to 125%, ACES + RCAS, optical-flow MFG at 2x/3x/4x/Unlimited, and the
-  interactive split-screen wipe with a slide-out quick-settings drawer.
-- **Heap accounting you can read in logcat**: live/peak bytes, 7-class census,
-  top allocation sites with return addresses, page-arena usage and reclaimed
-  bytes, printed at every 64 MB watermark and on OOM.
+You can override any auto-selected tier manually with per-game presets or **Berserk Mode**.
 
 ---
 
-## Compatibility
+## Quick Start
 
-| Hardware / Architecture | Platform support | Status |
-|---|---|---|
-| **Qualcomm Snapdragon (Adreno 5xx/6xx/7xx/8xx)** | Android 8.0 – 16 | Native hardware (GLES 3.2 + Vulkan) |
-| **MediaTek Dimensity / Helio (Mali / Immortalis)** | Android 8.0 – 16 | Native hardware (GLES 3.2 + Vulkan) |
-| **Imagination PowerVR / IMG BXM / GE** | Android 8.0 – 16 | Native hardware (GLES 3.2, ES 2.0 fallback) |
-| **Samsung Exynos (Xclipse 920 / 940, RDNA)** | Android 12 – 16 | Native hardware (GLES 3.2 + Vulkan) |
-| **Emulator (SwiftShader / ANGLE)** | API 26 – 36 | Works, software-rendered and slow |
-| **16 KB page devices** | ARM64 & x86_64 | Built with `-Wl,-z,max-page-size=16384` |
+1. Download **`Zai-Bridge-v3.2.1-Universal.apk`** from [**Releases**](https://github.com/mohdziauddin2006-cloud/zai-bridge/releases/latest).
+2. Install it on any Android 8.0–16+ device (`arm64-v8a`, `armeabi-v7a`, `x86_64`, or `x86`).
+3. Tap **Import** to add an APK / APKS / XAPK from storage, or pick an already installed game to virtualize inside Zai-Bridge (including split APKs).
+4. Long-press any game card (or open **Hardware Inspector**) to inspect your detected SoC/GPU and configure Zai-Scale Ultra presets.
+5. Tap the game card to launch.
 
 ---
 
-## Installation & Quick Start
+## Build From Source
 
-1. **Download** `Zai-Bridge-Universal.apk` from the releases page.
-2. **Install** on Android 8.0 (API 26) through Android 16 (API 36).
-3. **Grant storage access** so legacy APKs and `.obb` archives can be ingested.
-4. **Import the game**: tap **+ Import Game**, pick the 32-bit `.apk` (and
-   optional `.obb`), check the detected engine/orientation, then **Import & Stage**.
-5. **Configure and play**: open the game card, choose orientation lock and a
-   Zai-Scale preset, then **PLAY IMMERSIVE**.
+### Requirements
+- JDK 17
+- Android SDK Platform 36 (`compileSdk 36`), Build-Tools `35.0.0+`
+- Android NDK `26.1.10909125` and CMake `3.22.1`
 
----
+Prebuilt static `libunicorn.a` archives for `arm64-v8a` and `x86_64` live under `app/src/main/cpp/prebuilt/`.
 
-## Build
+### Commands
 
 ```bash
-./gradlew assembleDebug
-$ANDROID_HOME/build-tools/35.0.0/zipalign -p -f 4 app-debug.apk app-debug-aligned.apk
-$ANDROID_HOME/build-tools/35.0.0/apksigner sign \
-  --ks app/build/debug.keystore --ks-pass pass:android --key-pass pass:android \
+# 1. Clean debug build (all 4 ABIs)
+./gradlew clean assembleDebug
+
+# 2. Align & sign for distribution / in-place upgrades
+zipalign -p -f 4 app/build/outputs/apk/debug/app-debug.apk app-aligned.apk
+apksigner sign --ks ~/.android/debug.keystore --ks-pass pass:android --key-pass pass:android \
   --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true \
-  --out Zai-Bridge-Universal.apk app-debug-aligned.apk
+  --out Zai-Bridge-v3.2.1-Universal.apk app-aligned.apk
+
+# 3. Run instrumented verification tests on a connected device/emulator
+./gradlew connectedDebugAndroidTest
 ```
 
-`scripts/build_and_push.ps1` wraps build + `zipalign` + signing + push for
-Windows / PowerShell Core (`pwsh ./scripts/build_and_push.ps1`).
-
 ---
 
-## Verification and Telemetry
+## Compatibility & Known Limits
 
-| Gate | Result |
-|---|---|
-| Compilation, 4 ABIs (`arm64-v8a`, `armeabi-v7a`, `x86_64`, `x86`) | `BUILD SUCCESSFUL` |
-| 16 KB ELF page alignment (`-Wl,-z,max-page-size=16384`) | `ENABLED` |
-| `zipalign -p -f 4` | `PASSED` |
-| APK signature v2 + v3 | `VERIFIED` (`apksigner verify`) |
-| Version | `3.2.0` (`versionCode 320`) |
-| Guest arena, `mmap` served from the page arena | `PASSED` |
-| Guest stack & Mono `threads.c:897` stack-bounds assertion | `PASSED` |
-| CheckJNI guards (`JniPendingExceptionGuard`, scoped `GlobalRef`s) | `PASSED` |
-| Guest mutex / condvar / `emu_mu_` concurrency chain | `PASSED` (zero deadlocks, zero dead-owner stalls) |
-| Live Unity 4.6.6f2 render (`com.feelingtouch.hellzombie`) | `VERIFIED` (`eglSwapBuffers #1..#90+` composited, fullscreen SGSR 75%, zero crashes) |
-
-### v3.2.0 Root-Cause Emulation Fixes
-
-* **Guest Mutex & Scheduler Deadlock Chain:** Parsed Bionic 32-bit `pthread_mutex_t` attributes (`NORMAL` / `RECURSIVE` / `ERRORCHECK`), synchronized `GuestMutex` state with `GuestMutexFullLock` across condvars and `thread_alive` dead-owner recovery, released `emu_mu_` via `GuestUnlockGuard` around blocking host calls (`pthread_mutex_lock`, `pthread_cond_wait`/`timedwait`/`timedwait_monotonic_np`, `sem_wait`/`timedwait`, `pthread_join`, `futex`, `eglSwapBuffers`, `Call*MethodA`/`NewObjectA`), and added cooperative 250k-instruction yield slices when `emu_mu_.has_waiters()`.
-* **Child `uc_engine` SVC & I-Cache Coherence:** Shared `Emulator::handle_step_error()` across main and `pthread_create` worker engines plus `publish_cache_flush` / `drain_cache_flushes` propagation.
-* **JNI Bridge & `FMODAudioDevice` Stability:** Scoped incoming `native_entry` jobjects to prevent GlobalRef table overflow (`51,200` limit), guarded `NewGlobalRef` with `JniPendingExceptionGuard`, added `FromReflectedMethod` reflection signature caching, and implemented `NewDirectByteBuffer` / `GetDirectBufferAddress` / `GetDirectBufferCapacity`.
-* **Graphics, Audio & Libc Completeness:** Added `glCompressedTexImage2D` / `glCompressedTexSubImage2D`, display-space `glGetIntegerv` (`GL_VIEWPORT`, `GL_SCISSOR_BOX`, `GL_FRAMEBUFFER_BINDING`) unscaling for `Zai-Scale`, `imp_log_vprint`, `qsort`, `bsearch`, `uname`, and `__system_property_get`.
-* **Exact Cooperative Pause/Resume Context Snapshot:** `Emulator::Pause` snapshots/restores the full `uc_context*` (`CPSR.T` preserved), and `dispatch()` resumes pending render ticks in-place.
-
-### Defects fixed on the way to this point
-
-* ARM32 `setjmp`/`longjmp`/`sigsetjmp`/`siglongjmp` with a real register-file
-  cookie; `UC_ERR_READ/WRITE_UNMAPPED` forwarded to the guest `SIGSEGV` handler
-  with a 32-bit `siginfo_t`/`ucontext_t` so Boehm's probe protocol works.
-* Guest fds `0`/`1`/`2` report as open, so `fprintf(stderr, ...)` no longer
-  fails with `EBADF` and Mono's error reporter stops recursing.
-* `vasprintf` stores its buffer; `calloc` zeroes recycled blocks;
-  `getdtablesize` returns 1024; `/proc/stat` and `/proc/cpuinfo` are synthetic.
-* Files addressed as `<apk>/<entry>` are extracted once instead of being
-  `mmap`'d out of the zip container.
-* A native suspended for the cooperative time slice answers `true`, so
-  `UnityPlayer$b` does not treat the pause as "engine gone".
-* `guest_allocs_` is lock-protected; JNI calls on a `Class` receiver for
-  `Context` methods are repaired to the live session Activity.
-
----
-
-## License
-
-Distributed under the **MIT License**. See [`LICENSE`](LICENSE) for details.
+- **Translation CPU overhead**: Emulating `armeabi-v7a` instructions through Unicorn on a 64-bit CPU carries real CPU cost compared to native `arm64-v8a` code; heavier late-era ARMv7 Unity games perform best on mid-range to flagship cores and may show hitching during first-run Mono/JIT warmup.
+- **Anti-cheat, DRM, and Play Integrity**: Online games that enforce signature pinning, Play Integrity hardware attestation, kernel/emulator detection, or obfuscated runtime self-checks will reject containerized execution.
+- **Vulkan-first titles**: Zai-Bridge hooks Vulkan presentation (`vkQueuePresentKHR`) for telemetry and passthrough stability, while Zai-Scale Ultra spatial/temporal shaders operate on OpenGL ES framebuffers.
+- **Engine diversity**: Unity (`4.x` Mono through `2018–Unity 6` IL2CPP), Unreal, Cocos, and custom NDK titles cover the tested surface; games relying on undocumented OEM framework services or custom Binder daemons outside standard Android SDK APIs can still fail.

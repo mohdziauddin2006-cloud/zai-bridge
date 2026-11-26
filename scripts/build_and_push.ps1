@@ -15,7 +15,7 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $RepoRoot
 
 Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host " Zai-Bridge v3.2.0 — Automated Build, Sign & Push Pipeline" -ForegroundColor Cyan
+Write-Host " Zai-Bridge v3.2.1 — Automated Build & Sign Pipeline" -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 
 # 1. Locate Android SDK Build-Tools (zipalign & apksigner)
@@ -42,9 +42,9 @@ if (-not (Test-Path $UnsignedOrDebugApk)) {
     throw "Expected APK not found at: $UnsignedOrDebugApk"
 }
 
-# 3. Zipalign & Sign with v2 + v3 APK Signature Schemes
+# 3. Zipalign & Sign with v1 + v2 + v3 APK Signature Schemes
 $AlignedApk = Join-Path $RepoRoot "app/build/outputs/apk/debug/app-debug-aligned.apk"
-$FinalUniversalApk = Join-Path $RepoRoot "Zai-Bridge-Universal.apk"
+$FinalUniversalApk = Join-Path $RepoRoot "Zai-Bridge-v3.2.1-Universal.apk"
 
 if ($BuildToolsDir) {
     Write-Host "`n[2/4] Running zipalign (-p -f 4) and apksigner (v2 + v3)..." -ForegroundColor Yellow
@@ -56,8 +56,9 @@ if ($BuildToolsDir) {
         throw "zipalign failed with exit code $LASTEXITCODE"
     }
 
-    $KeystorePath = Join-Path $RepoRoot "app/build/debug.keystore"
+    $KeystorePath = Join-Path ([Environment]::GetFolderPath("UserProfile")) ".android/debug.keystore"
     if (-not (Test-Path $KeystorePath)) {
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $KeystorePath) | Out-Null
         & keytool -genkeypair -v -keystore $KeystorePath -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
     }
 
@@ -71,27 +72,10 @@ if ($BuildToolsDir) {
         throw "apksigner verify failed with exit code $LASTEXITCODE"
     }
 } else {
-    Write-Host "`n[2/4] Copying signed debug APK to Zai-Bridge-Universal.apk..." -ForegroundColor Yellow
+    Write-Host "`n[2/4] Copying signed debug APK to Zai-Bridge-v3.2.1-Universal.apk..." -ForegroundColor Yellow
     Copy-Item -Path $UnsignedOrDebugApk -Destination $FinalUniversalApk -Force
 }
 
 $ApkSizeMB = [math]::Round((Get-Item $FinalUniversalApk).Length / 1MB, 2)
-Write-Host "Produced Zai-Bridge-Universal.apk ($ApkSizeMB MB)" -ForegroundColor Green
-
-# 4. Git Commit & Push (if inside a Git repository)
-if (Test-Path (Join-Path $RepoRoot ".git")) {
-    Write-Host "`n[3/4] Staging and committing build artifacts..." -ForegroundColor Yellow
-    & git add -A
-    $GitStatus = & git status --porcelain
-    if ($GitStatus) {
-        & git commit -m "release(v3.2.0): Zai-Bridge universal 32/64-bit container, Unity/Mono suspend fix & Zai-Scale Ultra"
-        Write-Host "`n[4/4] Pushing to origin/main..." -ForegroundColor Yellow
-        & git push origin HEAD:main
-    } else {
-        Write-Host "Working tree clean; nothing new to commit." -ForegroundColor Green
-    }
-} else {
-    Write-Host "`n[3/4] Notice: .git directory not present in this workspace snapshot. Ready for manual git push." -ForegroundColor Cyan
-}
-
-Write-Host "`nAll pipeline steps completed successfully!" -ForegroundColor Green
+Write-Host "Produced Zai-Bridge-v3.2.1-Universal.apk ($ApkSizeMB MB)" -ForegroundColor Green
+Write-Host "`nBuild and signing completed! Publish Zai-Bridge-v3.2.1-Universal.apk via GitHub Releases." -ForegroundColor Cyan

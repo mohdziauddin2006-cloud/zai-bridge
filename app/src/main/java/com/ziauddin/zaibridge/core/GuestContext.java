@@ -580,6 +580,40 @@ public final class GuestContext extends ContextWrapper {
         return guestLoader != null ? guestLoader : super.getClassLoader();
     }
 
+    /**
+     * Resolves a safe theme resource ID guaranteed to belong either to the guest's
+     * own {@link AssetManager} or Android's universal framework resources ({@code 0x01......}).
+     * Prevents applying a host {@code 0x7f......} theme ID onto the guest AssetManager.
+     */
+    public int resolveGuestThemeRes(ActivityInfo guestAi) {
+        Resources guestPrimary = resources.getGuestPrimary();
+        int[] candidates = {
+                guestAi != null ? guestAi.theme : 0,
+                appInfo != null ? appInfo.theme : 0,
+                guestPrimary.getIdentifier("UnityThemeSelector", "style", guestPackage),
+                guestPrimary.getIdentifier("Theme.AppCompat.NoActionBar", "style", guestPackage),
+                guestPrimary.getIdentifier("Theme.AppCompat.Light.NoActionBar", "style", guestPackage),
+        };
+        for (int candidate : candidates) {
+            if (candidate == 0) continue;
+            if ((candidate & 0xff000000) == 0x01000000) {
+                return candidate;
+            }
+            try {
+                String type = guestPrimary.getResourceTypeName(candidate);
+                if ("style".equals(type)) {
+                    return candidate;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return native64
+                ? android.R.style.Theme_Material_NoActionBar
+                : (appInfo != null && appInfo.targetSdkVersion < 21
+                        ? android.R.style.Theme_Holo_NoActionBar
+                        : android.R.style.Theme_Material_NoActionBar);
+    }
+
     @Override
     public Context createPackageContext(String packageName, int flags)
             throws PackageManager.NameNotFoundException {
@@ -587,6 +621,58 @@ public final class GuestContext extends ContextWrapper {
             return this;
         }
         return super.createPackageContext(packageName, flags);
+    }
+
+    @Override
+    public Context createConfigurationContext(android.content.res.Configuration overrideConfiguration) {
+        Context derived = super.createConfigurationContext(overrideConfiguration);
+        if (derived == null) return this;
+        GuestResourcesWrapper cfgRes = resources.withConfiguration(
+                overrideConfiguration, derived.getResources().getDisplayMetrics());
+        return wrapDerivedContext(derived, cfgRes);
+    }
+
+    @Override
+    public Context createDisplayContext(android.view.Display display) {
+        Context derived = super.createDisplayContext(display);
+        if (derived == null) return this;
+        android.util.DisplayMetrics dm = new android.util.DisplayMetrics();
+        if (display != null) {
+            try {
+                display.getMetrics(dm);
+            } catch (Throwable t) {
+                dm = resources.getDisplayMetrics();
+            }
+        } else {
+            dm = resources.getDisplayMetrics();
+        }
+        GuestResourcesWrapper dispRes = resources.withConfiguration(resources.getConfiguration(), dm);
+        return wrapDerivedContext(derived, dispRes);
+    }
+
+    @Override
+    public Context createDeviceProtectedStorageContext() {
+        Context derived = super.createDeviceProtectedStorageContext();
+        return derived == null ? this : wrapDerivedContext(derived, resources);
+    }
+
+    private Context wrapDerivedContext(Context derived, final GuestResourcesWrapper derivedRes) {
+        final Resources.Theme derivedTheme = derivedRes.newTheme();
+        derivedTheme.setTo(theme);
+        return new ContextWrapper(derived) {
+            @Override public Resources getResources() { return derivedRes; }
+            @Override public AssetManager getAssets() { return derivedRes.getAssets(); }
+            @Override public Resources.Theme getTheme() { return derivedTheme; }
+            @Override public String getPackageName() { return GuestContext.this.getPackageName(); }
+            @Override public String getOpPackageName() { return GuestContext.this.getOpPackageName(); }
+            @Override public ApplicationInfo getApplicationInfo() { return GuestContext.this.getApplicationInfo(); }
+            @Override public PackageManager getPackageManager() { return GuestContext.this.getPackageManager(); }
+            @Override public ClassLoader getClassLoader() { return GuestContext.this.getClassLoader(); }
+            @Override public Context getApplicationContext() { return GuestContext.this.getApplicationContext(); }
+            @Override public File getFilesDir() { return GuestContext.this.getFilesDir(); }
+            @Override public File getCacheDir() { return GuestContext.this.getCacheDir(); }
+            @Override public File getObbDir() { return GuestContext.this.getObbDir(); }
+        };
     }
 
     @Override
