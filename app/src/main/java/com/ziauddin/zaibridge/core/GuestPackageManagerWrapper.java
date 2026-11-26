@@ -544,4 +544,402 @@ public final class GuestPackageManagerWrapper extends PackageManager {
     @Override public Intent getLeanbackLaunchIntentForPackage(String packageName) { return base.getLeanbackLaunchIntentForPackage(packageName); }
     @Override public String[] canonicalToCurrentPackageNames(String[] names) { return base.canonicalToCurrentPackageNames(names); }
     @Override public String[] currentToCanonicalPackageNames(String[] names) { return base.currentToCanonicalPackageNames(names); }
+
+    @androidx.annotation.RequiresApi(28)
+    @Override
+    public android.os.Bundle getSuspendedPackageAppExtras() {
+        return base.getSuspendedPackageAppExtras();
+    }
+
+    @androidx.annotation.RequiresApi(28)
+    @Override
+    public boolean hasSigningCertificate(int uid, byte[] certificate, int type) {
+        return base.hasSigningCertificate(uid, certificate, type);
+    }
+
+    @androidx.annotation.RequiresApi(28)
+    @Override
+    public boolean hasSigningCertificate(String packageName, byte[] certificate, int type) {
+        return base.hasSigningCertificate(packageName, certificate, type);
+    }
+
+    @androidx.annotation.RequiresApi(28)
+    @Override
+    public boolean isPackageSuspended(String packageName) throws NameNotFoundException {
+        return base.isPackageSuspended(packageName);
+    }
+
+    @androidx.annotation.RequiresApi(29)
+    @Override
+    public boolean isPackageSuspended() {
+        return base.isPackageSuspended();
+    }
+
+    @androidx.annotation.RequiresApi(29)
+    @Override
+    public boolean addWhitelistedRestrictedPermission(
+            String packageName, String permName, int whitelistFlags) {
+        return base.addWhitelistedRestrictedPermission(packageName, permName, whitelistFlags);
+    }
+
+    @androidx.annotation.RequiresApi(29)
+    @Override
+    public boolean removeWhitelistedRestrictedPermission(
+            String packageName, String permName, int whitelistFlags) {
+        return base.removeWhitelistedRestrictedPermission(packageName, permName, whitelistFlags);
+    }
+
+    @androidx.annotation.RequiresApi(29)
+    @Override
+    public java.util.Set<String> getWhitelistedRestrictedPermissions(
+            String packageName, int whitelistFlag) {
+        return base.getWhitelistedRestrictedPermissions(packageName, whitelistFlag);
+    }
+
+    @androidx.annotation.RequiresApi(29)
+    @Override
+    public List<android.content.pm.ModuleInfo> getInstalledModules(int flags) {
+        return base.getInstalledModules(flags);
+    }
+
+    @androidx.annotation.RequiresApi(29)
+    @Override
+    public android.content.pm.ModuleInfo getModuleInfo(String packageName, int flags)
+            throws NameNotFoundException {
+        return base.getModuleInfo(packageName, flags);
+    }
+
+    @androidx.annotation.RequiresApi(29)
+    @Override
+    public boolean getSyntheticAppDetailsActivityEnabled(String packageName) {
+        return base.getSyntheticAppDetailsActivityEnabled(packageName);
+    }
+
+    @androidx.annotation.RequiresApi(29)
+    @Override
+    public boolean isDeviceUpgrading() {
+        return base.isDeviceUpgrading();
+    }
+
+    @androidx.annotation.RequiresApi(30)
+    @Override
+    public CharSequence getBackgroundPermissionOptionLabel() {
+        return base.getBackgroundPermissionOptionLabel();
+    }
+
+    @androidx.annotation.RequiresApi(30)
+    @Override
+    public java.util.Set<String> getMimeGroup(String mimeGroup) {
+        return base.getMimeGroup(mimeGroup);
+    }
+
+    @androidx.annotation.RequiresApi(30)
+    @Override
+    public void setMimeGroup(String mimeGroup, java.util.Set<String> mimeTypes) {
+        base.setMimeGroup(mimeGroup, mimeTypes);
+    }
+
+    @androidx.annotation.RequiresApi(30)
+    @Override
+    public boolean isAutoRevokeWhitelisted() {
+        return base.isAutoRevokeWhitelisted();
+    }
+
+    @androidx.annotation.RequiresApi(30)
+    @Override
+    public boolean isAutoRevokeWhitelisted(String packageName) {
+        return base.isAutoRevokeWhitelisted(packageName);
+    }
+
+    @androidx.annotation.RequiresApi(30)
+    @Override
+    public boolean setAutoRevokeWhitelisted(String packageName, boolean whitelisted) {
+        return base.setAutoRevokeWhitelisted(packageName, whitelisted);
+    }
+
+    @androidx.annotation.RequiresApi(30)
+    @Override
+    public boolean isDefaultApplicationIcon(Drawable drawable) {
+        return base.isDefaultApplicationIcon(drawable);
+    }
+
+    @androidx.annotation.RequiresApi(31)
+    @Override
+    public void getGroupOfPlatformPermission(
+            String permissionName,
+            java.util.concurrent.Executor executor,
+            java.util.function.Consumer<String> callback) {
+        base.getGroupOfPlatformPermission(permissionName, executor, callback);
+    }
+
+    @androidx.annotation.RequiresApi(31)
+    @Override
+    public void getPlatformPermissionsForGroup(
+            String permissionGroupName,
+            java.util.concurrent.Executor executor,
+            java.util.function.Consumer<List<String>> callback) {
+        base.getPlatformPermissionsForGroup(permissionGroupName, executor, callback);
+    }
+
+    @androidx.annotation.RequiresApi(31)
+    @Override
+    public Property getProperty(String propertyName, ComponentName component)
+            throws NameNotFoundException {
+        return base.getProperty(propertyName, component);
+    }
+
+    @androidx.annotation.RequiresApi(31)
+    @Override
+    public Property getProperty(String propertyName, String packageName)
+            throws NameNotFoundException {
+        return base.getProperty(propertyName, packageName);
+    }
+
+    @androidx.annotation.RequiresApi(31)
+    @Override
+    public List<Property> queryActivityProperty(String propertyName) {
+        return base.queryActivityProperty(propertyName);
+    }
+
+    @androidx.annotation.RequiresApi(31)
+    @Override
+    public List<Property> queryApplicationProperty(String propertyName) {
+        return base.queryApplicationProperty(propertyName);
+    }
+
+    @androidx.annotation.RequiresApi(31)
+    @Override
+    public List<Property> queryProviderProperty(String propertyName) {
+        return base.queryProviderProperty(propertyName);
+    }
+
+    @androidx.annotation.RequiresApi(31)
+    @Override
+    public List<Property> queryReceiverProperty(String propertyName) {
+        return base.queryReceiverProperty(propertyName);
+    }
+
+    @androidx.annotation.RequiresApi(31)
+    @Override
+    public List<Property> queryServiceProperty(String propertyName) {
+        return base.queryServiceProperty(propertyName);
+    }
+
+    @androidx.annotation.RequiresApi(31)
+    @Override
+    public int getTargetSdkVersion(String packageName) throws NameNotFoundException {
+        if (guestPackage != null && guestPackage.equals(packageName)) {
+            ApplicationInfo ai = getApplicationInfo(packageName, 0);
+            if (ai != null && ai.targetSdkVersion > 0) {
+                return ai.targetSdkVersion;
+            }
+        }
+        return base.getTargetSdkVersion(packageName);
+    }
+
+    @androidx.annotation.RequiresApi(31)
+    @Override
+    public void requestChecksums(
+            String packageName,
+            boolean includeSplits,
+            int required,
+            List<java.security.cert.Certificate> trustedInstallers,
+            OnChecksumsReadyListener onChecksumsReadyListener)
+            throws java.security.cert.CertificateEncodingException, NameNotFoundException {
+        base.requestChecksums(packageName, includeSplits, required, trustedInstallers, onChecksumsReadyListener);
+    }
+
+    @androidx.annotation.RequiresApi(33)
+    @Override
+    public boolean canPackageQuery(String sourcePackageName, String targetPackageName)
+            throws NameNotFoundException {
+        return base.canPackageQuery(sourcePackageName, targetPackageName);
+    }
+
+    @androidx.annotation.RequiresApi(33)
+    @Override
+    public android.content.IntentSender getLaunchIntentSenderForPackage(String packageName) {
+        return base.getLaunchIntentSenderForPackage(packageName);
+    }
+
+    @androidx.annotation.RequiresApi(33)
+    @Override
+    public PackageInfo getPackageArchiveInfo(String archiveFilePath, PackageInfoFlags flags) {
+        return base.getPackageArchiveInfo(archiveFilePath, flags);
+    }
+
+    @androidx.annotation.RequiresApi(33)
+    @Override
+    public int[] getPackageGids(String packageName, PackageInfoFlags flags)
+            throws NameNotFoundException {
+        return base.getPackageGids(packageName, flags);
+    }
+
+    @androidx.annotation.RequiresApi(33)
+    @Override
+    public PackageInfo getPackageInfo(
+            android.content.pm.VersionedPackage versionedPackage, PackageInfoFlags flags)
+            throws NameNotFoundException {
+        if (versionedPackage != null && guestPackage != null
+                && guestPackage.equals(versionedPackage.getPackageName())) {
+            return getPackageInfo(guestPackage, flags);
+        }
+        return base.getPackageInfo(versionedPackage, flags);
+    }
+
+    @androidx.annotation.RequiresApi(33)
+    @Override
+    public List<PackageInfo> getPackagesHoldingPermissions(
+            String[] permissions, PackageInfoFlags flags) {
+        return base.getPackagesHoldingPermissions(permissions, flags);
+    }
+
+    @androidx.annotation.RequiresApi(33)
+    @Override
+    public List<SharedLibraryInfo> getSharedLibraries(PackageInfoFlags flags) {
+        return base.getSharedLibraries(flags);
+    }
+
+    @androidx.annotation.RequiresApi(33)
+    @Override
+    public List<ResolveInfo> queryBroadcastReceivers(Intent intent, ResolveInfoFlags flags) {
+        return base.queryBroadcastReceivers(intent, flags);
+    }
+
+    @androidx.annotation.RequiresApi(33)
+    @Override
+    public List<ProviderInfo> queryContentProviders(
+            String processName, int uid, ComponentInfoFlags flags) {
+        return queryContentProviders(processName, uid, flags != null ? (int) flags.getValue() : 0);
+    }
+
+    @androidx.annotation.RequiresApi(33)
+    @Override
+    public List<ResolveInfo> queryIntentActivityOptions(
+            ComponentName caller, List<Intent> specifics, Intent intent, ResolveInfoFlags flags) {
+        return base.queryIntentActivityOptions(caller, specifics, intent, flags);
+    }
+
+    @androidx.annotation.RequiresApi(33)
+    @Override
+    public List<ResolveInfo> queryIntentContentProviders(Intent intent, ResolveInfoFlags flags) {
+        return base.queryIntentContentProviders(intent, flags);
+    }
+
+    @androidx.annotation.RequiresApi(33)
+    @Override
+    public List<ResolveInfo> queryIntentServices(Intent intent, ResolveInfoFlags flags) {
+        return base.queryIntentServices(intent, flags);
+    }
+
+    @androidx.annotation.RequiresApi(33)
+    @Override
+    public ProviderInfo resolveContentProvider(String authority, ComponentInfoFlags flags) {
+        return resolveContentProvider(authority, flags != null ? (int) flags.getValue() : 0);
+    }
+
+    @androidx.annotation.RequiresApi(33)
+    @Override
+    public ResolveInfo resolveService(Intent intent, ResolveInfoFlags flags) {
+        return base.resolveService(intent, flags);
+    }
+
+    @androidx.annotation.RequiresApi(33)
+    @Override
+    public void setComponentEnabledSettings(List<ComponentEnabledSetting> settings) {
+        base.setComponentEnabledSettings(settings);
+    }
+
+    @androidx.annotation.RequiresApi(34)
+    @Override
+    public boolean[] canPackageQuery(String sourcePackageName, String[] targetPackageNames)
+            throws NameNotFoundException {
+        return base.canPackageQuery(sourcePackageName, targetPackageNames);
+    }
+
+    @androidx.annotation.RequiresApi(34)
+    @Override
+    public <T> T parseAndroidManifest(
+            android.os.ParcelFileDescriptor apkFd,
+            java.util.function.Function<XmlResourceParser, T> callback)
+            throws java.io.IOException {
+        return base.parseAndroidManifest(apkFd, callback);
+    }
+
+    @androidx.annotation.RequiresApi(34)
+    @Override
+    public <T> T parseAndroidManifest(
+            java.io.File apkFile,
+            java.util.function.Function<XmlResourceParser, T> callback)
+            throws java.io.IOException {
+        return base.parseAndroidManifest(apkFile, callback);
+    }
+
+    @androidx.annotation.RequiresApi(34)
+    @Override
+    public void relinquishUpdateOwnership(String targetPackage) {
+        base.relinquishUpdateOwnership(targetPackage);
+    }
+
+    @androidx.annotation.RequiresApi(35)
+    @Override
+    public android.content.pm.ArchivedPackageInfo getArchivedPackage(String packageName) {
+        return base.getArchivedPackage(packageName);
+    }
+
+    @androidx.annotation.RequiresApi(35)
+    @Override
+    public boolean isAppArchivable(String packageName) throws NameNotFoundException {
+        return base.isAppArchivable(packageName);
+    }
+
+    @androidx.annotation.RequiresApi(35)
+    @Override
+    public boolean isPackageStopped(String packageName) throws NameNotFoundException {
+        return base.isPackageStopped(packageName);
+    }
+
+    /**
+     * Hidden framework method invoked by {@link android.app.Activity#requestPermissions}.
+     */
+    @SuppressWarnings("unused")
+    public String getPermissionControllerPackageName() {
+        try {
+            HiddenApi.exemptAll();
+            java.lang.reflect.Method m = PackageManager.class.getDeclaredMethod(
+                    "getPermissionControllerPackageName");
+            m.setAccessible(true);
+            Object res = m.invoke(base);
+            if (res instanceof String && !((String) res).isEmpty()) {
+                return (String) res;
+            }
+        } catch (Throwable ignored) {
+        }
+        return "com.google.android.permissioncontroller";
+    }
+
+    /**
+     * Hidden framework method invoked by {@link android.app.Activity#requestPermissions}.
+     */
+    @SuppressWarnings("unused")
+    public Intent buildRequestPermissionsIntent(String[] permissions) {
+        try {
+            HiddenApi.exemptAll();
+            java.lang.reflect.Method m = PackageManager.class.getDeclaredMethod(
+                    "buildRequestPermissionsIntent", String[].class);
+            m.setAccessible(true);
+            Object res = m.invoke(base, (Object) permissions);
+            if (res instanceof Intent) {
+                return (Intent) res;
+            }
+        } catch (Throwable ignored) {
+        }
+        Intent intent = new Intent("android.content.pm.action.REQUEST_PERMISSIONS");
+        intent.putExtra("android.content.pm.extra.REQUEST_PERMISSIONS_NAMES", permissions);
+        String controller = getPermissionControllerPackageName();
+        if (controller != null && !controller.isEmpty()) {
+            intent.setPackage(controller);
+        }
+        return intent;
+    }
 }

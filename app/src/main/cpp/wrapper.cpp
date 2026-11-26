@@ -411,8 +411,13 @@ public:
         std::memset(reinterpret_cast<void*>(base), 0, kStubSize);
 
 #if defined(__aarch64__)
+        // AArch64 AAPCS64 frame:
+        //   [sp,   #0..#63]  = x0..x7
+        //   [sp,  #64..#127] = d0..d7
+        //   [sp, #128..#143] = saved x29, x30 (blr x16 overwrites x30!)
+        // Caller-spilled stack args sit at [sp, #144+].
         uint32_t* w = reinterpret_cast<uint32_t*>(base);
-        w[0]  = 0xD10203FFu; // sub  sp, sp, #128
+        w[0]  = 0xD10243FFu; // sub  sp, sp, #144
         w[1]  = 0xA90007E0u; // stp  x0, x1, [sp, #0]
         w[2]  = 0xA9010FE2u; // stp  x2, x3, [sp, #16]
         w[3]  = 0xA90217E4u; // stp  x4, x5, [sp, #32]
@@ -421,21 +426,24 @@ public:
         w[6]  = 0x6D050FE2u; // stp  d2, d3, [sp, #80]
         w[7]  = 0x6D0617E4u; // stp  d4, d5, [sp, #96]
         w[8]  = 0x6D071FE6u; // stp  d6, d7, [sp, #112]
-        w[9]  = 0xD2800000u | ((id & 0xFFFFu) << 5);  // mov x0, #id
-        w[10] = 0x910003E1u; // mov  x1, sp
-        // Absolute indirect call. A direct `bl` only reaches +-128 MB and this
-        // pool is allocated far away from the library on 64-bit Android, so a
-        // relative branch would silently truncate and jump into arbitrary code.
-        w[11] = 0x580000B0u; // ldr  x16, [pc, #20]  -> literal at w[16]
-        w[12] = 0xD63F0200u; // blr  x16
-        w[13] = 0x9E670000u; // fmov d0, x0 (copy return value to FP register d0)
-        w[14] = 0x910203FFu; // add  sp, sp, #128
-        w[15] = 0xD65F03C0u; // ret
+        w[9]  = 0xA9087BFDu; // stp  x29, x30, [sp, #128]
+        w[10] = 0x910203FDu; // add  x29, sp, #128
+        w[11] = 0xD2800000u | ((id & 0xFFFFu) << 5);  // mov x0, #id
+        w[12] = 0x910003E1u; // mov  x1, sp
+        // Absolute indirect call via 8-byte literal at w[20..21] (computed pc-rel offset).
+        constexpr size_t kLdrIdx = 13;
+        constexpr size_t kLitIdx = 20;
+        const uint32_t imm19 = static_cast<uint32_t>(kLitIdx - kLdrIdx);
+        w[kLdrIdx] = 0x58000010u | (imm19 << 5); // ldr x16, [pc, #28]
+        w[14] = 0xD63F0200u; // blr  x16 (overwrites x30)
+        w[15] = 0x9E670000u; // fmov d0, x0 (copy return value to FP register d0)
+        w[16] = 0xA9487BFDu; // ldp  x29, x30, [sp, #128]
+        w[17] = 0x910243FFu; // add  sp, sp, #144
+        w[18] = 0xD65F03C0u; // ret  (returns to caller's preserved x30)
+        w[19] = 0xD503201Fu; // nop  (8-byte alignment for literal pool)
         const uint64_t t = reinterpret_cast<uintptr_t>(target);
-        w[16] = static_cast<uint32_t>(t & 0xFFFFFFFFu);        // .quad target
-        w[17] = static_cast<uint32_t>(t >> 32);
-        w[18] = 0xD503201Fu; // padding
-        w[19] = 0xD503201Fu; // padding
+        w[kLitIdx]     = static_cast<uint32_t>(t & 0xFFFFFFFFu); // .quad target
+        w[kLitIdx + 1] = static_cast<uint32_t>(t >> 32);
 #elif defined(__x86_64__)
         // System V AMD64. Integer/pointer arguments arrive in rdi, rsi, rdx,
         // rcx, r8, r9 (7th+ on the stack); floating-point arguments arrive in
@@ -3494,13 +3502,18 @@ public:
                     captured.reserve(e.arg_types.size());
                     size_t ii = 2;
                     size_t fi = 8;
+#if defined(__aarch64__)
+                    constexpr size_t kStackArgBias = 10; // [sp+144] skips 16 spill + 2 fp/lr slots
+#else
+                    constexpr size_t kStackArgBias = 8;
+#endif
                     for (char t : e.arg_types) {
                         if (t == 'F' || t == 'D') {
                             uint64_t bits = (fi < 16) ? host_args[fi] : 0;
                             fi++;
                             captured.push_back({t, bits, nullptr});
                         } else {
-                            uint64_t v = (ii < 8) ? host_args[ii] : host_args[ii + 8];
+                            uint64_t v = (ii < 8) ? host_args[ii] : host_args[ii + kStackArgBias];
                             ii++;
                             jobject g = nullptr;
                             if ((t == 'L' || t == '[') && t_env && v) {
@@ -3606,7 +3619,11 @@ public:
         // an even register/stack slot, a float is one word.
         auto get_int_arg = [&](size_t idx) -> uint64_t {
             if (idx < 8) return host_args[idx];
+#if defined(__aarch64__)
+            return host_args[idx + 10]; // spilled above 144-byte frame
+#else
             return host_args[idx + 8]; // spilled at sp + 128
+#endif
         };
         auto get_fp_arg = [&](size_t idx) -> uint64_t {
             if (idx < 16) return host_args[idx];
@@ -4098,6 +4115,7 @@ private:
     }
 
     uint32_t arg(size_t i) {
+        if (i >= 4) return stacked_arg(i);
         uint32_t v = 0;
         uc_engine* uc = current_uc();
         if (uc) {
@@ -6562,14 +6580,19 @@ public:
             auto fn = gl_proc<EGLBoolean (*)(EGLDisplay, EGLConfig*, EGLint, EGLint*)>(
                 "eglGetConfigs");
             if (!fn) return 0u;
+            const uint32_t guest_configs = arg(1);
             const EGLint want = static_cast<EGLint>(arg(2));
-            std::vector<EGLConfig> configs(want > 0 ? static_cast<size_t>(want) : 1);
+            const bool count_only = (guest_configs == 0 || want <= 0);
+            std::vector<EGLConfig> configs(count_only ? 0 : static_cast<size_t>(want));
             EGLint num = 0;
-            const EGLBoolean ok = fn(guest_display(arg(0)), configs.data(), want, &num);
+            const EGLBoolean ok = fn(guest_display(arg(0)),
+                                     count_only ? nullptr : configs.data(),
+                                     count_only ? 0 : want,
+                                     &num);
             if (arg(3)) emu_.write_u32(arg(3), static_cast<uint32_t>(num));
-            if (arg(1) && want > 0) {
+            if (!count_only && guest_configs && want > 0) {
                 for (EGLint i = 0; i < std::min(num, want); ++i) {
-                    emu_.write_u32(arg(1) + static_cast<uint32_t>(i * 4),
+                    emu_.write_u32(guest_configs + static_cast<uint32_t>(i * 4),
                                    to_guest_ref(configs[static_cast<size_t>(i)]));
                 }
             }
@@ -6581,8 +6604,11 @@ public:
                                              EGLint, EGLint*)>("eglChooseConfig");
             if (!fn) return 0u;
             std::vector<EGLint> attribs = read_egl_ints(arg(1));
+            const uint32_t guest_configs = arg(2);
             const EGLint want = static_cast<EGLint>(arg(3));
-            std::vector<EGLConfig> configs(want > 0 ? static_cast<size_t>(want) : 1);
+            const uint32_t num_out_ptr = arg(4);
+            const bool count_only = (guest_configs == 0 || want <= 0);
+            std::vector<EGLConfig> configs(count_only ? 0 : static_cast<size_t>(want));
             EGLint num = 0;
             int strategy = 0;
             // A guest asking for RGB565 + legacy attributes can match nothing
@@ -6590,16 +6616,29 @@ public:
             // real depth buffer before giving up, so the guest never sees
             // "IllegalArgumentException: No config chosen".
             const EGLBoolean ok = zai::eglc::choose_config(
-                    fn, guest_display(arg(0)), attribs, configs.data(), want, &num,
-                    &strategy);
+                    fn, guest_display(arg(0)), attribs,
+                    count_only ? nullptr : configs.data(),
+                    count_only ? 0 : want,
+                    &num, &strategy);
             if (strategy != 0) {
-                LOGI("eglChooseConfig: %s (%d configs)",
-                     zai::eglc::strategy_name(strategy), num);
+                LOGI("eglChooseConfig: %s (%d configs, want=%d, countOnly=%d)",
+                     zai::eglc::strategy_name(strategy), num, want, count_only ? 1 : 0);
             }
-            if (arg(4)) emu_.write_u32(arg(4), static_cast<uint32_t>(num));
-            if (arg(2) && want > 0) {
+            if (!ok || num <= 0) {
+                std::string desc;
+                for (size_t i = 0; i < attribs.size() && i < 24; ++i) {
+                    char buf[24];
+                    std::snprintf(buf, sizeof(buf), i ? ",0x%x" : "0x%x",
+                                  static_cast<unsigned>(attribs[i]));
+                    desc += buf;
+                }
+                LOGW("eglChooseConfig empty/fail dpy=%08x guest_cfg=%08x want=%d num_ptr=%08x attribs=[%s]",
+                     arg(0), guest_configs, want, num_out_ptr, desc.c_str());
+            }
+            if (num_out_ptr) emu_.write_u32(num_out_ptr, static_cast<uint32_t>(num));
+            if (!count_only && guest_configs && want > 0) {
                 for (EGLint i = 0; i < std::min(num, want); ++i) {
-                    emu_.write_u32(arg(2) + static_cast<uint32_t>(i * 4),
+                    emu_.write_u32(guest_configs + static_cast<uint32_t>(i * 4),
                                    to_guest_ref(configs[static_cast<size_t>(i)]));
                 }
             }

@@ -48,6 +48,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "gpu_compositor.h"
@@ -106,13 +107,31 @@ struct ModuleInfo {
     uintptr_t relro_end = 0;
 };
 
+struct PatchedSlot {
+    uintptr_t slot = 0;
+    void* original = nullptr;
+    void* replacement = nullptr;
+    bool inside_relro = false;
+};
+
 std::mutex g_targets_mutex;
 std::vector<zai::plthook::Target> g_targets;
+std::vector<PatchedSlot> g_patched_slots;
 std::atomic<bool> g_installed{false};
+std::atomic<bool> g_gl_hooks_enabled{false};
 
 std::atomic<int> g_modules_scanned{0};
 std::atomic<int> g_slots_seen{0};
 std::atomic<int> g_slots_patched{0};
+
+bool is_gl_egl_symbol(const char* sym) {
+    if (sym == nullptr) return false;
+    return std::strcmp(sym, "eglSwapBuffers") == 0
+           || std::strcmp(sym, "eglSwapBuffersWithDamageKHR") == 0
+           || std::strcmp(sym, "glBindFramebuffer") == 0
+           || std::strcmp(sym, "glViewport") == 0
+           || std::strcmp(sym, "glScissor") == 0;
+}
 
 bool contains_icase(const char* haystack, const char* needle) {
     if (!haystack || !needle || !*needle) return false;
@@ -228,8 +247,12 @@ int patch_relocations(const dl_phdr_info* info, const ElfW(Rela)* rela, size_t c
                                             : reinterpret_cast<const ElfW(Rel)*>(rela)[i].r_offset;
         const uintptr_t slot = relocated(info, static_cast<ElfW(Addr)>(offset));
 
+        const bool gl_enabled = g_gl_hooks_enabled.load(std::memory_order_acquire);
         for (const zai::plthook::Target& target : g_targets) {
             if (std::strcmp(symbol, target.symbol) != 0) continue;
+            // When Zai-Scale is Off, never patch or intercept GL/EGL slots so
+            // PowerVR / Adreno / Mali calls run untouched through the real driver.
+            if (!gl_enabled && is_gl_egl_symbol(symbol)) break;
             void* current = *reinterpret_cast<void**>(slot);
             if (current == target.replacement) break;  // already ours
             if (!slot_writable(slot)) {
@@ -239,9 +262,22 @@ int patch_relocations(const dl_phdr_info* info, const ElfW(Rela)* rela, size_t c
                 }
                 break;
             }
-            *reinterpret_cast<void**>(slot) = target.replacement;
             const bool relro = relro_end > relro_begin && slot >= relro_begin &&
                                slot < relro_end;
+            {
+                std::lock_guard<std::mutex> lock(g_targets_mutex);
+                bool recorded = false;
+                for (const PatchedSlot& ps : g_patched_slots) {
+                    if (ps.slot == slot) {
+                        recorded = true;
+                        break;
+                    }
+                }
+                if (!recorded) {
+                    g_patched_slots.push_back({slot, current, target.replacement, relro});
+                }
+            }
+            *reinterpret_cast<void**>(slot) = target.replacement;
             slot_harden(slot, relro);
             ++patched;
             ++g_slots_patched;
@@ -573,6 +609,67 @@ void trampoline_scissor(GLint x, GLint y, GLsizei width, GLsizei height) {
                    scaled_h > 0 ? scaled_h : height);
 }
 
+bool addr_in_live_module(uintptr_t addr) {
+    struct Probe {
+        uintptr_t target;
+        bool found;
+    } probe{addr, false};
+    dl_iterate_phdr([](struct dl_phdr_info* info, size_t, void* data) -> int {
+        auto* p = static_cast<Probe*>(data);
+        if (info == nullptr || is_excluded(info->dlpi_name)) return 0;
+        for (int i = 0; i < info->dlpi_phnum; ++i) {
+            const ElfW(Phdr)& ph = info->dlpi_phdr[i];
+            if (ph.p_type != PT_LOAD) continue;
+            const uintptr_t seg_start = static_cast<uintptr_t>(info->dlpi_addr + ph.p_vaddr);
+            const uintptr_t seg_end = seg_start + static_cast<uintptr_t>(ph.p_memsz);
+            if (p->target >= seg_start && p->target < seg_end) {
+                p->found = true;
+                return 1;
+            }
+        }
+        return 0;
+    }, &probe);
+    return probe.found;
+}
+
+int restore_gl_egl_slots() {
+    std::vector<PatchedSlot> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(g_targets_mutex);
+        snapshot.swap(g_patched_slots);
+    }
+    int restored = 0;
+    std::vector<PatchedSlot> keep;
+    for (const PatchedSlot& ps : snapshot) {
+        if (ps.slot == 0 || ps.original == nullptr) continue;
+        if (!addr_in_live_module(ps.slot)) continue;
+        // Vulkan targets stay installed for telemetry; GL/EGL slots revert when Off.
+        if (ps.replacement == reinterpret_cast<void*>(&trampoline_swap)
+                || ps.replacement == reinterpret_cast<void*>(&trampoline_swap_damage)
+                || ps.replacement == reinterpret_cast<void*>(&trampoline_bind_framebuffer)
+                || ps.replacement == reinterpret_cast<void*>(&trampoline_viewport)
+                || ps.replacement == reinterpret_cast<void*>(&trampoline_scissor)) {
+            void* current = *reinterpret_cast<void**>(ps.slot);
+            if (current == ps.replacement && slot_writable(ps.slot)) {
+                *reinterpret_cast<void**>(ps.slot) = ps.original;
+                slot_harden(ps.slot, ps.inside_relro);
+                ++restored;
+            }
+        } else {
+            keep.push_back(ps);
+        }
+    }
+    if (!keep.empty()) {
+        std::lock_guard<std::mutex> lock(g_targets_mutex);
+        g_patched_slots.insert(g_patched_slots.end(), keep.begin(), keep.end());
+    }
+    if (restored > 0) {
+        LOGI("PLT hook: Zai-Scale Off -> restored %d GL/EGL GOT slot(s) to direct driver path",
+             restored);
+    }
+    return restored;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -601,12 +698,36 @@ int patch(const Target* targets, int count) {
 
     const int patched = iterate_and_patch();
     if (patched > 0) g_installed.store(true);
-    LOGI("PLT hook: patched %d slot(s) across %d module(s), %d slot(s) inspected",
-         patched, g_modules_scanned.load(), g_slots_seen.load());
+    LOGI("PLT hook: patched %d slot(s) across %d module(s), %d slot(s) inspected (glHooks=%s)",
+         patched, g_modules_scanned.load(), g_slots_seen.load(),
+         g_gl_hooks_enabled.load() ? "on" : "off-passthrough");
     return patched;
 }
 
-int refresh() { return iterate_and_patch(); }
+int refresh() {
+    if (!g_gl_hooks_enabled.load(std::memory_order_acquire)) {
+        restore_gl_egl_slots();
+    }
+    return iterate_and_patch();
+}
+
+void set_enabled(bool enabled) {
+    const bool prev = g_gl_hooks_enabled.exchange(enabled, std::memory_order_acq_rel);
+    if (!enabled) {
+        restore_gl_egl_slots();
+        if (g_installed.load()) {
+            // Keep installed=false once GL hooks are restored; vulkan_hook patches cleanly on demand.
+            g_installed.store(false);
+        }
+    } else if (!prev) {
+        const int patched = iterate_and_patch();
+        if (patched > 0) g_installed.store(true);
+    }
+}
+
+bool enabled() {
+    return g_gl_hooks_enabled.load(std::memory_order_acquire);
+}
 
 bool installed() { return g_installed.load(); }
 
@@ -620,9 +741,10 @@ std::string stats() {
     const uint64_t swaps = g_swaps.load();
     char buf[320];
     std::snprintf(buf, sizeof buf,
-                  "plt=modules:%d slots:%d patched:%d redirects:%llu swaps:%llu "
+                  "plt=modules:%d slots:%d patched:%d glHooks=%s redirects:%llu swaps:%llu "
                   "generated:%llu damageSwaps:%llu fps:%.1f",
                   g_modules_scanned.load(), g_slots_seen.load(), g_slots_patched.load(),
+                  g_gl_hooks_enabled.load(std::memory_order_acquire) ? "on" : "off",
                   static_cast<unsigned long long>(g_redirects.load()),
                   static_cast<unsigned long long>(swaps),
                   static_cast<unsigned long long>(g_generated.load()),

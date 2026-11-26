@@ -1,9 +1,13 @@
 package com.ziauddin.zaibridge.core;
 
 import android.app.Application;
+import android.content.BroadcastReceiver;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.ContextWrapper;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.ServiceConnection;
 import android.content.SharedPreferences;
 import android.content.pm.ActivityInfo;
 import android.content.pm.ApplicationInfo;
@@ -17,6 +21,8 @@ import android.os.Bundle;
 import android.os.Process;
 import android.util.Log;
 
+import androidx.annotation.RequiresApi;
+
 import com.ziauddin.zaibridge.R;
 
 import java.io.File;
@@ -28,6 +34,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Executor;
 
 /**
  * Isolated {@link Context} for a virtualized guest game running inside `:guest`.
@@ -846,5 +853,87 @@ public final class GuestContext extends ContextWrapper {
     public SharedPreferences getSharedPreferences(String name, int mode) {
         String safePkg = guestPackage.replaceAll("[^A-Za-z0-9._-]", "_");
         return super.getSharedPreferences("guest_" + safePkg + "_" + name, mode);
+    }
+
+    @Override
+    public ComponentName startService(Intent service) {
+        try {
+            return super.startService(service);
+        } catch (SecurityException | IllegalStateException e) {
+            Log.w(TAG, "guarded startService(" + service + "): " + e.getMessage());
+            return null;
+        }
+    }
+
+    @Override
+    public ComponentName startForegroundService(Intent service) {
+        try {
+            return super.startForegroundService(service);
+        } catch (SecurityException | IllegalStateException e) {
+            Log.w(TAG, "guarded startForegroundService(" + service + "): " + e.getMessage());
+            return null;
+        }
+    }
+
+    @Override
+    public boolean bindService(Intent service, ServiceConnection conn, int flags) {
+        try {
+            return super.bindService(service, conn, flags);
+        } catch (SecurityException | IllegalStateException e) {
+            Log.w(TAG, "guarded bindService(" + service + "): " + e.getMessage());
+            return false;
+        }
+    }
+
+    @RequiresApi(29)
+    @Override
+    public boolean bindService(Intent service, int flags, Executor executor, ServiceConnection conn) {
+        try {
+            return super.bindService(service, flags, executor, conn);
+        } catch (SecurityException | IllegalStateException e) {
+            Log.w(TAG, "guarded bindService(exec, " + service + "): " + e.getMessage());
+            return false;
+        }
+    }
+
+    @Override
+    public void sendBroadcast(Intent intent) {
+        try {
+            super.sendBroadcast(intent);
+        } catch (SecurityException | IllegalStateException e) {
+            Log.w(TAG, "guarded sendBroadcast(" + intent + "): " + e.getMessage());
+        }
+    }
+
+    @Override
+    public void sendBroadcast(Intent intent, String receiverPermission) {
+        try {
+            super.sendBroadcast(intent, receiverPermission);
+        } catch (SecurityException | IllegalStateException e) {
+            Log.w(TAG, "guarded sendBroadcast(" + intent + "): " + e.getMessage());
+        }
+    }
+
+    @Override
+    public Intent registerReceiver(BroadcastReceiver receiver, IntentFilter filter) {
+        try {
+            if (Build.VERSION.SDK_INT >= 33) {
+                return super.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED);
+            }
+            return super.registerReceiver(receiver, filter);
+        } catch (SecurityException | IllegalStateException e) {
+            Log.w(TAG, "guarded registerReceiver: " + e.getMessage());
+            return null;
+        }
+    }
+
+    @Override
+    public Intent registerReceiver(BroadcastReceiver receiver, IntentFilter filter, int flags) {
+        try {
+            return super.registerReceiver(receiver, filter, flags);
+        } catch (SecurityException | IllegalStateException e) {
+            Log.w(TAG, "guarded registerReceiver(flags): " + e.getMessage());
+            return null;
+        }
     }
 }

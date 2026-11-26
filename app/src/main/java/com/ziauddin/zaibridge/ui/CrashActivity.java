@@ -14,6 +14,7 @@ import android.widget.Toast;
 
 import androidx.appcompat.app.AppCompatActivity;
 
+import com.ziauddin.zaibridge.BuildConfig;
 import com.ziauddin.zaibridge.MainActivity;
 import com.ziauddin.zaibridge.R;
 import com.ziauddin.zaibridge.core.SoCProfiler;
@@ -53,11 +54,23 @@ public class CrashActivity extends AppCompatActivity {
         String errorMessage = getIntent().getStringExtra(EXTRA_ERROR_MESSAGE);
 
         if (crashInfo == null || crashInfo.isEmpty()) {
-            crashInfo = readLastCrashFile();
+            File anrFile = new File(getFilesDir(), "last_anr.txt");
+            File crashFile = new File(getFilesDir(), "last_crash.txt");
+            boolean preferAnr = anrFile.isFile() && anrFile.length() > 0
+                    && (!crashFile.isFile() || crashFile.length() == 0
+                    || anrFile.lastModified() >= crashFile.lastModified());
+            if (preferAnr) {
+                crashInfo = readFileBounded(anrFile);
+                if (errorMessage == null || errorMessage.isEmpty()) {
+                    errorMessage = "Main Thread Stalled (>4s) · ANR Watchdog";
+                }
+            } else {
+                crashInfo = readFileBounded(crashFile);
+            }
         }
 
         final String bodyText = crashInfo != null ? crashInfo : errorMessage;
-        final String baseDeviceHeader = "Zai-Bridge v4.0.0 · Android " + Build.VERSION.RELEASE
+        final String baseDeviceHeader = "Zai-Bridge v" + BuildConfig.VERSION_NAME + " · Android " + Build.VERSION.RELEASE
                 + " (API " + Build.VERSION.SDK_INT + ")\n"
                 + "Device: " + Build.MANUFACTURER + " " + Build.MODEL + " (" + Build.DEVICE + ")\n"
                 + "ABI: " + (Build.SUPPORTED_ABIS.length > 0 ? Build.SUPPORTED_ABIS[0] : "unknown");
@@ -105,10 +118,9 @@ public class CrashActivity extends AppCompatActivity {
         });
     }
 
-    private String readLastCrashFile() {
+    private static String readFileBounded(File f) {
         try {
-            File f = new File(getFilesDir(), "last_crash.txt");
-            if (f.isFile() && f.length() > 0) {
+            if (f != null && f.isFile() && f.length() > 0) {
                 byte[] b = new byte[(int) Math.min(f.length(), 131072)];
                 try (FileInputStream fis = new FileInputStream(f)) {
                     int n = fis.read(b);

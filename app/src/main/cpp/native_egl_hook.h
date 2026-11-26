@@ -40,6 +40,10 @@ int refresh();
 // True once at least one target was installed.
 bool installed();
 
+// Controls whether GL/EGL GOT interposition is active (false when Zai-Scale is Off).
+void set_enabled(bool enabled);
+bool enabled();
+
 // Human readable counters for the settings sheet / telemetry pill:
 // modules=N entries=N patched=N swaps=N generated=N vulkanPresents=N api=...
 std::string stats();

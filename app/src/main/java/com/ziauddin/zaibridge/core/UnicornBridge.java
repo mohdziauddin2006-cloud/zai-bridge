@@ -54,6 +54,7 @@ public final class UnicornBridge {
             try {
                 System.loadLibrary("wrapper");
                 loaded = true;
+                HiddenApi.exemptAll();
                 Log.i(TAG, "Unicorn core loaded for " + HOST_ABI);
             } catch (UnsatisfiedLinkError e) {
                 Log.e(TAG, "Unicorn core missing for " + HOST_ABI, e);

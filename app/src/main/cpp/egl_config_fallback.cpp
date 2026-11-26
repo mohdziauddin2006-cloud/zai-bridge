@@ -123,6 +123,26 @@ std::vector<EGLint> minimal(const std::vector<EGLint>& in) {
     return out;
 }
 
+std::vector<EGLint> any_window_es(const std::vector<EGLint>& in) {
+    std::vector<EGLint> out;
+    EGLint renderable = renderable_of(in);
+    if (renderable == 0) renderable = EGL_OPENGL_ES2_BIT;
+    out.push_back(EGL_SURFACE_TYPE);
+    out.push_back(EGL_WINDOW_BIT);
+    out.push_back(EGL_RENDERABLE_TYPE);
+    out.push_back(renderable);
+    out.push_back(EGL_NONE);
+    return out;
+}
+
+std::vector<EGLint> any_window() {
+    return { EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_NONE };
+}
+
+std::vector<EGLint> any_config() {
+    return { EGL_NONE };
+}
+
 }  // namespace
 
 namespace zai {
@@ -135,11 +155,14 @@ EGLBoolean choose_config(ChooseConfigFn fn, EGLDisplay display,
     if (num != nullptr) *num = 0;
     if (fn == nullptr) return EGL_FALSE;
 
+    EGLConfig* out_configs = (want > 0) ? configs : nullptr;
+    EGLint out_want = (out_configs != nullptr) ? want : 0;
+
     std::vector<EGLint> request = attribs;
     if (request.empty() || request.back() != EGL_NONE) request.push_back(EGL_NONE);
 
     EGLint count = 0;
-    EGLBoolean ok = fn(display, request.data(), configs, want, &count);
+    EGLBoolean ok = fn(display, request.data(), out_configs, out_want, &count);
     if (ok == EGL_TRUE && count > 0) {
         if (num != nullptr) *num = count;
         return EGL_TRUE;
@@ -149,11 +172,14 @@ EGLBoolean choose_config(ChooseConfigFn fn, EGLDisplay display,
             relaxed_color(request),
             relaxed_depth(request),
             minimal(request),
+            any_window_es(request),
+            any_window(),
+            any_config(),
     };
 
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 6; ++i) {
         count = 0;
-        ok = fn(display, attempts[i].data(), configs, want, &count);
+        ok = fn(display, attempts[i].data(), out_configs, out_want, &count);
         if (ok == EGL_TRUE && count > 0) {
             if (num != nullptr) *num = count;
             if (strategy != nullptr) *strategy = i + 1;
@@ -172,6 +198,9 @@ const char* strategy_name(int strategy) {
         case 1: return "RGBA8888 + depth24";
         case 2: return "depth16, no alpha/aa";
         case 3: return "minimal window RGBA8888";
+        case 4: return "any window ES";
+        case 5: return "any window";
+        case 6: return "any config";
         default: return "no config";
     }
 }

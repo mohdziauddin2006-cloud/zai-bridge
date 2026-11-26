@@ -24,14 +24,30 @@ public final class HiddenApi {
 
     private static final String TAG = "ZaiBridge";
 
-    private static boolean applied;
+    private static volatile boolean applied;
+    private static volatile boolean reflectionTried;
 
     private HiddenApi() {
     }
 
-    /** Idempotent; safe to call from every process start. */
+    private static native boolean nativeExemptAll();
+
+    /** Idempotent; retries cleanly via native platform thread once libwrapper loads. */
     public static synchronized boolean exemptAll() {
         if (applied) return true;
+        try {
+            if (nativeExemptAll()) {
+                applied = true;
+                Log.i(TAG, "hidden-API exemptions applied (native platform thread)");
+                return true;
+            }
+        } catch (UnsatisfiedLinkError ignored) {
+            // Core shared library not yet loaded during early attachBaseContext.
+        } catch (Throwable t) {
+            Log.w(TAG, "native hidden-API exemption warning: " + t.getMessage());
+        }
+        if (reflectionTried) return false;
+        reflectionTried = true;
         try {
             // Step 1: a Method handle on Class.getDeclaredMethod(String, Class[]).
             Method getDeclaredMethod = Class.class.getDeclaredMethod(
@@ -53,13 +69,11 @@ public final class HiddenApi {
             Log.i(TAG, "hidden-API exemptions applied (all signatures)");
             return true;
         } catch (Throwable t) {
-            // Pre-28 releases have no blocklist at all, so this is normal there.
-            // On 14+ the call itself can be rejected; the cause says whether the
-            // lookup or the invocation was refused.
+            // Do not latch `applied = true` on failure so once libwrapper.so loads,
+            // nativeExemptAll() unlocks hidden APIs cleanly on Android 14–16+.
             Throwable cause = t instanceof java.lang.reflect.InvocationTargetException
                     && t.getCause() != null ? t.getCause() : t;
-            Log.w(TAG, "hidden-API exemption unavailable: " + cause);
-            applied = true;
+            Log.w(TAG, "hidden-API reflection unavailable (will retry native): " + cause);
             return false;
         }
     }

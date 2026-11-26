@@ -68,6 +68,8 @@ public class BridgeApplication extends Application {
         if (isGuestProcess(base)) {
             HiddenApi.exemptAll();
             boolean inst = BridgeInstrumentation.install(base);
+            CrashGuard.installMainLooperShield(base);
+            AnrWatchdog.install(base);
             Log.i(TAG, "BridgeApplication(:guest) attached; instrumentation=" + inst);
         } else {
             Log.i(TAG, "BridgeApplication(main) initialized cleanly; launcher process isolated.");

@@ -30,8 +30,11 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import com.ziauddin.zaibridge.BuildConfig;
+import com.ziauddin.zaibridge.core.AnrWatchdog;
 import com.ziauddin.zaibridge.core.BridgeInstrumentation;
 import com.ziauddin.zaibridge.core.BridgeRuntime;
+import com.ziauddin.zaibridge.core.CrashGuard;
 import com.ziauddin.zaibridge.core.GameOrientation;
 import com.ziauddin.zaibridge.core.GuestActivityHost;
 import com.ziauddin.zaibridge.core.GuestContext;
@@ -173,6 +176,10 @@ public class ProxyGameActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         requestWindowFeature(Window.FEATURE_NO_TITLE);
+        final Context appCtx = super.getApplicationContext();
+        AnrWatchdog.install(appCtx);
+        AnrWatchdog.setForeground(true);
+        CrashGuard.installMainLooperShield(appCtx);
         final Intent intent = getIntent();
         final boolean bootstrapReady = intent != null
                 && intent.getBooleanExtra(GuestLauncher.EXTRA_BOOTSTRAP_READY, false);
@@ -338,6 +345,7 @@ public class ProxyGameActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        AnrWatchdog.setForeground(true);
         if (fallbackHost != null) fallbackHost.onResume();
     }
 
@@ -351,6 +359,9 @@ public class ProxyGameActivity extends Activity {
     protected void onStop() {
         if (fallbackHost != null) fallbackHost.onStop();
         super.onStop();
+        if (!isFinishing()) {
+            AnrWatchdog.setForeground(false);
+        }
     }
 
     @Override
@@ -394,7 +405,7 @@ public class ProxyGameActivity extends Activity {
     private void showErrorReport(String label, String dir, String reason) {
         final String body = (reason != null && !reason.isEmpty())
                 ? reason : "Unknown guest initialization failure";
-        final String fullReport = "Zai-Bridge v4.0.0 Launch Failure Report\n"
+        final String fullReport = "Zai-Bridge v" + BuildConfig.VERSION_NAME + " Launch Failure Report\n"
                 + "Game: " + (label != null ? label : "<unknown>") + "\n"
                 + "Dir: " + (dir != null ? dir : "<none>") + "\n"
                 + "Android: " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")\n"

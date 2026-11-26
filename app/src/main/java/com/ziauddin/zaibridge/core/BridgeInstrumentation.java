@@ -111,6 +111,11 @@ public final class BridgeInstrumentation extends Instrumentation {
     public void callActivityOnCreate(Activity activity, Bundle icicle) {
         Context ctx = BridgeApplication.get();
         if (ctx == null) ctx = getTargetContext();
+        if (ctx != null) {
+            AnrWatchdog.install(ctx);
+            AnrWatchdog.setForeground(true);
+            CrashGuard.installMainLooperShield(ctx);
+        }
         final boolean guest = isGuest(activity);
         if (ctx != null && guest) {
             GuestLauncher.attachGuestContext(activity, ctx);
@@ -238,11 +243,20 @@ public final class BridgeInstrumentation extends Instrumentation {
     @Override
     public void callActivityOnResume(Activity activity) {
         Log.i(TAG, "lifecycle onResume " + activity.getClass().getName());
+        AnrWatchdog.setForeground(true);
         if (isGuest(activity)) {
             GuestLauncher.reassertGuestResources(activity);
             EglSwapHook.refreshNativeHooks();
         }
         super.callActivityOnResume(activity);
+    }
+
+    @Override
+    public void callActivityOnStop(Activity activity) {
+        super.callActivityOnStop(activity);
+        if (!activity.isFinishing()) {
+            AnrWatchdog.setForeground(false);
+        }
     }
 
     @Override

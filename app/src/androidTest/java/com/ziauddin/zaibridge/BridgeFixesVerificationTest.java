@@ -158,19 +158,22 @@ public class BridgeFixesVerificationTest extends InstrumentationTestCase {
             holder[0] = simulatedUnityGuest;
         });
 
-        Activity guest = holder[0];
-        assertNotNull(guest);
-        assertTrue("Activity.getResources() must be GuestResourcesWrapper",
-                guest.getResources() instanceof GuestResourcesWrapper);
-        assertTrue("ApplicationContext.getResources() must be GuestResourcesWrapper",
-                guest.getApplicationContext().getResources() instanceof GuestResourcesWrapper);
-        assertEquals("Game view", guest.getResources().getString(0));
-        int resId = guest.getResources().getIdentifier(
-                "game_view_content_description", "string", "com.kolka.boostrider");
-        assertTrue(resId != 0);
-        assertEquals("Game view", guest.getResources().getString(resId));
-        assertSame(guestCtx.getGuestApplication(), guest.getApplication());
-        GuestLauncher.restoreHostResourcesIfIdle();
+        try {
+            Activity guest = holder[0];
+            assertNotNull(guest);
+            assertTrue("Activity.getResources() must be GuestResourcesWrapper",
+                    guest.getResources() instanceof GuestResourcesWrapper);
+            assertTrue("ApplicationContext.getResources() must be GuestResourcesWrapper",
+                    guest.getApplicationContext().getResources() instanceof GuestResourcesWrapper);
+            assertEquals("Game view", guest.getResources().getString(0));
+            int resId = guest.getResources().getIdentifier(
+                    "game_view_content_description", "string", "com.kolka.boostrider");
+            assertTrue(resId != 0);
+            assertEquals("Game view", guest.getResources().getString(resId));
+            assertSame(guestCtx.getGuestApplication(), guest.getApplication());
+        } finally {
+            GuestLauncher.restoreHostResourcesIfIdle();
+        }
     }
 
     public void testGameHostThemeSupportsAppCompatAndMaterial() {
@@ -381,5 +384,97 @@ public class BridgeFixesVerificationTest extends InstrumentationTestCase {
                 crashInfo.processName != null && crashInfo.processName.endsWith(":guest"));
         assertFalse("Main launcher test process must not be treated as :guest",
                 com.ziauddin.zaibridge.core.BridgeApplication.isGuestProcess(host));
+    }
+
+    public void testCrashGuardRecognizesContainerIpcAndSdkExceptions() {
+        SecurityException gmsPkg = new SecurityException("Unknown calling package name 'com.kolka.boostrider'.");
+        assertTrue(com.ziauddin.zaibridge.core.CrashGuard.isRecoverableGuestContainerException(gmsPkg));
+
+        Error wrapped = new Error("FATAL EXCEPTION [main]", gmsPkg);
+        assertTrue(com.ziauddin.zaibridge.core.CrashGuard.isRecoverableGuestContainerException(wrapped));
+
+        SecurityException intentPerm = new SecurityException("Permission Denial: getIntentSender() not allowed to send as package com.foo");
+        assertTrue(com.ziauddin.zaibridge.core.CrashGuard.isRecoverableGuestContainerException(intentPerm));
+
+        IllegalStateException realBug = new IllegalStateException("unrelated app failure");
+        assertFalse(com.ziauddin.zaibridge.core.CrashGuard.isRecoverableGuestContainerException(realBug));
+        assertFalse(com.ziauddin.zaibridge.core.CrashGuard.isThirdPartySdkWorkerException("UnityMain", realBug));
+
+        NullPointerException adNpe = new NullPointerException("Looper must not be null");
+        adNpe.setStackTrace(new StackTraceElement[]{
+                new StackTraceElement("m84.buv", "k", "com.google.android.gms.policy_ads_fdr_dynamite", 8),
+                new StackTraceElement("com.google.android.gms.ads.rewarded.zzb", "run", null, 1)
+        });
+        assertTrue(com.ziauddin.zaibridge.core.CrashGuard.isThirdPartySdkWorkerException(
+                "AdWorker(ClientSingle) #1", adNpe));
+    }
+
+    public void testGuestCompatHooksAndPermissionIntentDelegation() throws Exception {
+        assertFalse(com.ziauddin.zaibridge.core.GuestCompatHooks.shouldOverrideCompatChange(
+                com.ziauddin.zaibridge.core.GuestCompatHooks.CHANGE_PENDING_INTENT_EXPLICIT_MUTABILITY_REQUIRED,
+                22,
+                true));
+        assertTrue(com.ziauddin.zaibridge.core.GuestCompatHooks.shouldOverrideCompatChange(
+                com.ziauddin.zaibridge.core.GuestCompatHooks.CHANGE_PENDING_INTENT_EXPLICIT_MUTABILITY_REQUIRED,
+                34,
+                true));
+
+        Object[] args = new Object[]{
+                1,
+                "com.feelingtouch.hellzombie",
+                null,
+                null,
+                null,
+                0,
+                new Intent[]{new Intent("TEST_ALARM")},
+                new String[]{null},
+                0,
+                null,
+                0
+        };
+        Class<?>[] paramTypes = new Class<?>[]{
+                int.class, String.class, String.class, android.os.IBinder.class, String.class,
+                int.class, Intent[].class, String[].class, int.class, android.os.Bundle.class, int.class
+        };
+        assertTrue(com.ziauddin.zaibridge.core.GuestCompatHooks.rewriteIntentSenderArgs(
+                args, paramTypes, "com.feelingtouch.hellzombie", "com.ziauddin.zaibridge"));
+        assertEquals("com.ziauddin.zaibridge", args[1]);
+        int rewrittenFlags = (Integer) args[8];
+        assertTrue((rewrittenFlags & android.app.PendingIntent.FLAG_IMMUTABLE) != 0);
+
+        Context host = targetContext();
+        GuestContext gc = new GuestContext(
+                host,
+                new File(host.getCacheDir(), "perm-test-game"),
+                "com.kolka.boostrider",
+                "com.unity3d.player.UnityPlayerGameActivity",
+                true,
+                host.getClassLoader());
+        PackageManager pm = gc.getPackageManager();
+        java.lang.reflect.Method buildReq = pm.getClass().getMethod(
+                "buildRequestPermissionsIntent", String[].class);
+        Intent reqIntent = (Intent) buildReq.invoke(
+                pm, (Object) new String[]{"android.permission.POST_NOTIFICATIONS"});
+        assertNotNull(reqIntent);
+
+        Class<?> httpParamsCls = Class.forName("org.apache.http.params.BasicHttpParams");
+        Object httpParams = httpParamsCls.getDeclaredConstructor().newInstance();
+        assertNotNull("org.apache.http.legacy runtime must be active (not Stub!)", httpParams);
+    }
+
+    public void testHiddenApiAndZaiScaleOffZeroPltInterception() {
+        assertTrue("EglSwapHook must load libwrapper", com.ziauddin.zaibridge.core.EglSwapHook.install());
+        assertTrue("Native HiddenApi.exemptAll() must succeed on Android 8-16+",
+                com.ziauddin.zaibridge.core.HiddenApi.exemptAll());
+
+        // When Zai-Scale is Off (preset 0, 100% scale, Off MFG), native PLT GL/EGL hooks must stay unpatched.
+        com.ziauddin.zaibridge.core.EglSwapHook.configure(
+                com.ziauddin.zaibridge.data.GraphicsSettings.ofPreset(
+                        com.ziauddin.zaibridge.data.GraphicsSettings.PRESET_OFF));
+        com.ziauddin.zaibridge.core.EglSwapHook.refreshHooks();
+        String pltStats = com.ziauddin.zaibridge.core.EglSwapHook.pltStats();
+        assertNotNull(pltStats);
+        assertTrue("Expected glHooks=off in PLT stats when Zai-Scale is Off, got: " + pltStats,
+                pltStats.contains("glHooks=off"));
     }
 }

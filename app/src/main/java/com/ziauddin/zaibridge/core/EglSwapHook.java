@@ -50,6 +50,7 @@ public final class EglSwapHook {
             if (!sLoaded) {
                 System.loadLibrary("wrapper");
                 sLoaded = true;
+                HiddenApi.exemptAll();
             }
             sInstalled = nativeInstall();
             // The Java boundary covers GLSurfaceView games; a 64-bit renderer

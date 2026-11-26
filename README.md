@@ -1,9 +1,9 @@
 <div align="center">
-  <img src="docs/banner.svg" alt="Zai-Bridge v4.0.0" width="100%" />
+  <img src="docs/banner.svg" alt="Zai-Bridge v4.0.1" width="100%" />
 
   <p>
     <a href="https://github.com/mohdziauddin2006-cloud/zai-bridge/releases/latest">
-      <img src="https://img.shields.io/badge/Release-v4.0.0-00E5FF?style=for-the-badge" alt="Release v4.0.0" />
+      <img src="https://img.shields.io/badge/Release-v4.0.1-00E5FF?style=for-the-badge" alt="Release v4.0.1" />
     </a>
     <img src="https://img.shields.io/badge/Android-8.0%20--%2016%2B-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android 8.0 to 16+" />
     <img src="https://img.shields.io/badge/ABIs-arm64--v8a%20%7C%20armeabi--v7a%20%7C%20x86__64%20%7C%20x86-FFB300?style=for-the-badge" alt="Universal 4-ABI APK" />
@@ -13,7 +13,7 @@
   </p>
 
   <p>
-    <strong><a href="https://github.com/mohdziauddin2006-cloud/zai-bridge/releases/latest">Download Zai-Bridge v4.0.0 APK (Zai-Bridge-v4.0.0-Universal.apk)</a></strong>
+    <strong><a href="https://github.com/mohdziauddin2006-cloud/zai-bridge/releases/latest">Download Zai-Bridge v4.0.1 APK (Zai-Bridge-v4.0.1-Universal.apk)</a></strong>
   </p>
 </div>
 
@@ -23,13 +23,14 @@ No root, no custom kernel, and no patched ROM is needed. One universal APK ships
 
 ---
 
-## Architecture Highlights (v4.0.0)
+## Architecture Highlights (v4.0.1)
 
 - **Isolated `:guest` Process (`ProxyGameActivity` & `GameHostActivity`)**: Games execute inside a separate `:guest` OS process while `MainActivity`, imports, sheets, and `CrashActivity` remain untouched in the main launcher process. Tapping **Exit Game** reaps `:guest` cleanly so the next launch starts with a fresh ART `ClassLoader`, clean EGL state, and fresh native heaps.
-- **Zero-ANR Async Bootstrap**: Tapping a game card returns from `MainActivity` immediately without disk I/O or rotation stalls. Inside `:guest`, a lightweight dark loading screen prepares `DexClassLoader`, split-APK `Resources`, custom guest `Application`/`ContentProvider` initialization, and 32-bit Unicorn ELF mapping + `DT_INIT_ARRAY` constructors off the Main UI Thread, backed by a hard 25 ms UI-thread lock/slice ceiling in `wrapper.cpp`.
-- **Real OS Metadata Resolution**: Reads manifest meta-data through Android's `PackageManager` first and resolves binary XML `TYPE_REFERENCE` attributes (`@integer/...`, `@string/...`, `@bool/...`) against the guest APK's `Resources` table so Play Services, Firebase, AndroidX Startup, and Ads SDKs always receive actual values rather than unresolved `0x7F......` resource IDs.
-- **Zero-Overhead GL Passthrough & Transparent HUD**: When Zai-Scale is `Off` (100% scale, Off MFG), `native_egl_hook.cpp` forwards `glBindFramebuffer`, `glViewport`, `glScissor`, and `eglSwapBuffers` directly with zero FBO blits while keeping live frame counting active. When Zai-Scale Ultra is enabled and a driver fails an FBO or shader compile, the compositor trips cleanly into direct passthrough instead of presenting a blank screen.
-- **Live Hardware Profiler & Force-Save Checkpoints**: Prioritizes live EGL `GL_RENDERER`, separates shared SoC silicon dies via per-core `cpuinfo_max_freq`, snaps physical RAM to standard module tiers (`2–24 GB`), and lets you snapshot/restore game save directories from the in-game drawer.
+- **Real-Device ARM64 ANR & Watchdog Elimination**: `HostTrampolines::emit` in `wrapper.cpp` preserves the 144-byte AArch64 `x29`/`x30` stack frame around `blr x16` ART callbacks (fixing post-`NativeLoader.load` LR loops on physical ARM64 SoCs), while `AnrWatchdog` monitors `:guest` main-thread stalls (`> 4 s`) into `last_anr.txt`.
+- **Universal AAPCS Stack Args & PowerVR EGL Negotiation**: `wrapper.cpp` routes `arg(i >= 4)` cleanly through `stacked_arg(i)` and preserves `eglChooseConfig` / `eglGetConfigs` count queries (`nullptr, 0`), paired with progressive fallback configs in `egl_config_fallback.cpp` and zero-PLT-interception GL passthrough (`glHooks=off`) in `native_egl_hook.cpp` / `egl_swap_hook.cpp` when Zai-Scale is Off.
+- **Android 8–16+ Compat & Container Containment**: Native platform-domain `HiddenApi.nativeExemptAll()` enables `GuestCompatHooks` (`android.compat.Compatibility` + `IActivityManager.getIntentSender*` `FLAG_IMMUTABLE` & calling-package rewriting for pre-API-31 titles), `org.apache.http.legacy` library loading, complete `GuestPackageManagerWrapper` API 28–36 + permission-controller delegations, clean host `Resources` restoration across `LoadedApk`/`ContextImpl`, and main-looper / background ad-worker shielding in `CrashGuard`.
+- **Real OS Metadata & Split-APK Virtualization**: Resolves manifest meta-data and binary XML `TYPE_REFERENCE` attributes (`@integer/...`, `@string/...`, `@bool/...`) against guest `Resources` while isolating per-game `files/`, `cache/`, `obb/`, and `SharedPreferences` storage.
+- **Live Hardware Profiler & Force-Save Checkpoints**: Prioritizes live EGL `GL_RENDERER`, separates shared SoC silicon dies via per-core `cpuinfo_max_freq`, snaps physical RAM to standard module tiers (`2–24 GB`), and snapshots/restores save directories from the in-game drawer.
 
 ---
 
@@ -38,8 +39,10 @@ No root, no custom kernel, and no patched ROM is needed. One universal APK ships
 | Launcher Library | Live Hardware Inspector |
 | :---: | :---: |
 | <img src="docs/screenshots/launcher_home.png" alt="Zai-Bridge Launcher Library" width="260" /> | <img src="docs/screenshots/hardware_inspector.png" alt="Hardware Inspector Sheet" width="260" /> |
-| **Zai-Scale Ultra Controls** | **32-bit Guest Rendering Live** |
-| <img src="docs/screenshots/zai_scale_sheet.png" alt="Zai-Scale Ultra Configuration" width="260" /> | <img src="docs/screenshots/hellzombie_rendered.png" alt="Hell Zombie Running on 64-bit Host" width="440" /> |
+| **Zai-Scale Ultra Controls** | **32-bit Guest Live on Infinix X6852 (Android 16)** |
+| <img src="docs/screenshots/zai_scale_sheet.png" alt="Zai-Scale Ultra Configuration" width="260" /> | <img src="docs/screenshots/hellzombie_rendered.png" alt="Hell Zombie Running on Infinix X6852 Android 16" width="440" /> |
+| **64-bit Unity 6 Live (`Boost Rider` + Zai-Scale)** | **Verified on Dimensity 7020 / PowerVR BXM-8-256** |
+| <img src="docs/screenshots/boostrider_rendered.png" alt="Boost Rider Rendering Live on Infinix X6852 Android 16" width="260" /> | Hardware-verified on Android 16 (API 36) across 32-bit legacy and 64-bit Unity 6 workloads |
 
 ---
 
@@ -85,7 +88,7 @@ Custom sliders also expose **Split Compare** wipe and Force-Save slots (`Quick`,
 
 ## Quick Start
 
-1. Download **`Zai-Bridge-v4.0.0-Universal.apk`** from [**Releases**](https://github.com/mohdziauddin2006-cloud/zai-bridge/releases/latest).
+1. Download **`Zai-Bridge-v4.0.1-Universal.apk`** from [**Releases**](https://github.com/mohdziauddin2006-cloud/zai-bridge/releases/latest).
 2. Install it on any Android 8.0–16+ device (`arm64-v8a`, `armeabi-v7a`, `x86_64`, or `x86`).
 3. Tap **Import** to add an APK / APKS / XAPK + optional OBB, or pick an already installed game (including split-APK bundles).
 4. Tap a card to launch into the isolated `:guest` container, or long-press / open **Hardware Inspector** to customize Zai-Scale Ultra.
@@ -109,7 +112,7 @@ Custom sliders also expose **Split Compare** wipe and Force-Save slots (`Quick`,
 zipalign -p -f 4 app/build/outputs/apk/debug/app-debug.apk app-aligned.apk
 apksigner sign --ks ~/.android/debug.keystore --ks-pass pass:android --key-pass pass:android \
   --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true \
-  --out Zai-Bridge-v4.0.0-Universal.apk app-aligned.apk
+  --out Zai-Bridge-v4.0.1-Universal.apk app-aligned.apk
 
 # 3. Run instrumented tests on a connected emulator or handset
 ./gradlew connectedDebugAndroidTest
@@ -122,3 +125,9 @@ apksigner sign --ks ~/.android/debug.keystore --ks-pass pass:android --key-pass 
 - **Translation CPU overhead**: Emulating `armeabi-v7a` machine code on 64-bit cores adds real CPU cost compared to native `arm64-v8a` titles; heavy 32-bit Unity/Mono titles still require JIT warmup on first scene load.
 - **Anti-cheat, DRM, and Play Integrity**: Online titles that enforce APK signature pinning, Play Integrity hardware attestation, kernel/emulator checks, or external daemon integrity checks will block containerized execution.
 - **Vulkan-first titles**: Vulkan swaps (`vkQueuePresentKHR`) run in passthrough with live FPS telemetry, while Zai-Scale Ultra shaders target OpenGL ES framebuffers.
+
+---
+
+## Credits
+
+Built and verified with engineering contributions assisted by **Freebuff**, **Agy**, and **OpenCode**.

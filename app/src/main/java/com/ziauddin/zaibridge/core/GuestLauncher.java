@@ -634,7 +634,7 @@ public final class GuestLauncher {
     }
 
     private static final Object RESOURCES_INJECT_LOCK = new Object();
-    private static final java.util.Map<Object, android.content.res.Resources> SAVED_SHARED_RESOURCES =
+    private static final java.util.Map<Object, java.util.Map<java.lang.reflect.Field, android.content.res.Resources>> SAVED_SHARED_RESOURCES =
             new IdentityHashMap<>();
     private static final java.util.Map<Activity, GuestContext> BOUND_GUEST_CONTEXTS =
             new WeakHashMap<>();
@@ -677,11 +677,21 @@ public final class GuestLauncher {
                     }
                     if (!isResField) continue;
                     if (cur == guestRes || cur == sysRes || "mSystem".equals(name)) continue;
-                    if (trackOriginalForRestore && cur instanceof android.content.res.Resources
+                    boolean shouldTrack = trackOriginalForRestore
+                            || (!(target instanceof Activity)
+                                && !(target instanceof GuestContext)
+                                && !(target instanceof GuestApplication));
+                    if (shouldTrack && cur instanceof android.content.res.Resources
                             && !(cur instanceof GuestResourcesWrapper)) {
                         synchronized (RESOURCES_INJECT_LOCK) {
-                            if (!SAVED_SHARED_RESOURCES.containsKey(target)) {
-                                SAVED_SHARED_RESOURCES.put(target, (android.content.res.Resources) cur);
+                            java.util.Map<java.lang.reflect.Field, android.content.res.Resources> fieldMap =
+                                    SAVED_SHARED_RESOURCES.get(target);
+                            if (fieldMap == null) {
+                                fieldMap = new java.util.LinkedHashMap<>();
+                                SAVED_SHARED_RESOURCES.put(target, fieldMap);
+                            }
+                            if (!fieldMap.containsKey(f)) {
+                                fieldMap.put(f, (android.content.res.Resources) cur);
                             }
                         }
                     }
@@ -732,13 +742,26 @@ public final class GuestLauncher {
             HiddenApi.exemptAll();
         } catch (Throwable ignored) {
         }
+        try {
+            android.content.pm.ApplicationInfo guestAi = guestContext.getApplicationInfo();
+            int targetSdk = guestAi != null ? guestAi.targetSdkVersion : 0;
+            String hostPkg = guestContext.getHostBaseContext() != null
+                    ? guestContext.getHostBaseContext().getPackageName()
+                    : (hostCtx != null ? hostCtx.getPackageName() : activity.getPackageName());
+            GuestCompatHooks.installForGuest(
+                    hostCtx != null ? hostCtx : activity,
+                    guestContext.getPackageName(),
+                    hostPkg,
+                    targetSdk);
+        } catch (Throwable ignored) {
+        }
 
         final android.content.res.Resources guestRes = guestContext.getResources();
         final Context origBase = activity.getBaseContext();
         final Set<Object> visited = Collections.newSetFromMap(new IdentityHashMap<>());
 
         if (origBase != null && !(origBase instanceof GuestContext)) {
-            injectContextChainResources(origBase, guestRes, false, visited);
+            injectContextChainResources(origBase, guestRes, true, visited);
         }
 
         if (!(origBase instanceof GuestContext)) {
@@ -821,12 +844,22 @@ public final class GuestLauncher {
     public static void restoreHostResourcesIfIdle() {
         synchronized (RESOURCES_INJECT_LOCK) {
             if (SAVED_SHARED_RESOURCES.isEmpty()) return;
-            for (java.util.Map.Entry<Object, android.content.res.Resources> entry :
+            for (java.util.Map.Entry<Object, java.util.Map<java.lang.reflect.Field, android.content.res.Resources>> entry :
                     SAVED_SHARED_RESOURCES.entrySet()) {
                 Object target = entry.getKey();
-                android.content.res.Resources orig = entry.getValue();
-                if (target != null && orig != null) {
-                    setFieldQuiet(Object.class, target, "mResources", orig);
+                java.util.Map<java.lang.reflect.Field, android.content.res.Resources> fields = entry.getValue();
+                if (target == null || fields == null) continue;
+                for (java.util.Map.Entry<java.lang.reflect.Field, android.content.res.Resources> fe :
+                        fields.entrySet()) {
+                    try {
+                        java.lang.reflect.Field f = fe.getKey();
+                        android.content.res.Resources orig = fe.getValue();
+                        if (f != null && orig != null) {
+                            f.setAccessible(true);
+                            f.set(target, orig);
+                        }
+                    } catch (Throwable ignored) {
+                    }
                 }
             }
             SAVED_SHARED_RESOURCES.clear();

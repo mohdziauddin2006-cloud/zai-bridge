@@ -39,6 +39,7 @@
 #include "egl_config_fallback.h"
 #include "gl_shader_patcher.h"
 #include "gpu_compositor.h"
+#include "native_egl_hook.h"
 
 #include <atomic>
 #include <chrono>
@@ -47,6 +48,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #define LOG_TAG "ARM64_WRAPPER"
@@ -568,6 +570,57 @@ Java_com_ziauddin_zaibridge_core_EglSwapHook_nativeConfigure(
     config.auto_mfg = auto_mfg;
     config.berserk_mode = berserk;
     zai::GpuCompositor::instance().configure(config);
+    zai::plthook::set_enabled(zai::GpuCompositor::instance().active());
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_ziauddin_zaibridge_core_HiddenApi_nativeExemptAll(JNIEnv* env, jclass /*clazz*/) {
+    if (env == nullptr) return JNI_FALSE;
+    JavaVM* vm = nullptr;
+    if (env->GetJavaVM(&vm) != JNI_OK || vm == nullptr) return JNI_FALSE;
+    std::atomic<bool> ok{false};
+    // Pure native attached thread has zero Java stack frames, bypassing ART's
+    // caller-domain hidden-API blocklist across Android 9 through Android 16+.
+    std::thread worker([vm, &ok]() {
+        JNIEnv* th_env = nullptr;
+        if (vm->AttachCurrentThread(&th_env, nullptr) != JNI_OK || th_env == nullptr) {
+            return;
+        }
+        jclass vm_cls = th_env->FindClass("dalvik/system/VMRuntime");
+        if (vm_cls != nullptr) {
+            jmethodID get_rt = th_env->GetStaticMethodID(
+                    vm_cls, "getRuntime", "()Ldalvik/system/VMRuntime;");
+            jmethodID set_ex = th_env->GetMethodID(
+                    vm_cls, "setHiddenApiExemptions", "([Ljava/lang/String;)V");
+            if (get_rt != nullptr && set_ex != nullptr) {
+                jobject rt = th_env->CallStaticObjectMethod(vm_cls, get_rt);
+                jclass str_cls = th_env->FindClass("java/lang/String");
+                if (rt != nullptr && str_cls != nullptr) {
+                    jobjectArray arr = th_env->NewObjectArray(1, str_cls, nullptr);
+                    jstring prefix = th_env->NewStringUTF("L");
+                    if (arr != nullptr && prefix != nullptr) {
+                        th_env->SetObjectArrayElement(arr, 0, prefix);
+                        th_env->CallVoidMethod(rt, set_ex, arr);
+                        if (!th_env->ExceptionCheck()) {
+                            ok.store(true);
+                        }
+                    }
+                    if (prefix != nullptr) th_env->DeleteLocalRef(prefix);
+                    if (arr != nullptr) th_env->DeleteLocalRef(arr);
+                }
+                if (str_cls != nullptr) th_env->DeleteLocalRef(str_cls);
+                if (rt != nullptr) th_env->DeleteLocalRef(rt);
+            }
+            th_env->DeleteLocalRef(vm_cls);
+        }
+        if (th_env->ExceptionCheck()) th_env->ExceptionClear();
+        vm->DetachCurrentThread();
+    });
+    worker.join();
+    if (ok.load()) {
+        LOGI("native hidden-API exemption applied via platform-domain JNI thread");
+    }
+    return ok.load() ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT void JNICALL
