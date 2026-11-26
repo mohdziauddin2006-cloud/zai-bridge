@@ -552,6 +552,7 @@ struct GpuCompositor::Impl {
     std::atomic<int> compare_milli{0};
     std::atomic<uint64_t> epoch{1};
     std::atomic<bool> internal_bound{false};
+    std::atomic<bool> fallback_passthrough{false};
 
     GraphicsConfig snapshot() const {
         GraphicsConfig c;
@@ -1353,6 +1354,7 @@ void GpuCompositor::configure(const GraphicsConfig& config) {
                                : (d.frame_gen.load() >= 2 ? d.frame_gen.load() - 1 : 0);
     d.frames_fast = 0;
     d.frames_slow = 0;
+    d.fallback_passthrough.store(false);
     LOGI("Zai-Scale: preset=%d up=%d scale=%d%% sharp=%d%% neural=%d%% gen=%dx temporal=%d auto=%d berserk=%d",
          d.preset.load(), d.upscaler.load(), d.scale.load(), d.sharpness.load(),
          d.neural.load(), d.frame_gen.load(), d.temporal.load(), d.auto_mfg.load(),
@@ -1371,11 +1373,13 @@ float GpuCompositor::compare() const {
 }
 
 bool GpuCompositor::active() const {
+    if (impl_->fallback_passthrough.load(std::memory_order_acquire)) return false;
     const GraphicsConfig c = impl_->snapshot();
     return c.effects() || impl_->compare_milli.load() > 0;
 }
 
 bool GpuCompositor::internal_scaling() const {
+    if (!active()) return false;
     const GraphicsConfig c = impl_->snapshot();
     // Anything other than 1:1 needs the offscreen target: below 100% it is an
     // upscale, above it is DLAA super-sampling.
@@ -1400,7 +1404,10 @@ unsigned int GpuCompositor::bind_internal_target(int display_width, int display_
     if (!active() || !internal_scaling()) return 0;
     std::lock_guard<std::mutex> lock(d.mutex);
     const int major = d.detect_context();
-    if (major < 2 || !d.init_gl(major)) return 0;
+    if (major < 2 || !d.init_gl(major)) {
+        d.fallback_passthrough.store(true, std::memory_order_release);
+        return 0;
+    }
 
     const int dw = clamp_int(display_width, 1, 4096);
     const int dh = clamp_int(display_height, 1, 4096);
@@ -1411,7 +1418,10 @@ unsigned int GpuCompositor::bind_internal_target(int display_width, int display_
     d.save_state(saved);
     const bool ok = d.make_target(d.internal, iw, ih, true);
     d.restore_state(saved);
-    if (!ok) return 0;
+    if (!ok) {
+        d.fallback_passthrough.store(true, std::memory_order_release);
+        return 0;
+    }
 
     d.display_w = dw;
     d.display_h = dh;
@@ -1442,7 +1452,11 @@ bool GpuCompositor::begin(EGLDisplay display, EGLSurface surface,
     }
     std::lock_guard<std::mutex> lock(d.mutex);
     const int major = d.detect_context();
-    if (major < 2 || !d.init_gl(major)) return false;
+    if (major < 2 || !d.init_gl(major)) {
+        d.internal_bound.store(false);
+        d.fallback_passthrough.store(true, std::memory_order_release);
+        return false;
+    }
 
     const int dw = clamp_int(static_cast<int>(width), 1, 4096);
     const int dh = clamp_int(static_cast<int>(height), 1, 4096);
@@ -1473,6 +1487,11 @@ bool GpuCompositor::begin(EGLDisplay display, EGLSurface surface,
                     d.make_target(d.ring[2], sw, sh, false);
     if (!ok) {
         d.restore_state(saved);
+        if (use_internal) {
+            d.internal_bound.store(false);
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        }
+        d.fallback_passthrough.store(true, std::memory_order_release);
         return false;
     }
 
@@ -1637,14 +1656,39 @@ std::string GpuCompositor::gpu_description() {
     return out;
 }
 
+void GpuCompositor::note_passthrough_swap() {
+    Impl& d = *impl_;
+    ++d.guest_frames;
+    ++d.output_frames;
+    const auto now = std::chrono::steady_clock::now();
+    if (d.last_frame.time_since_epoch().count() != 0) {
+        const double wall =
+                std::chrono::duration<double, std::milli>(now - d.last_frame).count();
+        if (wall > 1.0 && wall < 250.0) d.push_interval(wall);
+    }
+    d.last_frame = now;
+}
+
 void GpuCompositor::note_shader_failure(const std::string& reason) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     impl_->note_failure(reason);
 }
 
+void GpuCompositor::trip_runtime_fallback(const std::string& reason) {
+    Impl& d = *impl_;
+    if (!d.fallback_passthrough.exchange(true, std::memory_order_acq_rel)) {
+        std::lock_guard<std::mutex> lock(d.mutex);
+        d.note_failure("direct passthrough fallback engaged: " + reason);
+    }
+    if (d.internal_bound.exchange(false)) {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+}
+
 void GpuCompositor::teardown() {
     Impl& d = *impl_;
     std::lock_guard<std::mutex> lock(d.mutex);
+    d.fallback_passthrough.store(false);
     const bool has_context = glGetString(GL_VERSION) != nullptr;
     if (d.gl_ready && has_context) {
         d.release_all();

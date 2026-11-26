@@ -1,31 +1,45 @@
 package com.ziauddin.zaibridge.core;
 
 import android.content.res.AssetManager;
+import android.content.res.Configuration;
+import android.content.res.Resources;
 import android.content.res.XmlResourceParser;
 import android.os.Bundle;
+import android.util.DisplayMetrics;
 import android.util.Log;
+import android.util.TypedValue;
+
+import androidx.annotation.Nullable;
 
 import org.xmlpull.v1.XmlPullParser;
 
 import java.lang.reflect.Method;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
- * Lightweight binary {@code AndroidManifest.xml} inspector using the public
- * {@link XmlResourceParser} API.
+ * Binary {@code AndroidManifest.xml} inspector with full resource-reference resolution.
  *
- * <p>Framework {@code PackageManager.getPackageArchiveInfo()} can omit
- * {@code <activity-alias>} target mappings, activity metadata on split APKs, or
- * merged application metadata. Reading the APK's binary manifest directly ensures
- * Unity ({@code unity.build-id}, {@code unity.splash-mode},
- * {@code unityplayer.UnityActivity}) and GameActivity ({@code android.app.lib_name})
- * always see accurate metadata and resolved activity class names.
+ * <p>Unlike naive parsers that store raw {@code 0x7F......} AXML resource IDs into
+ * {@code metaData}, this reader resolves every {@code TYPE_REFERENCE} attribute value
+ * (such as {@code @integer/google_play_services_version}) against the APK's merged
+ * {@link Resources} table so SDKs receive genuine primitives/strings instead of raw IDs.
  */
 public final class BinaryXmlManifestReader {
 
     private static final String TAG = "ZaiBridgeManifest";
     private static final String ANDROID_NS = "http://schemas.android.com/apk/res/android";
+
+    public static final class ProviderEntry {
+        public String name = "";
+        public String authorities = "";
+        public int initOrder = 0;
+        public boolean enabled = true;
+        public boolean exported = false;
+        public final Bundle metaData = new Bundle();
+    }
 
     public static final class ParsedManifest {
         public String packageName = "";
@@ -34,6 +48,7 @@ public final class BinaryXmlManifestReader {
         public final Bundle applicationMetaData = new Bundle();
         public final Map<String, Bundle> activityMetaData = new HashMap<>();
         public final Map<String, String> aliasTargets = new HashMap<>();
+        public final List<ProviderEntry> providers = new ArrayList<>();
 
         public String resolveActivityTarget(String name) {
             if (name == null || name.isEmpty()) return "";
@@ -77,6 +92,13 @@ public final class BinaryXmlManifestReader {
     private BinaryXmlManifestReader() {}
 
     public static ParsedManifest readFromApk(String apkPath) {
+        return readFromApk(apkPath, null, null);
+    }
+
+    public static ParsedManifest readFromApk(
+            String apkPath,
+            @Nullable List<String> splitPaths,
+            @Nullable Resources externalResources) {
         ParsedManifest out = new ParsedManifest();
         if (apkPath == null || apkPath.isEmpty()) return out;
 
@@ -86,10 +108,31 @@ public final class BinaryXmlManifestReader {
             am = AssetManager.class.getDeclaredConstructor().newInstance();
             Method addAssetPath = AssetManager.class.getMethod("addAssetPath", String.class);
             Object res = addAssetPath.invoke(am, apkPath);
-            int cookie = (res instanceof Integer) ? (Integer) res : 0;
-            if (cookie <= 0) return out;
-            parser = am.openXmlResourceParser(cookie, "AndroidManifest.xml");
-            parse(parser, out);
+            int baseCookie = (res instanceof Integer) ? (Integer) res : 0;
+            if (baseCookie <= 0) return out;
+
+            if (splitPaths != null) {
+                for (String split : splitPaths) {
+                    if (split != null && !split.isEmpty()) {
+                        try {
+                            addAssetPath.invoke(am, split);
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                }
+            }
+
+            Resources resolverRes = externalResources;
+            if (resolverRes == null) {
+                DisplayMetrics dm = new DisplayMetrics();
+                dm.setToDefaults();
+                Configuration cfg = new Configuration();
+                cfg.setToDefaults();
+                resolverRes = new Resources(am, dm, cfg);
+            }
+
+            parser = am.openXmlResourceParser(baseCookie, "AndroidManifest.xml");
+            parse(parser, out, resolverRes);
         } catch (Throwable t) {
             Log.w(TAG, "failed reading binary manifest from " + apkPath + ": " + t.getMessage());
         } finally {
@@ -109,10 +152,13 @@ public final class BinaryXmlManifestReader {
         return out;
     }
 
-    private static void parse(XmlResourceParser parser, ParsedManifest out) throws Exception {
+    private static void parse(XmlResourceParser parser, ParsedManifest out, @Nullable Resources resolverRes)
+            throws Exception {
         String currentComponent = null;
+        ProviderEntry currentProvider = null;
         boolean inApplication = false;
         boolean inActivity = false;
+        boolean inProvider = false;
         boolean inIntentFilter = false;
         boolean hasMainAction = false;
         boolean hasLauncherCategory = false;
@@ -130,6 +176,26 @@ public final class BinaryXmlManifestReader {
                     if (appName != null && !appName.isEmpty()) {
                         out.applicationClass = normalizeClassName(out.packageName, appName);
                     }
+                } else if ("provider".equals(tag)) {
+                    inProvider = true;
+                    currentProvider = new ProviderEntry();
+                    currentProvider.name = normalizeClassName(out.packageName, getAttr(parser, "name"));
+                    String auth = getAttr(parser, "authorities");
+                    if (auth != null) currentProvider.authorities = auth;
+                    String enabledAttr = getAttr(parser, "enabled");
+                    currentProvider.enabled = !"false".equals(enabledAttr);
+                    String exportedAttr = getAttr(parser, "exported");
+                    currentProvider.exported = "true".equals(exportedAttr);
+                    String orderAttr = getAttr(parser, "initOrder");
+                    if (orderAttr != null && !orderAttr.isEmpty()) {
+                        try {
+                            currentProvider.initOrder = Integer.parseInt(orderAttr);
+                        } catch (NumberFormatException ignored) {
+                        }
+                    }
+                    if (!currentProvider.name.isEmpty()) {
+                        out.providers.add(currentProvider);
+                    }
                 } else if ("activity".equals(tag) || "activity-alias".equals(tag)) {
                     inActivity = true;
                     hasMainAction = false;
@@ -144,7 +210,6 @@ public final class BinaryXmlManifestReader {
                         }
                     }
                     if (!currentComponent.isEmpty() && out.launcherActivity.isEmpty()) {
-                        // provisional first activity fallback; upgraded below if MAIN+LAUNCHER matches
                         out.launcherActivity = currentComponent;
                     }
                 } else if ("intent-filter".equals(tag) && inActivity) {
@@ -166,7 +231,9 @@ public final class BinaryXmlManifestReader {
                     String key = getAttr(parser, "name");
                     if (key != null && !key.isEmpty()) {
                         Bundle targetBundle = null;
-                        if (inActivity && currentComponent != null && !currentComponent.isEmpty()) {
+                        if (inProvider && currentProvider != null) {
+                            targetBundle = currentProvider.metaData;
+                        } else if (inActivity && currentComponent != null && !currentComponent.isEmpty()) {
                             targetBundle = out.activityMetaData.get(currentComponent);
                             if (targetBundle == null) {
                                 targetBundle = new Bundle();
@@ -176,7 +243,7 @@ public final class BinaryXmlManifestReader {
                             targetBundle = out.applicationMetaData;
                         }
                         if (targetBundle != null) {
-                            readMetaDataValue(parser, key, targetBundle);
+                            readMetaDataValue(parser, key, targetBundle, resolverRes);
                         }
                     }
                 }
@@ -191,6 +258,9 @@ public final class BinaryXmlManifestReader {
                 } else if ("activity".equals(tag) || "activity-alias".equals(tag)) {
                     inActivity = false;
                     currentComponent = null;
+                } else if ("provider".equals(tag)) {
+                    inProvider = false;
+                    currentProvider = null;
                 } else if ("application".equals(tag)) {
                     inApplication = false;
                 }
@@ -212,7 +282,8 @@ public final class BinaryXmlManifestReader {
         return null;
     }
 
-    private static void readMetaDataValue(XmlResourceParser parser, String key, Bundle dst) {
+    private static void readMetaDataValue(
+            XmlResourceParser parser, String key, Bundle dst, @Nullable Resources resolverRes) {
         int valIdx = -1;
         int resIdx = -1;
         for (int i = 0; i < parser.getAttributeCount(); i++) {
@@ -232,38 +303,89 @@ public final class BinaryXmlManifestReader {
         }
         if (valIdx < 0) return;
 
+        // If the binary XML attribute is a resource reference (@integer/..., @string/..., etc.),
+        // resolve it against Resources instead of storing the raw 0x7F...... resource ID.
+        int resId = parser.getAttributeResourceValue(valIdx, 0);
+        if (resId != 0) {
+            resolveReferenceValue(resolverRes, resId, key, dst);
+            return;
+        }
+
         String raw = parser.getAttributeValue(valIdx);
+        if (raw == null) return;
         if ("true".equals(raw) || "false".equals(raw)) {
             dst.putBoolean(key, Boolean.parseBoolean(raw));
             return;
         }
-        int resId = parser.getAttributeResourceValue(valIdx, 0);
-        if (resId != 0) {
-            dst.putInt(key, resId);
-            return;
-        }
-        if (raw != null) {
-            if (raw.startsWith("0x") || raw.matches("-?\\d+")) {
-                try {
-                    long parsed = raw.startsWith("0x")
-                            ? Long.parseLong(raw.substring(2), 16)
-                            : Long.parseLong(raw);
-                    if (parsed >= Integer.MIN_VALUE && parsed <= Integer.MAX_VALUE) {
-                        dst.putInt(key, (int) parsed);
-                        return;
-                    }
-                } catch (NumberFormatException ignored) {
-                }
-            }
-            if (raw.matches("-?\\d+\\.\\d+")) {
-                try {
-                    dst.putFloat(key, Float.parseFloat(raw));
+        if (raw.startsWith("0x") || raw.matches("-?\\d+")) {
+            try {
+                long parsed = raw.startsWith("0x")
+                        ? Long.parseLong(raw.substring(2), 16)
+                        : Long.parseLong(raw);
+                if (parsed >= Integer.MIN_VALUE && parsed <= Integer.MAX_VALUE) {
+                    dst.putInt(key, (int) parsed);
                     return;
-                } catch (NumberFormatException ignored) {
+                }
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        if (raw.matches("-?\\d+\\.\\d+")) {
+            try {
+                dst.putFloat(key, Float.parseFloat(raw));
+                return;
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        dst.putString(key, raw);
+    }
+
+    /**
+     * Resolves an AXML {@code TYPE_REFERENCE} resource ID against {@code res} and writes
+     * the actual primitive/String value into {@code dst}. Never leaks raw {@code 0x7F......} IDs.
+     */
+    public static boolean resolveReferenceValue(
+            @Nullable Resources res, int resId, String key, Bundle dst) {
+        if (res == null || resId == 0 || key == null || dst == null) return false;
+        try {
+            TypedValue tv = new TypedValue();
+            res.getValue(resId, tv, true);
+            if (tv.type == TypedValue.TYPE_INT_BOOLEAN) {
+                dst.putBoolean(key, tv.data != 0);
+                return true;
+            }
+            if (tv.type >= TypedValue.TYPE_FIRST_INT && tv.type <= TypedValue.TYPE_LAST_INT) {
+                dst.putInt(key, tv.data);
+                return true;
+            }
+            if (tv.type == TypedValue.TYPE_FLOAT) {
+                dst.putFloat(key, tv.getFloat());
+                return true;
+            }
+            if (tv.type == TypedValue.TYPE_STRING) {
+                CharSequence cs = tv.string != null ? tv.string : res.getText(resId);
+                if (cs != null) {
+                    dst.putString(key, cs.toString());
+                    return true;
                 }
             }
-            dst.putString(key, raw);
+            try {
+                String strVal = res.getString(resId);
+                if (strVal != null) {
+                    dst.putString(key, strVal);
+                    return true;
+                }
+            } catch (Throwable ignored) {
+            }
+            try {
+                dst.putInt(key, res.getInteger(resId));
+                return true;
+            } catch (Throwable ignored) {
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "unresolved meta-data ref 0x" + Integer.toHexString(resId)
+                    + " for " + key + ": " + t.getMessage());
         }
+        return false;
     }
 
     public static String normalizeClassName(String pkg, String raw) {

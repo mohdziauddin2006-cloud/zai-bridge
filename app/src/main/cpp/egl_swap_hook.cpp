@@ -200,10 +200,19 @@ int host_gles_major() {
 // ---------------------------------------------------------------------------
 bool present_frame(EGLDisplay dpy, EGLSurface surf) {
     zai::GpuCompositor& compositor = zai::GpuCompositor::instance();
-    // A 64-bit guest that binds framebuffer 0 through its own GOT (see
-    // native_egl_hook.cpp) renders into the scaled target, not the window.
+    if (!compositor.active()) {
+        if (compositor.guest_drew_internal()) {
+            compositor.release_internal_target();
+        }
+        compositor.note_passthrough_swap();
+        return false;
+    }
     const bool guest_internal = compositor.guest_drew_internal();
-    if (!compositor.begin(dpy, surf, guest_internal)) return false;
+    if (!compositor.begin(dpy, surf, guest_internal)) {
+        if (guest_internal) compositor.release_internal_target();
+        compositor.note_passthrough_swap();
+        return false;
+    }
 
     // Emit 0..15 synthetic frames ahead of the real one, evenly spaced by the
     // measured guest interval.

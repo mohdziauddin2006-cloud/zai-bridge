@@ -343,4 +343,43 @@ public class BridgeFixesVerificationTest extends InstrumentationTestCase {
         assertEquals(prof.gpuName, dataProf.gpu);
         assertEquals(prof.ramGb, dataProf.ramGb);
     }
+
+    public void testBinaryManifestResolvesIntegerReferenceInsteadOfRawId() {
+        Context testPkgCtx = getInstrumentation().getContext();
+        String testApkPath = testPkgCtx.getPackageCodePath();
+        BinaryXmlManifestReader.ParsedManifest manifest =
+                BinaryXmlManifestReader.readFromApk(testApkPath);
+        assertNotNull(manifest.applicationMetaData);
+        assertTrue("Manifest must include resolved GMS integer meta-data",
+                manifest.applicationMetaData.containsKey("com.google.android.gms.version"));
+        int resolved = manifest.applicationMetaData.getInt("com.google.android.gms.version", -1);
+        assertEquals("Expected @integer/test_gms_version_ref to resolve to 12451000, not raw 0x7F...... resource ID",
+                12451000, resolved);
+        assertTrue("Resolved value must never look like an unresolved 0x7F resource ID",
+                (resolved & 0xff000000) != 0x7f000000);
+    }
+
+    public void testProxyGameActivityRunsInIsolatedGuestProcess() throws Exception {
+        Context host = targetContext();
+        PackageManager pm = host.getPackageManager();
+        ActivityInfo proxyInfo = pm.getActivityInfo(
+                new ComponentName(host, ProxyGameActivity.class), 0);
+        ActivityInfo hostActInfo = pm.getActivityInfo(
+                new ComponentName(host, GameHostActivity.class), 0);
+        ActivityInfo mainInfo = pm.getActivityInfo(
+                new ComponentName(host, MainActivity.class), 0);
+        ActivityInfo crashInfo = pm.getActivityInfo(
+                new ComponentName(host, com.ziauddin.zaibridge.ui.CrashActivity.class), 0);
+
+        assertTrue("ProxyGameActivity must run in :guest process, got: " + proxyInfo.processName,
+                proxyInfo.processName != null && proxyInfo.processName.endsWith(":guest"));
+        assertTrue("GameHostActivity must run in :guest process, got: " + hostActInfo.processName,
+                hostActInfo.processName != null && hostActInfo.processName.endsWith(":guest"));
+        assertFalse("MainActivity must stay in main process",
+                mainInfo.processName != null && mainInfo.processName.endsWith(":guest"));
+        assertFalse("CrashActivity must stay in main process",
+                crashInfo.processName != null && crashInfo.processName.endsWith(":guest"));
+        assertFalse("Main launcher test process must not be treated as :guest",
+                com.ziauddin.zaibridge.core.BridgeApplication.isGuestProcess(host));
+    }
 }

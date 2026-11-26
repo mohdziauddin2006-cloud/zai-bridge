@@ -827,7 +827,7 @@ public class GameHostActivity extends Activity {
         exit.setBackground(exitBackground);
         exit.setLayoutParams(new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, dp(50)));
-        exit.setOnClickListener(v -> finish());
+        exit.setOnClickListener(v -> com.ziauddin.zaibridge.core.GuestLauncher.exitGuestProcess(this));
         body.addView(exit);
 
         panel.addView(scroll);

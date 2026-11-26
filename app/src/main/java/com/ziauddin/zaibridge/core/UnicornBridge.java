@@ -1,8 +1,11 @@
 package com.ziauddin.zaibridge.core;
 
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
 import android.view.Surface;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * The Java face of the Unicorn translation core.
@@ -40,6 +43,8 @@ public final class UnicornBridge {
 
     private static final java.util.concurrent.atomic.AtomicInteger GENERATION =
             new java.util.concurrent.atomic.AtomicInteger();
+    private static final Handler MAIN_HANDLER = new Handler(Looper.getMainLooper());
+    private static final AtomicBoolean PENDING_POSTED = new AtomicBoolean(false);
 
     private static final boolean CORE_LOADED;
 
@@ -145,12 +150,30 @@ public final class UnicornBridge {
      * the same process without "session already running".
      */
     public static void endSession() {
+        MAIN_HANDLER.removeCallbacksAndMessages(null);
+        PENDING_POSTED.set(false);
         if (!CORE_LOADED) return;
         try {
             nativeEndSession();
         } catch (Throwable t) {
             Log.w(TAG, "session teardown failed", t);
         }
+    }
+
+    /**
+     * Schedules one asynchronous continuation slice of any paused UI-thread guest
+     * call or queued UI callback on Android's main Looper without blocking input
+     * or vsync frames.
+     */
+    public static void postPendingResume() {
+        if (!CORE_LOADED) return;
+        if (!PENDING_POSTED.compareAndSet(false, true)) return;
+        MAIN_HANDLER.post(() -> {
+            PENDING_POSTED.set(false);
+            if (CORE_LOADED && nativeIsSessionActive()) {
+                nativePumpPending();
+            }
+        });
     }
 
     /** Id of the most recent {@link #startSession} attempt in this process. */
@@ -189,6 +212,8 @@ public final class UnicornBridge {
     private static native void nativeSetGuestActivity(Object activity);
 
     private static native boolean nativeIsSessionActive();
+
+    private static native void nativePumpPending();
 
     private static native void nativeEndSession();
 }

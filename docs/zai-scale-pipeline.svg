@@ -14,7 +14,7 @@
     </linearGradient>
   </defs>
   <rect width="1120" height="340" rx="18" fill="url(#bg)" stroke="#1F293D" stroke-width="2"/>
-  <text x="42" y="48" fill="#E8EEF7" font-family="Inter,Segoe UI,sans-serif" font-size="22" font-weight="700" letter-spacing="1">ZAI-SCALE ULTRA™ GRAPHICS PIPELINE (v3.2.1)</text>
+  <text x="42" y="48" fill="#E8EEF7" font-family="Inter,Segoe UI,sans-serif" font-size="22" font-weight="700" letter-spacing="1">ZAI-SCALE ULTRA™ GRAPHICS PIPELINE (v4.0.0)</text>
   <text x="42" y="72" fill="#8A99AD" font-family="Inter,Segoe UI,sans-serif" font-size="13">Zero-Copy EGL/PLT-GOT Capture · 3-Frame Temporal Ring · Hierarchical Optical Flow · DLSS-5 / FSR · Unlimited Uncapped MFG</text>
 
   <!-- Stage 1 -->

@@ -141,6 +141,7 @@ struct MemoryRegion {
 static std::mutex s_active_engines_mtx;
 static std::vector<uc_engine*> s_active_engines;
 static thread_local uc_engine* t_current_uc = nullptr;
+static thread_local uint32_t t_arm32_tls = 0;
 
 // Cross-engine instruction cache invalidation queue. When one engine runs
 // __ARM_NR_cacheflush or __clear_cache (e.g., Mono JIT emitting a trampoline),
@@ -203,6 +204,7 @@ static ANativeActivity* g_host_activity = nullptr;
 // from thread ..." as soon as the second thread reached a JNI call. Each thread
 // keeps its own environment instead, attached on demand from the shared VM.
 static thread_local JNIEnv* t_env = nullptr;
+static thread_local std::vector<std::vector<uint32_t>> t_local_frame_refs;
 
 struct GuestSem {
     std::mutex mtx;
@@ -887,13 +889,26 @@ public:
         uint32_t main_tls = alloc(64 * 4, 8);
         if (main_tls) {
             write_u32(main_tls, main_tls); // slot 0 points to self
+            main_tls_ = main_tls;
+            t_arm32_tls = main_tls;
             reg_write(UC_ARM_REG_C13_C0_3, main_tls);
             LOGI("ARM32 main thread TLS initialised at %08x (TPIDRURO)", main_tls);
+        }
+
+        {
+            std::lock_guard<std::mutex> plk(pool_mtx_);
+            pool_.clear();
+            pool_.push_back({uc_, false});
         }
 
         LOGI("uc_open(UC_ARCH_ARM, ARM|THUMB) ok - guest heap @ %08x, stack @ %08x",
              kHeapBase, kStackTop - static_cast<uint32_t>(kStackSize));
         return true;
+    }
+
+    void set_on_engine_created(std::function<void(uc_engine*)> cb) {
+        std::lock_guard<std::mutex> plk(pool_mtx_);
+        on_engine_created_ = std::move(cb);
     }
 
     // Hex dump of a guest window, used to tell code from data when a branch
@@ -1536,48 +1551,54 @@ public:
     // normal return would have restored.
     struct Pause {
         bool        active = false;
-        uc_context* saved = nullptr;       // pre-call caller snapshot
-        uc_context* suspended = nullptr;   // exact suspended ARM32 + VFP snapshot
+        uc_engine*  uc = nullptr;          // leased engine exclusively owned while paused
+        uint32_t    stack_slot = 0;        // reserved 2 MB guest stack slice
         uint32_t    suspended_pc = 0;      // exact resume PC with Thumb bit encoded
         uint32_t    entry = 0;
         std::string what;
         pthread_t   owner = 0;
     };
 
+    uint32_t current_thread_tls() {
+        if (t_arm32_tls) return t_arm32_tls;
+        if (static_cast<pid_t>(::syscall(__NR_gettid)) == ::getpid() && main_tls_) {
+            t_arm32_tls = main_tls_;
+            return t_arm32_tls;
+        }
+        uint32_t tls = alloc(64 * 4, 8);
+        if (tls) {
+            write_u32(tls, tls);
+            t_arm32_tls = tls;
+        } else {
+            t_arm32_tls = main_tls_;
+        }
+        return t_arm32_tls;
+    }
+
     bool call(uint32_t entry, const std::vector<uint32_t>& args, uint32_t& ret,
               const char* what = "", int budget_ms = 0, bool* paused_out = nullptr) {
-        UcScope uc_scope(uc_);
-        if (pending_.active) {
-            LOGW("call(%s): a suspended call is still pending", what);
-            return false;
-        }
-        uc_context* saved = nullptr;
-        if (uc_context_alloc(uc_, &saved) != UC_ERR_OK) return false;
-        uc_context_save(uc_, saved);
+        // Each active/suspended guest call gets its own dedicated Unicorn engine
+        // and its own non-overlapping 2 MB stack slice so GuestUnlockGuard yields
+        // or nested JNI callbacks never re-enter a live uc_emu_start() frame.
+        uc_engine* u = acquire_engine();
+        if (!u) return false;
+        const uint32_t slot = alloc_stack_slot();
+        UcScope uc_scope(u);
 
-        // Each nested guest entry gets its own slice of the 64 MB guest stack.
-        // The slice used to be 4 KB, which Mono's loader (which recurses through
-        // mono_get_method_full -> mono_..._full for every assembly member) blows
-        // through immediately: the callee's frames overwrote the caller's saved
-        // {r11, lr} and the caller returned to whatever heap word happened to
-        // land on its frame. 2 MB leaves 32 nesting levels, far more than the
-        // framework ever needs, while still keeping every slice in the mapped
-        // stack region.
         constexpr uint32_t kCallStackStride = 2u * 1024u * 1024u;
-        const uint32_t depth_slot = static_cast<uint32_t>(depth_ % 31) + 1u;
-        const uint32_t sp = align_down(kStackTop - kCallStackStride * depth_slot, 8);
-        if (depth_ >= 31) {
-            LOGW("call(%s): nesting depth %d exceeds the 31 guest stack slices", what,
-                 depth_);
-        }
+        const uint32_t sp = align_down(kStackTop - kCallStackStride * slot, 8);
 
         reg_write(UC_ARM_REG_SP, sp);
         reg_write(UC_ARM_REG_LR, kReturnSentinel);
+        const uint32_t tls = current_thread_tls();
+        if (tls) {
+            reg_write(UC_ARM_REG_C13_C0_3, tls);
+        }
         {
             uint32_t cpsr = 0;
             if (reg_read(UC_ARM_REG_CPSR, cpsr)) {
                 cpsr = (entry & 1u) ? (cpsr | 0x20u) : (cpsr & ~0x20u);
-                uc_reg_write(uc_, UC_ARM_REG_CPSR, &cpsr);
+                uc_reg_write(u, UC_ARM_REG_CPSR, &cpsr);
             }
         }
         for (size_t i = 0; i < args.size() && i < 4; ++i) {
@@ -1589,34 +1610,28 @@ public:
 
         if (call_trace_ < 60) {
             ++call_trace_;
-            LOGI("emu call #%d: %s @%08x (%zu args, depth %u)", call_trace_, what, entry,
-                 args.size(), depth_);
+            LOGI("emu call #%d: %s @%08x (%zu args, slot %u)", call_trace_, what, entry,
+                 args.size(), slot);
         }
 
-        ++depth_;
         uint32_t pc = entry;
         uc_err err = UC_ERR_OK;
         bool paused = false;
         run_to_return(pc, what, budget_ms, paused, err);
         if (paused) {
-            uc_context* suspended = nullptr;
-            if (uc_context_alloc(uc_, &suspended) == UC_ERR_OK) {
-                uc_context_save(uc_, suspended);
-            }
             pending_.active = true;
-            pending_.saved = saved;
-            pending_.suspended = suspended;
+            pending_.uc = u;
+            pending_.stack_slot = slot;
             pending_.suspended_pc = pc;
             pending_.entry = entry;
             pending_.what = what;
             pending_.owner = pthread_self();
             if (paused_out) *paused_out = true;
             LOGI("call(%s) @%08x suspended at pc=%08x after %dms: "
-                 "exact context snapshotted, continuing on next tick",
-                 what, entry, pc, budget_ms);
+                 "engine & stack slot %u pinned, continuing on next tick",
+                 what, entry, pc, budget_ms, slot);
             return false;
         }
-        --depth_;
 
         bool ok = false;
         if (err == UC_ERR_OK) {
@@ -1637,8 +1652,6 @@ public:
             LOGE("call(%s): r4=%08x r5=%08x r6=%08x r7=%08x r8=%08x r9=%08x "
                  "r10=%08x r11=%08x r12=%08x",
                  what, r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12]);
-            // The faulting instruction and the outgoing argument words separate a
-            // null indirect call (`blx rX` with rX == 0) from a bad load.
             log_guest_window("fault site", lr, 16, 8);
             LOGE("call(%s): stack args %08x %08x %08x %08x", what,
                  read_u32(sp_r), read_u32(sp_r + 4), read_u32(sp_r + 8),
@@ -1658,30 +1671,27 @@ public:
             LOGE("call(%s): backtrace:%s", what, chain.c_str());
         }
 
-        uc_context_restore(uc_, saved);
-        uc_context_free(saved);
+        free_stack_slot(slot);
+        release_engine(u);
         return ok;
     }
 
     /**
-     * Continues a suspended call from its exact snapshotted ARM32/VFP context.
+     * Continues a suspended call from its exclusively pinned Unicorn engine.
      *
      * @return true when the call really returned (`ret` holds R0), false when it
      *         is still suspended (`paused`) or aborted.
      */
     bool resume_pending(uint32_t& ret, int budget_ms, bool& paused) {
-        UcScope uc_scope(uc_);
         if (!pending_.active) return true;
-        uc_context* saved = pending_.saved;
-        uc_context* suspended = pending_.suspended;
+        uc_engine* u = pending_.uc ? pending_.uc : uc_;
+        const uint32_t slot = pending_.stack_slot;
         uint32_t pc = pending_.suspended_pc;
         const std::string what = pending_.what;
         const uint32_t entry = pending_.entry;
         pending_ = Pause{};
 
-        if (suspended != nullptr) {
-            uc_context_restore(uc_, suspended);
-        }
+        UcScope uc_scope(u);
         if (pc == 0) {
             uint32_t raw_pc = 0, cpsr = 0;
             reg_read(UC_ARM_REG_PC, raw_pc);
@@ -1692,25 +1702,15 @@ public:
         uc_err err = UC_ERR_OK;
         run_to_return(pc, what.c_str(), budget_ms, paused, err);
         if (paused) {
-            if (suspended == nullptr) {
-                uc_context_alloc(uc_, &suspended);
-            }
-            if (suspended != nullptr) {
-                uc_context_save(uc_, suspended);
-            }
             pending_.active = true;
-            pending_.saved = saved;
-            pending_.suspended = suspended;
+            pending_.uc = u;
+            pending_.stack_slot = slot;
             pending_.suspended_pc = pc;
             pending_.entry = entry;
             pending_.what = what;
             pending_.owner = pthread_self();
             return false;
         }
-        if (suspended != nullptr) {
-            uc_context_free(suspended);
-        }
-        --depth_;
 
         bool ok = false;
         if (err == UC_ERR_OK) {
@@ -1719,8 +1719,8 @@ public:
             LOGE("resume(%s) @%08x aborted: %s (pc=%08x)", what.c_str(), entry,
                  uc_strerror(err), pc);
         }
-        uc_context_restore(uc_, saved);
-        uc_context_free(saved);
+        if (slot) free_stack_slot(slot);
+        release_engine(u);
         pending_cv_.notify_all();
         LOGI("call(%s): resumed and completed (ret=%d)", what.c_str(), static_cast<int>(ret));
         return ok;
@@ -1746,6 +1746,96 @@ public:
     void set_run_unlocked_hook(std::function<void(const std::function<void()>&)> cb) {
         run_unlocked_ = std::move(cb);
     }
+
+private:
+    struct PooledEngine {
+        uc_engine* uc = nullptr;
+        bool busy = false;
+    };
+
+    uc_engine* spawn_pooled_uc(const std::function<void(uc_engine*)>& on_created) {
+        uc_engine* u = nullptr;
+        const uc_mode mode = static_cast<uc_mode>(UC_MODE_ARM | UC_MODE_THUMB);
+        uc_err err = uc_open(UC_ARCH_ARM, mode, &u);
+        if (err != UC_ERR_OK || !u) {
+            LOGE("pool uc_open(ARM32) failed: %s", uc_strerror(err));
+            return nullptr;
+        }
+        int32_t cpacr = 0x00F00000;
+        int32_t fpexc = 0x40000000;
+        uc_reg_write(u, UC_ARM_REG_C1_C0_2, &cpacr);
+        uc_reg_write(u, UC_ARM_REG_FPEXC, &fpexc);
+        {
+            std::lock_guard<std::mutex> lk(regions_mtx_);
+            for (const auto& r : regions_) {
+                uc_mem_map_ptr(u, r.guest_addr, r.size, r.perms, r.host_ptr);
+            }
+            std::lock_guard<std::mutex> alk(s_active_engines_mtx);
+            s_active_engines.push_back(u);
+        }
+        uc_hook mem_h = 0;
+        uc_hook_add(u, &mem_h,
+                    UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED |
+                            UC_HOOK_MEM_FETCH_UNMAPPED,
+                    reinterpret_cast<void*>(&Emulator::mem_fault_thunk),
+                    this, 1, 0);
+        if (on_created) {
+            on_created(u);
+        }
+        return u;
+    }
+
+    uc_engine* acquire_engine() {
+        std::function<void(uc_engine*)> on_created;
+        {
+            std::lock_guard<std::mutex> plk(pool_mtx_);
+            for (auto& pe : pool_) {
+                if (!pe.busy && pe.uc) {
+                    pe.busy = true;
+                    return pe.uc;
+                }
+            }
+            on_created = on_engine_created_;
+        }
+        uc_engine* u = spawn_pooled_uc(on_created);
+        if (!u) return uc_;
+        std::lock_guard<std::mutex> plk(pool_mtx_);
+        pool_.push_back({u, true});
+        LOGI("Unicorn engine pool expanded to %zu engine(s)", pool_.size());
+        return u;
+    }
+
+    void release_engine(uc_engine* u) {
+        if (!u) return;
+        std::lock_guard<std::mutex> plk(pool_mtx_);
+        for (auto& pe : pool_) {
+            if (pe.uc == u) {
+                pe.busy = false;
+                return;
+            }
+        }
+    }
+
+    uint32_t alloc_stack_slot() {
+        std::lock_guard<std::mutex> plk(pool_mtx_);
+        for (uint32_t bit = 0; bit < 31; ++bit) {
+            const uint32_t mask = 1u << bit;
+            if ((stack_slots_in_use_ & mask) == 0) {
+                stack_slots_in_use_ |= mask;
+                return bit + 1u;
+            }
+        }
+        LOGW("guest stack slices saturated (31 active); reusing top slice 31");
+        return 31u;
+    }
+
+    void free_stack_slot(uint32_t slot) {
+        if (slot < 1u || slot > 31u) return;
+        std::lock_guard<std::mutex> plk(pool_mtx_);
+        stack_slots_in_use_ &= ~(1u << (slot - 1u));
+    }
+
+public:
 
     // Shared step-error handler for both the main ART-driven engine and every
     // child ZaiGuestThread engine: ARM/Thumb interworking retries, SIGSEGV
@@ -1902,6 +1992,7 @@ private:
         uint32_t ret = static_cast<uint32_t>(-38);   // -ENOSYS
         switch (nr) {
             case 0x0F0001:   // __ARM_NR_set_tls
+                t_arm32_tls = a0;
                 uc_reg_write(uc, UC_ARM_REG_C13_C0_3, &a0);
                 ret = 0;
                 break;
@@ -1974,21 +2065,26 @@ private:
     // Chunked execution from `pc` up to the return sentinel.
     void run_to_return(uint32_t& pc, const char* what, int budget_ms, bool& paused,
                        uc_err& err) {
+        uc_engine* u = active_uc();
+        if (!u) {
+            err = UC_ERR_ARG;
+            return;
+        }
         constexpr uint32_t kChunk = 250u * 1000u;
         code_guard_hit_ = false;
         const auto started = std::chrono::steady_clock::now();
         uint64_t budget = kMaxInstructions;
         int state_retries = 0;
         for (;;) {
-            drain_cache_flushes(uc_);
-            err = uc_emu_start(uc_, pc, kReturnSentinel, 0, kChunk);
+            drain_cache_flushes(u);
+            err = uc_emu_start(u, pc, kReturnSentinel, 0, kChunk);
             if (code_guard_hit_) {
                 emu_ok_ = false;
                 err = UC_ERR_INSN_INVALID;
                 return;
             }
             if (err != UC_ERR_OK) {
-                if (handle_step_error(uc_, err, pc, state_retries, what)) continue;
+                if (handle_step_error(u, err, pc, state_retries, what)) continue;
                 return;
             }
 
@@ -2043,24 +2139,30 @@ private:
 
 public:
     ~Emulator() {
-        if (pending_.saved) {
-            uc_context_free(pending_.saved);
-            pending_.saved = nullptr;
-        }
-        if (pending_.suspended) {
-            uc_context_free(pending_.suspended);
-            pending_.suspended = nullptr;
-        }
         pending_.active = false;
+        pending_.uc = nullptr;
+        std::vector<uc_engine*> all_engines;
+        {
+            std::lock_guard<std::mutex> plk(pool_mtx_);
+            for (const auto& pe : pool_) {
+                if (pe.uc) all_engines.push_back(pe.uc);
+            }
+            pool_.clear();
+        }
+        if (all_engines.empty() && uc_) {
+            all_engines.push_back(uc_);
+        }
         {
             std::lock_guard<std::mutex> alk(s_active_engines_mtx);
-            auto it = std::find(s_active_engines.begin(), s_active_engines.end(), uc_);
-            if (it != s_active_engines.end()) s_active_engines.erase(it);
+            for (uc_engine* u : all_engines) {
+                auto it = std::find(s_active_engines.begin(), s_active_engines.end(), u);
+                if (it != s_active_engines.end()) s_active_engines.erase(it);
+            }
         }
-        if (uc_) {
-            uc_close(uc_);
-            uc_ = nullptr;
+        for (uc_engine* u : all_engines) {
+            uc_close(u);
         }
+        uc_ = nullptr;
         std::lock_guard<std::mutex> lk(regions_mtx_);
         for (auto& r : regions_) {
             if (r.host_ptr && r.host_ptr != MAP_FAILED) {
@@ -2072,6 +2174,11 @@ public:
     }
 
 private:
+    std::mutex pool_mtx_;
+    std::vector<PooledEngine> pool_;
+    uint32_t stack_slots_in_use_ = 0;
+    uint32_t main_tls_ = 0;
+    std::function<void(uc_engine*)> on_engine_created_;
     std::mutex alloc_mtx_;
     std::mutex regions_mtx_;
     std::vector<MemoryRegion> regions_;
@@ -2102,7 +2209,6 @@ private:
     size_t     page_peak_pages_ = 0;
     uint64_t   reclaimed_bytes_ = 0;     // returned by munmap/madvise
     std::mutex page_mtx_;
-    uint32_t   depth_ = 0;                   // nested call depth
     bool       emu_ok_ = true;               // last call made progress
     int        call_trace_ = 0;              // bounded entry logging for uc calls
     long long  last_report_ = 0;             // seconds bucket for spin reports
@@ -2115,40 +2221,31 @@ private:
 };
 
 // Releases the global emulator lock around blocking host calls or cooperative
-// slice yields when running on an ART thread holding `emu_mu`, saving and
-// restoring the shared ARM32 register file so another ART thread (typically
-// the UI thread) can make progress without corrupting the parked call.
+// slice yields when running on an ART thread holding `emu_mu`. Because every
+// ART call runs on its own exclusively leased Unicorn engine and 2 MB stack
+// slice, releasing `emu_mu` lets other ART threads progress cleanly without
+// overwriting another engine's live `uc_emu_start()` frame.
 class GuestUnlockGuard {
 public:
-    GuestUnlockGuard(Emulator& emu, GuestMutex& emu_mu) : emu_(emu), emu_mu_(emu_mu) {
+    GuestUnlockGuard(Emulator& /*emu*/, GuestMutex& emu_mu) : emu_mu_(emu_mu) {
         if (!emu_mu_.held_by_current_thread()) return;
-        if (t_current_uc && t_current_uc != emu_.uc()) return;
         active_ = true;
-        if (uc_context_alloc(emu_.uc(), &saved_ctx_) == UC_ERR_OK) {
-            uc_context_save(emu_.uc(), saved_ctx_);
-        }
+        saved_uc_ = t_current_uc;
         saved_depth_ = emu_mu_.unlock_all();
     }
 
     ~GuestUnlockGuard() {
         if (!active_) return;
         emu_mu_.lock_with_depth(saved_depth_);
-        while (emu_.has_pending() && !emu_.pending_owned_by_current_thread()) {
-            emu_.wait_pending_slice(emu_mu_, saved_depth_);
-        }
-        if (saved_ctx_) {
-            uc_context_restore(emu_.uc(), saved_ctx_);
-            uc_context_free(saved_ctx_);
-        }
+        t_current_uc = saved_uc_;
     }
 
     GuestUnlockGuard(const GuestUnlockGuard&) = delete;
     GuestUnlockGuard& operator=(const GuestUnlockGuard&) = delete;
 
 private:
-    Emulator& emu_;
     GuestMutex& emu_mu_;
-    uc_context* saved_ctx_ = nullptr;
+    uc_engine* saved_uc_ = nullptr;
     int saved_depth_ = 0;
     bool active_ = false;
 };
@@ -2186,10 +2283,10 @@ struct LoadedLibrary {
     uint32_t init_array_v = 0;
     uint32_t init_array_sz = 0;
 
-    // Relocations are applied exactly once. Runtime dlopen() adds libraries to
-    // an already-linked set, and re-running R_ARM_RELATIVE would add the bias
-    // a second time and corrupt every pointer in the earlier payloads.
+    // Relocations and static constructors are applied once so re-entering via
+    // NativeLoader.load on the UI thread never stalls re-running DT_INIT_ARRAY.
     bool linked = false;
+    mutable bool constructors_ran = false;
 };
 
 // A `Java_<class>_<method>` export found in a guest library: the host ART must
@@ -2713,7 +2810,16 @@ public:
     using ImportHandler = std::function<uint32_t()>;
 
     explicit JniBridge(Emulator& emu) : emu_(emu), linker_(emu) {}
-    ~JniBridge() { stop_ui_worker(); }
+    ~JniBridge() {
+        stop_ui_worker();
+        if (unicorn_bridge_cls_) {
+            if (JNIEnv* env = current_jni_env()) {
+                env->DeleteGlobalRef(unicorn_bridge_cls_);
+            }
+            unicorn_bridge_cls_ = nullptr;
+            post_pending_mid_ = nullptr;
+        }
+    }
 
     GuestMutex& emu_mutex() { return emu_mu_; }
 
@@ -2891,6 +2997,28 @@ public:
             LOGE("uc_hook_add failed: %s", uc_strerror(err));
             return false;
         }
+        emu_.set_on_engine_created([this](uc_engine* u) {
+            uc_hook h = 0;
+            uc_hook_add(u, &h, UC_HOOK_CODE,
+                        reinterpret_cast<void*>(&JniBridge::code_hook_thunk),
+                        this, static_cast<uint64_t>(kStubBase),
+                        static_cast<uint64_t>(kStubBase + kStubRegionSz - 1));
+        });
+
+        if (env) {
+            jclass local_bridge = env->FindClass("com/ziauddin/zaibridge/core/UnicornBridge");
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            if (local_bridge) {
+                unicorn_bridge_cls_ = reinterpret_cast<jclass>(env->NewGlobalRef(local_bridge));
+                post_pending_mid_ = env->GetStaticMethodID(
+                        unicorn_bridge_cls_, "postPendingResume", "()V");
+                if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
+                    post_pending_mid_ = nullptr;
+                }
+                env->DeleteLocalRef(local_bridge);
+            }
+        }
 
         LOGI("JNI bridge ready: env shadow %08x, vm shadow %08x, trap page %08x",
              env_shadow_, vm_shadow_, kStubBase);
@@ -3036,7 +3164,6 @@ public:
             LOGW("no Java_* exports in the mapped payloads");
             return;
         }
-        natives_.reserve(natives_.size() + exports.size());
         LOGI("binding %zu Java_* exports into the host runtime", exports.size());
 
         size_t bound = 0;
@@ -3069,6 +3196,8 @@ public:
 
     // Run DT_INIT / DT_INIT_ARRAY of a freshly loaded library.
     void run_constructors(const LoadedLibrary& lib) {
+        if (lib.constructors_ran) return;
+        lib.constructors_ran = true;
         std::vector<uint32_t> fns;
         if (lib.init_fn) fns.push_back(lib.init_fn);
         for (uint32_t f : lib.init_array) fns.push_back(f);
@@ -3095,7 +3224,7 @@ public:
     void set_guest_loader(jobject loader) { guest_loader_ = loader; }
     void set_guest_activity(jobject activity) { guest_thiz_ = activity; }
     jobject guest_loader() const { return guest_loader_; }
-    const std::vector<NativeEntry>& natives() const { return natives_; }
+    const std::deque<NativeEntry>& natives() const { return natives_; }
 
     // Per-session filesystem context. Everything the guest believes it can see
     // outside the sandbox is folded back into the game's private directory.
@@ -3231,8 +3360,14 @@ public:
         const uint32_t h = next_ref_++;
         refs_[h] = gref;
         if (deletable) {
-            if (is_global) deletable_global_jrefs_.insert(h);
-            else deletable_local_jrefs_.insert(h);
+            if (is_global) {
+                deletable_global_jrefs_.insert(h);
+            } else {
+                deletable_local_jrefs_.insert(h);
+                if (!t_local_frame_refs.empty()) {
+                    t_local_frame_refs.back().push_back(h);
+                }
+            }
         } else if (!last_thiz_gref_) {
             last_thiz_gref_ = gref;
             last_thiz_handle_ = h;
@@ -3333,15 +3468,16 @@ public:
     uint64_t native_entry(uint32_t id, uint64_t* host_args) {
         EnvScope env_scope(t_env, vm_);
         if (id >= natives_.size()) return 0;
-        const NativeEntry& e = natives_[id];
+        const NativeEntry e = natives_[id];
 
         // Never allow Android's Main UI thread to block >40ms on emu_mu_.
         // When contended on a background GL/worker thread, enqueue async-safe
         // void/boolean callbacks onto the dedicated UI async worker and return immediately.
         const bool on_ui_thread = is_ui_main_thread();
+        const bool nested_guest_call = emu_mu_.held_by_current_thread();
         bool acquired_immediately = false;
-        if (on_ui_thread && !emu_mu_.held_by_current_thread()) {
-            acquired_immediately = emu_mu_.try_lock_for(40);
+        if (on_ui_thread && !nested_guest_call) {
+            acquired_immediately = emu_mu_.try_lock_for(25);
             if (!acquired_immediately) {
                 if ((e.ret_type == 'V' || e.ret_type == 'Z')
                         && e.name != "nativeRender" && e.name != "render") {
@@ -3505,55 +3641,40 @@ public:
         }
 
         uint32_t ret = 0;
-        const int budget_ms = startup_budget_ms();
+        const int budget_ms = nested_guest_call ? 0 : startup_budget_ms();
 
-        // A call the budget suspended last time is still sitting on the guest's
-        // stack. Finish it before dispatching anything else; if it needs more
-        // than this call's budget, let ART have this call back too. Dropping a
-        // frame here is harmless -- the engine is still initialising, and the
-        // frame the UI thread waits for has already been answered.
-        if (emu_.has_pending() && !emu_.pending_owned_by_current_thread()) {
-            // A different thread is standing inside the guest. Queue distinct
-            // non-render callbacks (e.g. resize/resume) so they run once cold
-            // init completes without putting two ART threads in Unicorn at once.
-            if (e.guest_fn != emu_.pending_entry() && e.name != "nativeRender" && e.name != "render") {
-                deferred_.active = true;
-                deferred_.fn = e.guest_fn;
-                deferred_.args = args;
-                deferred_.name = e.name;
-                keep_scoped = true;
-            }
-            finish_native_call();
-            return suspended_result(e);
-        }
-        if (emu_.has_pending()) {
+        // Only top-level UI-main-thread calls participate in the 25ms cooperative slice Pause.
+        // Background threads (GLThread, FMODAudioDevice, workers) run on their own
+        // exclusively leased Unicorn engine and stack slot so they never touch UI `pending_`.
+        if (on_ui_thread && !nested_guest_call && (emu_.has_pending() || !deferred_queue_.empty())) {
+            const auto slice_start = std::chrono::steady_clock::now();
             const uint32_t pending_fn = emu_.pending_entry();
-            const bool same_entry = (pending_fn == e.guest_fn);
+            const bool same_entry = (pending_fn != 0 && pending_fn == e.guest_fn);
             bool still_paused = false;
             uint32_t resumed_ret = 0;
-            const bool resumed_ok = emu_.resume_pending(resumed_ret, budget_ms, still_paused);
-            if (still_paused) {
-                // Only defer DISTINCT lifecycle/resize calls; NEVER queue a
-                // duplicate nativeRender tick or we would re-enter Unity boot.
-                if (!same_entry && e.name != "nativeRender" && e.name != "render") {
-                    deferred_.active = true;
-                    deferred_.fn = e.guest_fn;
-                    deferred_.args = args;
-                    deferred_.name = e.name;
-                    keep_scoped = true;
+            bool resumed_ok = true;
+            if (emu_.has_pending()) {
+                resumed_ok = emu_.resume_pending(resumed_ret, budget_ms, still_paused);
+                sync_direct_buffers_to_host();
+                if (still_paused) {
+                    // Preserve distinct init/lifecycle calls (e.g. initJni, nativeInitWWW,
+                    // nativeSetDefaultDisplay, nativeResize) in FIFO order; skip duplicate
+                    // render ticks so we never re-enter Unity boot.
+                    if (!same_entry && e.name != "nativeRender" && e.name != "render"
+                            && deferred_queue_.size() < 32) {
+                        deferred_queue_.push_back({e.guest_fn, args, scoped_jrefs, e.name});
+                        keep_scoped = true;
+                    }
+                    post_pending_resume();
+                    finish_native_call();
+                    return suspended_result(e);
                 }
-                finish_native_call();
-                return suspended_result(e);
+                for (uint32_t h : pending_jrefs_) {
+                    delete_guest_jobject(h, false);
+                }
+                pending_jrefs_.clear();
             }
-            if (deferred_.active) {
-                Deferred pending_def = deferred_;
-                deferred_ = Deferred{};
-                uint32_t replayed = 0;
-                LOGI("native %s replayed after suspended call completed",
-                     pending_def.name.c_str());
-                emu_.call(pending_def.fn, pending_def.args, replayed,
-                          pending_def.name.c_str(), 0);
-            }
+            const bool queue_drained = drain_deferred_queue_locked(slice_start);
             // If this incoming tick was driving the suspended function itself
             // (e.g., UnityPlayer.nativeRender), return its exact result now
             // instead of re-entering from the top on the same tick!
@@ -3572,15 +3693,30 @@ public:
                 finish_native_call();
                 return static_cast<uint64_t>(resumed_ret);
             }
+            if (!queue_drained) {
+                if (e.name != "nativeRender" && e.name != "render"
+                        && deferred_queue_.size() < 32) {
+                    deferred_queue_.push_back({e.guest_fn, args, scoped_jrefs, e.name});
+                    keep_scoped = true;
+                }
+                post_pending_resume();
+                finish_native_call();
+                return suspended_result(e);
+            }
         }
 
         bool guest_paused = false;
         const bool ok = emu_.call(e.guest_fn, args, ret, e.name.c_str(), budget_ms,
                                   &guest_paused);
-        if (n < 3) LOGI("native %s -> %s (ret=%d)", e.name.c_str(), ok ? "returned" : "FAILED",
-                        static_cast<int>(ret));
+        if (n < 3) {
+            LOGI("native %s -> %s (ret=%d)", e.name.c_str(),
+                 ok ? "returned" : (guest_paused ? "suspended (continuing async)" : "FAILED"),
+                 static_cast<int>(ret));
+        }
         if (!ok && guest_paused) {
+            pending_jrefs_.insert(pending_jrefs_.end(), scoped_jrefs.begin(), scoped_jrefs.end());
             keep_scoped = true;
+            post_pending_resume();
             finish_native_call();
             return suspended_result(e);
         }
@@ -4694,6 +4830,13 @@ public:
 
             case kIdxFindClass: {
                 const std::string name = guest_string(arg(1));
+                std::string cache_key = name;
+                std::replace(cache_key.begin(), cache_key.end(), '.', '/');
+                {
+                    std::lock_guard<std::mutex> lk(refs_mtx_);
+                    auto cit = class_cache_.find(cache_key);
+                    if (cit != class_cache_.end()) return cit->second;
+                }
                 // CheckJNI turns a FindClass with a pending exception into a
                 // process abort. A guest callback that threw has already been
                 // reported; drop the exception so the bridge can continue.
@@ -4707,16 +4850,19 @@ public:
                 jclass c = find_class_through(t_env, guest_loader_, name);
                 if (!c) {
                     t_env->ExceptionClear();
-                    std::string slash_name = name;
-                    std::replace(slash_name.begin(), slash_name.end(), '.', '/');
-                    c = t_env->FindClass(slash_name.c_str());
+                    c = t_env->FindClass(cache_key.c_str());
                 }
                 if (!c) {
                     t_env->ExceptionClear();
                     LOGE("FindClass(%s) failed", name.c_str());
                     return 0;
                 }
-                return adopt_local_jobject(c, false);
+                const uint32_t handle = adopt_local_jobject(c, false);
+                if (handle) {
+                    std::lock_guard<std::mutex> lk(refs_mtx_);
+                    class_cache_[cache_key] = handle;
+                }
+                return handle;
             }
 
             case kIdxGetObjectClass: {
@@ -4909,13 +5055,26 @@ public:
                 LOGE("guest FatalError: %s", guest_string(arg(1)).c_str());
                 return 0;
 
-            case kIdxPushLocalFrame:
-                return static_cast<uint32_t>(
-                    t_env->PushLocalFrame(static_cast<jint>(arg(1))));
+            case kIdxPushLocalFrame: {
+                const jint rc = t_env->PushLocalFrame(static_cast<jint>(arg(1)));
+                if (rc == 0) t_local_frame_refs.emplace_back();
+                return static_cast<uint32_t>(rc);
+            }
 
-            case kIdxPopLocalFrame:
-                return adopt_local_jobject(
-                    t_env->PopLocalFrame(static_cast<jobject>(from_guest_ref(arg(1)))), true);
+            case kIdxPopLocalFrame: {
+                jobject result_in = static_cast<jobject>(from_guest_ref(arg(1)));
+                std::vector<uint32_t> frame_refs;
+                if (!t_local_frame_refs.empty()) {
+                    frame_refs = std::move(t_local_frame_refs.back());
+                    t_local_frame_refs.pop_back();
+                }
+                jobject popped = t_env->PopLocalFrame(result_in);
+                const uint32_t ret = adopt_local_jobject(popped, true);
+                for (uint32_t lh : frame_refs) {
+                    delete_guest_jobject(lh, false);
+                }
+                return ret;
+            }
 
             case kIdxEnsureLocalCapacity:
                 return static_cast<uint32_t>(
@@ -7828,6 +7987,10 @@ public:
             int fd = -1, events = 0;
             void* data = nullptr;
             void* looper = from_guest_ref(arg(0));
+            if (!looper) {
+                auto for_thr = platform_proc<void* (*)()>("ALooper_forThread");
+                if (for_thr && !for_thr()) return static_cast<uint32_t>(-1);
+            }
             const uint32_t out_fd = arg(2), out_ev = arg(3), out_data = arg(4);
             int timeout = static_cast<int>(arg(1));
             if (timeout < 0 || timeout > kLooperPollSliceMs) timeout = kLooperPollSliceMs;
@@ -7845,6 +8008,10 @@ public:
             auto fn = platform_proc<int (*)(int, int*, int*, void**)>
                     ("ALooper_pollAll");
             if (!fn) return static_cast<uint32_t>(-1);
+            // Unity/NDK threads without a prepared thread-local ALooper poll
+            // every frame; return ALOOPER_POLL_ERROR cleanly instead of flooding logcat.
+            auto for_thr = platform_proc<void* (*)()>("ALooper_forThread");
+            if (for_thr && !for_thr()) return static_cast<uint32_t>(-1);
             int fd = -1, events = 0;
             void* data = nullptr;
             const uint32_t out_fd = arg(1), out_ev = arg(2), out_data = arg(3);
@@ -11535,8 +11702,6 @@ public:
 
         std::vector<JNINativeMethod> host_methods;
         host_methods.reserve(count);
-        // host_methods[] stores persistent strdup pointers so they never move or expire
-        natives_.reserve(natives_.size() + count);
 
         for (uint32_t i = 0; i < count; ++i) {
             const uint32_t base = methods + i * 12;   // sizeof(JNINativeMethod32)
@@ -12087,6 +12252,7 @@ public:
     int guest_pointer_warnings_ = 0;
     std::unordered_map<uint32_t, void*> refs_;
     std::unordered_map<void*, uint32_t> ref_reverse_;
+    std::unordered_map<std::string, uint32_t> class_cache_;
     std::unordered_set<uint32_t> deletable_local_jrefs_;
     std::unordered_set<uint32_t> deletable_global_jrefs_;
     jobject last_thiz_gref_ = nullptr;
@@ -12099,7 +12265,7 @@ public:
     mutable std::mutex io_mtx_;
     uint32_t next_ref_ = 0x00010000;
 
-    std::vector<NativeEntry> natives_;
+    std::deque<NativeEntry> natives_;
     // Until the first frame is presented no single guest call may hold the
     // calling ART thread for longer than this.
     //
@@ -12117,20 +12283,103 @@ public:
         return 0;
     }
 
-    // A call that arrived while the guest was still inside a suspended one.
+    // Calls that arrived on the UI thread while a previous UI call was paused.
     struct Deferred {
-        bool        active = false;
         uint32_t    fn = 0;
         std::vector<uint32_t> args;
+        std::vector<uint32_t> jrefs;
         std::string name;
     };
-    Deferred deferred_;
+    std::deque<Deferred> deferred_queue_;
+    std::vector<uint32_t> pending_jrefs_;
+    jclass unicorn_bridge_cls_ = nullptr;
+    jmethodID post_pending_mid_ = nullptr;
 
     static uint64_t suspended_result(const NativeEntry& e) {
         return e.ret_type == 'Z' ? 1u : 0u;
     }
 
-    static constexpr int kMainThreadBudgetMs = 45;
+public:
+    JNIEnv* current_jni_env() const {
+        if (t_env) return t_env;
+        if (!vm_) return nullptr;
+        JNIEnv* env = nullptr;
+        if (vm_->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
+            if (vm_->AttachCurrentThread(&env, nullptr) != JNI_OK) return nullptr;
+        }
+        t_env = env;
+        return env;
+    }
+
+    void post_pending_resume() const {
+        if (!unicorn_bridge_cls_ || !post_pending_mid_) return;
+        JNIEnv* env = current_jni_env();
+        if (!env) return;
+        env->CallStaticVoidMethod(unicorn_bridge_cls_, post_pending_mid_);
+        if (env->ExceptionCheck()) env->ExceptionClear();
+    }
+
+    void pump_pending() {
+        EnvScope env_scope(t_env, vm_);
+        if (!is_ui_main_thread() || emu_mu_.held_by_current_thread()) return;
+        if (!emu_mu_.try_lock_for(kMainThreadBudgetMs)) {
+            post_pending_resume();
+            return;
+        }
+        ScopedGuestLock emu_lock(emu_mu_, std::adopt_lock);
+
+        const auto slice_start = std::chrono::steady_clock::now();
+        if (emu_.has_pending()) {
+            bool still_paused = false;
+            uint32_t resumed_ret = 0;
+            emu_.resume_pending(resumed_ret, kMainThreadBudgetMs, still_paused);
+            sync_direct_buffers_to_host();
+            if (still_paused) {
+                post_pending_resume();
+                return;
+            }
+            for (uint32_t h : pending_jrefs_) {
+                delete_guest_jobject(h, false);
+            }
+            pending_jrefs_.clear();
+        }
+        drain_deferred_queue_locked(slice_start);
+    }
+
+private:
+    bool drain_deferred_queue_locked(std::chrono::steady_clock::time_point slice_start) {
+        while (!deferred_queue_.empty()) {
+            Deferred pending_def = std::move(deferred_queue_.front());
+            deferred_queue_.pop_front();
+            uint32_t replayed = 0;
+            bool deferred_paused = false;
+            LOGI("native %s replayed after suspended call completed",
+                 pending_def.name.c_str());
+            const bool ok = emu_.call(pending_def.fn, pending_def.args, replayed,
+                                      pending_def.name.c_str(), kMainThreadBudgetMs,
+                                      &deferred_paused);
+            sync_direct_buffers_to_host();
+            if (!ok && deferred_paused) {
+                pending_jrefs_.insert(pending_jrefs_.end(),
+                                      pending_def.jrefs.begin(),
+                                      pending_def.jrefs.end());
+                post_pending_resume();
+                return false;
+            }
+            for (uint32_t h : pending_def.jrefs) {
+                delete_guest_jobject(h, false);
+            }
+            if (!deferred_queue_.empty() &&
+                (std::chrono::steady_clock::now() - slice_start) >=
+                    std::chrono::milliseconds(kMainThreadBudgetMs)) {
+                post_pending_resume();
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static constexpr int kMainThreadBudgetMs = 25;
     static constexpr int kRenderThreadBudgetMs = 1500;
     GuestMutex   emu_mu_;                             // serialises ART -> guest
     std::mutex   ui_worker_mtx_;
@@ -12820,6 +13069,13 @@ Java_com_ziauddin_zaibridge_core_UnicornBridge_nativeIsSessionActive(
     return g_session_active ? JNI_TRUE : JNI_FALSE;
 }
 
+extern "C" JNIEXPORT void JNICALL
+Java_com_ziauddin_zaibridge_core_UnicornBridge_nativePumpPending(
+        JNIEnv* /*env*/, jclass /*clazz*/) {
+    if (!g_session_active || !g_bridge) return;
+    g_bridge->pump_pending();
+}
+
 // Clean session teardown. The guest Activity is already destroyed when the
 // launcher calls this; the compositor and the Unicorn engine are released so a
 // second game can be launched in the same process with a fresh address space.
@@ -12906,9 +13162,12 @@ static void run_guest_callback_safely(const char* name, bool allow_async, std::f
         fn();
         return;
     }
-    if (mu.try_lock_for(40)) {
+    if (mu.try_lock_for(25)) {
         JniBridge::ScopedGuestLock lk(mu, std::adopt_lock);
         fn();
+        if (g_emulator && g_emulator->has_pending()) {
+            g_bridge->post_pending_resume();
+        }
         return;
     }
     if (allow_async) {
@@ -12920,7 +13179,7 @@ static void run_guest_callback_safely(const char* name, bool allow_async, std::f
             fn();
         });
     } else {
-        LOGW("UI-thread ANR guard: skipped synchronous ANativeActivity %s (>40ms contended)", name);
+        LOGW("UI-thread ANR guard: skipped synchronous ANativeActivity %s (>25ms contended)", name);
     }
 }
 
@@ -12929,7 +13188,7 @@ static void host_fwd_void(uint32_t cb, const char* name) {
     run_guest_callback_safely(name, true, [cb, name]() {
         if (!g_emulator) return;
         uint32_t r = 0;
-        const int budget = JniBridge::is_ui_main_thread() ? 45 : 0;
+        const int budget = JniBridge::is_ui_main_thread() ? 25 : 0;
         g_emulator->call(cb, {g_shadow_activity_addr}, r, name, budget);
     });
 }
@@ -12960,7 +13219,7 @@ static void hc_onDestroy(ANativeActivity* activity) {
     run_guest_callback_safely("NA onDestroy", false, []() {
         if (!g_emulator) return;
         uint32_t r = 0;
-        g_emulator->call(g_guest_onDestroy, {g_shadow_activity_addr}, r, "NA onDestroy", 45);
+        g_emulator->call(g_guest_onDestroy, {g_shadow_activity_addr}, r, "NA onDestroy", 25);
     });
 }
 
@@ -12972,7 +13231,7 @@ static void hc_onWindowFocusChanged(ANativeActivity* activity, int hasFocus) {
         uint32_t r = 0;
         g_emulator->call(g_guest_onWindowFocusChanged,
                          {g_shadow_activity_addr, static_cast<uint32_t>(hasFocus)},
-                         r, "NA onWindowFocusChanged", 45);
+                         r, "NA onWindowFocusChanged", 25);
     });
 }
 
@@ -12983,8 +13242,8 @@ static void* hc_onSaveInstanceState(ANativeActivity* activity, size_t* outLen) {
 
     GuestMutex& mu = g_bridge->emu_mutex();
     if (JniBridge::is_ui_main_thread() && !mu.held_by_current_thread()) {
-        if (!mu.try_lock_for(40)) {
-            LOGW("UI-thread ANR guard: skipped hc_onSaveInstanceState (>40ms contended)");
+        if (!mu.try_lock_for(25)) {
+            LOGW("UI-thread ANR guard: skipped hc_onSaveInstanceState (>25ms contended)");
             return nullptr;
         }
     } else {
@@ -12999,7 +13258,7 @@ static void* hc_onSaveInstanceState(ANativeActivity* activity, size_t* outLen) {
     uint32_t guest_buf = 0;
     g_emulator->call(g_guest_onSaveInstanceState,
                      {g_shadow_activity_addr, guest_len_ptr},
-                     guest_buf, "NA onSaveInstanceState", 45);
+                     guest_buf, "NA onSaveInstanceState", 25);
 
     uint32_t len = g_emulator->read_u32(guest_len_ptr);
     g_emulator->release(guest_len_ptr, 4);
@@ -13034,7 +13293,7 @@ static void hc_onNativeWindowCreated(ANativeActivity* activity, ANativeWindow* w
         if (!g_emulator || !g_bridge) return;
         const uint32_t gw = g_bridge->to_guest_ref(window);
         uint32_t r = 0;
-        const int budget = JniBridge::is_ui_main_thread() ? 45 : 0;
+        const int budget = JniBridge::is_ui_main_thread() ? 25 : 0;
         g_emulator->call(g_guest_onNativeWindowCreated, {g_shadow_activity_addr, gw}, r, "NA onNativeWindowCreated", budget);
     });
 }
@@ -13046,7 +13305,7 @@ static void hc_onNativeWindowResized(ANativeActivity* activity, ANativeWindow* w
         if (!g_emulator || !g_bridge) return;
         const uint32_t gw = g_bridge->to_guest_ref(window);
         uint32_t r = 0;
-        const int budget = JniBridge::is_ui_main_thread() ? 45 : 0;
+        const int budget = JniBridge::is_ui_main_thread() ? 25 : 0;
         g_emulator->call(g_guest_onNativeWindowResized, {g_shadow_activity_addr, gw}, r, "NA onNativeWindowResized", budget);
     });
 }
@@ -13058,7 +13317,7 @@ static void hc_onNativeWindowRedrawNeeded(ANativeActivity* activity, ANativeWind
         if (!g_emulator || !g_bridge) return;
         const uint32_t gw = g_bridge->to_guest_ref(window);
         uint32_t r = 0;
-        const int budget = JniBridge::is_ui_main_thread() ? 45 : 0;
+        const int budget = JniBridge::is_ui_main_thread() ? 25 : 0;
         g_emulator->call(g_guest_onNativeWindowRedrawNeeded, {g_shadow_activity_addr, gw}, r, "NA onNativeWindowRedrawNeeded", budget);
     });
 }
@@ -13070,7 +13329,7 @@ static void hc_onNativeWindowDestroyed(ANativeActivity* activity, ANativeWindow*
             if (!g_emulator || !g_bridge) return;
             const uint32_t gw = g_bridge->to_guest_ref(window);
             uint32_t r = 0;
-            g_emulator->call(g_guest_onNativeWindowDestroyed, {g_shadow_activity_addr, gw}, r, "NA onNativeWindowDestroyed", 45);
+            g_emulator->call(g_guest_onNativeWindowDestroyed, {g_shadow_activity_addr, gw}, r, "NA onNativeWindowDestroyed", 25);
         });
     }
     if (g_bridge) g_bridge->set_host_window(nullptr);
@@ -13079,12 +13338,20 @@ static void hc_onNativeWindowDestroyed(ANativeActivity* activity, ANativeWindow*
 
 static void hc_onInputQueueCreated(ANativeActivity* activity, AInputQueue* queue) {
     (void)activity;
-    if (!g_guest_onInputQueueCreated || !g_emulator || !g_bridge) return;
-    run_guest_callback_safely("NA onInputQueueCreated", true, [queue]() {
-        if (!g_emulator || !g_bridge) return;
+    if (!g_emulator || !g_bridge) return;
+    if (!g_guest_onInputQueueCreated) {
+        LOGI("NA onInputQueueCreated(%p): no guest handler installed", queue);
+        return;
+    }
+    LOGI("NA onInputQueueCreated(%p) -> guest callback @0x%08x",
+         queue, g_guest_onInputQueueCreated);
+    g_bridge->enqueue_ui_task([queue]() {
+        if (!g_emulator || !g_bridge || !g_guest_onInputQueueCreated) return;
+        JniBridge::ScopedGuestLock lk(g_bridge->emu_mutex());
         const uint32_t gq = g_bridge->to_guest_ref(queue);
         uint32_t r = 0;
-        g_emulator->call(g_guest_onInputQueueCreated, {g_shadow_activity_addr, gq}, r, "NA onInputQueueCreated", 45);
+        g_emulator->call(g_guest_onInputQueueCreated, {g_shadow_activity_addr, gq},
+                         r, "NA onInputQueueCreated", 0);
     });
 }
 
@@ -13095,7 +13362,7 @@ static void hc_onInputQueueDestroyed(ANativeActivity* activity, AInputQueue* que
         if (!g_emulator || !g_bridge) return;
         const uint32_t gq = g_bridge->to_guest_ref(queue);
         uint32_t r = 0;
-        g_emulator->call(g_guest_onInputQueueDestroyed, {g_shadow_activity_addr, gq}, r, "NA onInputQueueDestroyed", 45);
+        g_emulator->call(g_guest_onInputQueueDestroyed, {g_shadow_activity_addr, gq}, r, "NA onInputQueueDestroyed", 25);
     });
 }
 
@@ -13115,7 +13382,7 @@ static void hc_onContentRectChanged(ANativeActivity* activity, const ARect* rect
             }
         }
         uint32_t r = 0;
-        g_emulator->call(g_guest_onContentRectChanged, {g_shadow_activity_addr, guest_rect}, r, "NA onContentRectChanged", 45);
+        g_emulator->call(g_guest_onContentRectChanged, {g_shadow_activity_addr, guest_rect}, r, "NA onContentRectChanged", 25);
         if (guest_rect) {
             g_emulator->release(guest_rect, sizeof(ARect));
         }
@@ -13279,8 +13546,11 @@ static void ANativeActivity_onCreate_impl(ANativeActivity* activity, void* saved
     g_emulator->read(shadow, &sa_updated, sizeof(sa_updated));
     activity->instance = g_bridge->from_guest_ref(sa_updated.instance);
 
-    LOGI("ANativeActivity struct bridge installed: onStart=0x%08x onResume=0x%08x onWindowCreated=0x%08x instance=%p",
-         c32.onStart, c32.onResume, c32.onNativeWindowCreated, activity->instance);
+    LOGI("ANativeActivity struct bridge installed: onStart=0x%08x onResume=0x%08x "
+         "onWindowCreated=0x%08x onInputQueueCreated=0x%08x onInputQueueDestroyed=0x%08x "
+         "guestInstance=0x%08x",
+         c32.onStart, c32.onResume, c32.onNativeWindowCreated,
+         c32.onInputQueueCreated, c32.onInputQueueDestroyed, sa_updated.instance);
 }
 
 // Exported entry points for NativeActivity and game engines
@@ -13382,7 +13652,7 @@ Java_com_unity3d_player_NativeLoader_load(JNIEnv* env, jclass clazz, jstring lib
             const uint32_t onload = JniBridge::export_of(lib, "JNI_OnLoad");
             if (onload) {
                 uint32_t ret = 0;
-                g_bridge->call_onload(onload, ret, /*force=*/true);
+                g_bridge->call_onload(onload, ret, /*force=*/false);
             }
         }
     }

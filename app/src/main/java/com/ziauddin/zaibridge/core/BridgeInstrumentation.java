@@ -15,25 +15,13 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 
 /**
- * The Activity virtualization hook.
+ * Activity virtualization hook installed exclusively inside the isolated {@code :guest} process.
  *
- * <p>Replaces {@code ActivityThread.mInstrumentation} with this subclass. The
- * framework does all the heavy lifting — it builds the window, decor view,
- * fragment controller, input channel and token in {@code
- * ActivityThread.performLaunchActivity} with this instrument's return value —
- * and the bridge only has to answer two questions:
- *
- * <ul>
- *   <li>{@link #newActivity}: which class should be attached to the proxy's
- *       {@code ActivityClientRecord}? For a bridge launch, the guest Activity
- *       from the game's own {@code DexClassLoader}.</li>
- *   <li>{@link #callActivityOnCreate}: what context should that Activity see
- *       before its {@code onCreate} runs?</li>
- * </ul>
- *
- * <p>Because the guest instance is a normal framework Activity, touch, key,
- * sensor, lifecycle and configuration dispatch all reach it through the real
- * window; nothing is re-implemented here.
+ * <p>On initial launch of {@link ProxyGameActivity} (before async bootstrap finishes),
+ * {@link #newActivity} intentionally returns {@code ProxyGameActivity} itself in &lt; 1 ms
+ * so Android transitions immediately into a non-blocking dark splash without stalling
+ * the main thread. Once {@link GuestLauncher#EXTRA_BOOTSTRAP_READY} is set,
+ * {@link #newActivity} instantiates the already-prepared guest {@link Activity}.
  */
 public final class BridgeInstrumentation extends Instrumentation {
 
@@ -41,11 +29,6 @@ public final class BridgeInstrumentation extends Instrumentation {
 
     private final Instrumentation delegate;
 
-    /**
-     * Activities this hook created from a guest dex. Only these get the guest
-     * context and the bridge probing: the launcher's own Activities go through
-     * {@link #callActivityOnCreate} too and must keep their real base context.
-     */
     private static final java.util.Set<Activity> GUESTS =
             java.util.Collections.newSetFromMap(new java.util.WeakHashMap<Activity, Boolean>());
 
@@ -57,10 +40,6 @@ public final class BridgeInstrumentation extends Instrumentation {
         return activity != null && GUESTS.contains(activity);
     }
 
-    /**
-     * Installs the hook. Called from {@code Application.attachBaseContext}, i.e.
-     * before the launcher Activity is created.
-     */
     public static boolean install(Context ctx) {
         try {
             Class<?> threadClass = Class.forName("android.app.ActivityThread");
@@ -101,15 +80,12 @@ public final class BridgeInstrumentation extends Instrumentation {
         }
     }
 
-    // ------------------------------------------------------------------
-    // Guest instantiation
-    // ------------------------------------------------------------------
-
     @Override
     public Activity newActivity(ClassLoader cl, String className, Intent intent)
             throws ClassNotFoundException, IllegalAccessException,
             InstantiationException {
-        if (ProxyGameActivity.class.getName().equals(className)) {
+        if (ProxyGameActivity.class.getName().equals(className)
+                && GuestLauncher.shouldInstantiateGuest(intent)) {
             Context ctx = BridgeApplication.get();
             if (ctx == null) {
                 ctx = getTargetContext();
@@ -149,32 +125,19 @@ public final class BridgeInstrumentation extends Instrumentation {
                     + "appWrapped=" + (appRes instanceof GuestResourcesWrapper)
                     + " (" + (appRes != null ? appRes.getClass().getSimpleName() : "null") + ")");
 
-            // Before performCreate: the guest's onCreate may inflate the very
-            // SurfaceView whose dimensions a late rotation would invalidate.
             GuestLauncher.applyGuestOrientation(activity);
         }
         super.callActivityOnCreate(activity, icicle);
         if (ctx != null && guest) {
             GuestLauncher.reassertGuestResources(activity);
-            // A guest that probed the display size in onCreate saw the pre-rotation
-            // orientation and may have asked for it. The imported manifest wins.
             GuestLauncher.confirmGuestOrientation(activity);
-            // The guest inflated its view tree during onCreate; the surface can
-            // be handed to the core from the next layout pass onwards.
+            GuestLauncher.releaseInputQueueIfViewHosted(activity);
             GuestLauncher.hookSurface(activity);
             GuestLauncher.probeInput(activity);
             GuestLauncher.attachOverlayAndRefreshHooks(activity, ctx);
         }
     }
 
-    // ------------------------------------------------------------------
-    // Multi-Activity guest apps
-    // ------------------------------------------------------------------
-
-    /**
-     * Rewrites a guest's {@code startActivity} into another launch of the
-     * proxy, carrying the new target class in {@code GUEST_ACTIVITY_CLASS}.
-     */
     public Instrumentation.ActivityResult execStartActivity(
             Context who, IBinder contextThread, IBinder token, Activity target,
             Intent intent, int requestCode, Bundle options) {
@@ -195,11 +158,6 @@ public final class BridgeInstrumentation extends Instrumentation {
         }
     }
 
-    /**
-     * Handles non-Activity {@code Context.startActivity} calls (e.g. from
-     * {@code GuestApplication} or {@code GuestContext}) where Android invokes the
-     * {@code String target} hidden overload.
-     */
     public Instrumentation.ActivityResult execStartActivity(
             Context who, IBinder contextThread, IBinder token, String target,
             Intent intent, int requestCode, Bundle options) {
@@ -220,10 +178,6 @@ public final class BridgeInstrumentation extends Instrumentation {
         }
     }
 
-    /**
-     * @return a copy of {@code intent} that launches ProxyGameActivity for the
-     *         requested class, or null when the intent should be left alone.
-     */
     private static Intent rewriteGuestIntent(Activity target, Context who, Intent intent) {
         if (intent == null) return null;
         final String pkg = GuestLauncher.getGuestPackage();
@@ -251,21 +205,16 @@ public final class BridgeInstrumentation extends Instrumentation {
         }
         String targetClass = BinaryXmlManifestReader.normalizeClassName(pkg, rawClass);
 
-        Intent out = new Intent(intent);   // preserves every extra and flag
+        Intent out = new Intent(intent);
         out.setComponent(new ComponentName(host.getPackageName(),
                 ProxyGameActivity.class.getName()));
         out.putExtra(GuestLauncher.EXTRA_GAME_DIR, dir);
         out.putExtra(GuestLauncher.EXTRA_GUEST_ACTIVITY, targetClass);
+        out.putExtra(GuestLauncher.EXTRA_BOOTSTRAP_READY, true);
         Log.i(TAG, "execStartActivity: " + component.flattenToShortString()
                 + " -> ProxyGameActivity (guest class=" + targetClass + ")");
         return out;
     }
-
-    // ------------------------------------------------------------------
-    // Lifecycle / input: the framework dispatches these itself. The guest is a
-    // real Activity, so there is nothing to forward. The overrides below only
-    // add logging at the boundary, which is what the logcat verification reads.
-    // ------------------------------------------------------------------
 
     @Override
     public void callActivityOnPostCreate(Activity activity, Bundle savedInstanceState) {

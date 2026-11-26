@@ -71,8 +71,9 @@ public final class GuestActivityHost {
             guest = (Activity) ctor.newInstance();
 
             boolean isNative64 = GuestLauncher.isNative64Game(null, gameDir);
-            GuestContext guestContext = new GuestContext(
-                    host, gameDir, guestPackage, launcherActivity, isNative64, loader);
+            GuestContext guestContext = GuestLauncher.getOrCreateGuestContext(
+                    host.getApplicationContext(), gameDir, guestPackage, launcherActivity,
+                    isNative64, loader);
 
             GuestLauncher.injectGuestResourcesMultiLayer(guest, guestContext, host);
 
@@ -222,6 +223,30 @@ public final class GuestActivityHost {
     public void onWindowFocusChanged(boolean hasFocus) {
         invoke("onWindowFocusChanged", new Class<?>[]{boolean.class},
                 new Object[]{hasFocus});
+    }
+
+    public void onConfigurationChanged(android.content.res.Configuration newConfig) {
+        invoke("onConfigurationChanged",
+                new Class<?>[]{android.content.res.Configuration.class},
+                new Object[]{newConfig});
+    }
+
+    public boolean dispatchKeyEvent(android.view.KeyEvent event) {
+        if (guest == null || !attached || event == null) return false;
+        try {
+            return guest.dispatchKeyEvent(event);
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    public boolean dispatchTouchEvent(android.view.MotionEvent event) {
+        if (guest == null || !attached || event == null) return false;
+        try {
+            return guest.dispatchTouchEvent(event);
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     private void invoke(String method, Class<?>[] signature, Object[] args) {

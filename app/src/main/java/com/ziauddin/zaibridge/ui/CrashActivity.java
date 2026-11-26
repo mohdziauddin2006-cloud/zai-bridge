@@ -57,7 +57,7 @@ public class CrashActivity extends AppCompatActivity {
         }
 
         final String bodyText = crashInfo != null ? crashInfo : errorMessage;
-        final String baseDeviceHeader = "Zai-Bridge v3.2.0 · Android " + Build.VERSION.RELEASE
+        final String baseDeviceHeader = "Zai-Bridge v4.0.0 · Android " + Build.VERSION.RELEASE
                 + " (API " + Build.VERSION.SDK_INT + ")\n"
                 + "Device: " + Build.MANUFACTURER + " " + Build.MODEL + " (" + Build.DEVICE + ")\n"
                 + "ABI: " + (Build.SUPPORTED_ABIS.length > 0 ? Build.SUPPORTED_ABIS[0] : "unknown");

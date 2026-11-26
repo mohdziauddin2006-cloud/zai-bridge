@@ -98,6 +98,7 @@
         -->
         <activity
             android:name=".proxy.ProxyGameActivity"
+            android:process=":guest"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation|uiMode|density|fontScale|locale|layoutDirection|touchscreen"
             android:exported="false"
             android:hardwareAccelerated="true"
@@ -113,7 +114,8 @@
         -->
         <activity
             android:name=".GameHostActivity"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode|density"
+            android:process=":guest"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation|uiMode|density|fontScale|locale|layoutDirection|touchscreen"
             android:exported="false"
             android:hardwareAccelerated="true"
             android:launchMode="singleTask"

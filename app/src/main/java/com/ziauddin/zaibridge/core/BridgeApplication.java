@@ -2,21 +2,25 @@ package com.ziauddin.zaibridge.core;
 
 import android.app.Application;
 import android.content.Context;
+import android.os.Build;
 import android.util.Log;
+
+import java.io.FileInputStream;
+import java.nio.charset.StandardCharsets;
 
 /**
  * Process entry point.
  *
- * <p>{@code attachBaseContext} is kept completely lightweight, fast, and crash-proof.
- * No native libraries are loaded, no internal hidden API reflections are forced,
- * and no framework instrumentation is mutated here.
- *
- * <p>All heavy hooks and translations are deferred to {@link BridgeRuntime#ensureInitialized(Context)},
- * which is called defensively only when a guest game is actually launched.
+ * <p>{@code attachBaseContext} stays lightweight and fast in the main launcher
+ * process (`MainActivity`, `CrashActivity`, `IngestionService`). Only when
+ * executing inside the isolated `:guest` container process are hidden-API
+ * exemptions and {@link BridgeInstrumentation} installed, keeping the launcher
+ * UI 100% immune to guest freezes, crashes, or {@code ActivityThread} mutation.
  */
 public class BridgeApplication extends Application {
 
     private static final String TAG = "ZaiBridge";
+    public static final String GUEST_PROCESS_SUFFIX = ":guest";
 
     private static Context instance;
 
@@ -24,15 +28,49 @@ public class BridgeApplication extends Application {
         return instance;
     }
 
+    public static String getCurrentProcessName(Context context) {
+        if (Build.VERSION.SDK_INT >= 28) {
+            try {
+                String name = Application.getProcessName();
+                if (name != null && !name.isEmpty()) return name;
+            } catch (Throwable ignored) {
+            }
+        }
+        try (FileInputStream fis = new FileInputStream("/proc/self/cmdline")) {
+            byte[] buf = new byte[128];
+            int n = fis.read(buf);
+            if (n > 0) {
+                int len = 0;
+                while (len < n && buf[len] != 0) len++;
+                if (len > 0) {
+                    return new String(buf, 0, len, StandardCharsets.UTF_8).trim();
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return context != null ? context.getPackageName() : "";
+    }
+
+    public static boolean isGuestProcess(Context context) {
+        String proc = getCurrentProcessName(context);
+        return proc != null && proc.endsWith(GUEST_PROCESS_SUFFIX);
+    }
+
     @Override
     protected void attachBaseContext(Context base) {
         super.attachBaseContext(base);
         instance = base;
 
-        // 1. Install Crash Guard immediately to protect against any unexpected
-        //    Java or JNI aborts across all OEM variants (Android 8–16).
+        // Install CrashGuard in all processes so `:guest` crashes route cleanly
+        // to CrashActivity running in the main launcher process.
         CrashGuard.install(base);
 
-        Log.i(TAG, "BridgeApplication initialized cleanly; native hooks decoupled from startup.");
+        if (isGuestProcess(base)) {
+            HiddenApi.exemptAll();
+            boolean inst = BridgeInstrumentation.install(base);
+            Log.i(TAG, "BridgeApplication(:guest) attached; instrumentation=" + inst);
+        } else {
+            Log.i(TAG, "BridgeApplication(main) initialized cleanly; launcher process isolated.");
+        }
     }
 }

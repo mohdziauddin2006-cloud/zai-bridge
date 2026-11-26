@@ -1,11 +1,16 @@
 package com.ziauddin.zaibridge.core;
 
 import android.app.Activity;
+import android.app.Application;
+import android.content.ContentProvider;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.ProviderInfo;
+import android.graphics.Color;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.Process;
 import android.util.Log;
 import android.view.Display;
 import android.view.Surface;
@@ -24,7 +29,13 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.reflect.Method;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.IdentityHashMap;
+import java.util.List;
+import java.util.Set;
+import java.util.WeakHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.zip.ZipEntry;
@@ -32,20 +43,11 @@ import java.util.zip.ZipFile;
 import java.util.zip.ZipInputStream;
 
 /**
- * Bridge between the framework-launched proxy Activity and the imported game.
+ * Bridge between the `:guest` proxy Activity and the imported game.
  *
- * <p>Supports two execution modes seamlessly:
- * <ul>
- *   <li><b>{@code native64} (Installed 64-bit / Split-APK games):</b> combines
- *       {@code game.apk} + {@code splits/*.apk} into the DEX classpath, points
- *       the native library search path directly at {@code native64/}, skips
- *       Unicorn CPU translation completely, and hooks EGL/GLES/Vulkan symbols
- *       via {@link EglSwapHook#refreshNativeHooks()} for Zai-Scale Ultra
- *       upscaling, DLSS-5/FSR shaders, and Unlimited Multi-Frame Generation.</li>
- *   <li><b>{@code unicorn32} (Legacy 32-bit ARM games):</b> opens the Unicorn
- *       ARM32-to-ARM64 translation session before loading guest classes so
- *       static {@code System.loadLibrary} initialisers resolve cleanly.</li>
- * </ul>
+ * <p>All heavy bootstrap work (assets unpack, `DexClassLoader`, manifest/resource binding,
+ * native `libwrapper.so` load, and Unicorn ARM32 ELF/constructor execution) executes strictly
+ * off the Main UI Thread in {@link #bootstrapOffUiThread}.
  */
 public final class GuestLauncher {
 
@@ -55,8 +57,17 @@ public final class GuestLauncher {
     public static final String EXTRA_GAME_LABEL = "com.ziauddin.zaibridge.extra.GAME_LABEL";
     public static final String EXTRA_GUEST_ACTIVITY =
             "com.ziauddin.zaibridge.extra.GUEST_ACTIVITY_CLASS";
+    public static final String EXTRA_GAME_PACKAGE =
+            "com.ziauddin.zaibridge.extra.GAME_PACKAGE";
+    public static final String EXTRA_IS_NATIVE64 =
+            "com.ziauddin.zaibridge.extra.IS_NATIVE64";
+    public static final String EXTRA_BOOTSTRAP_READY =
+            "com.ziauddin.zaibridge.extra.BOOTSTRAP_READY";
 
-    /** One session per process; a second game replaces the current one. */
+    public interface StatusListener {
+        void onStatus(String message);
+    }
+
     private static volatile String sessionGameDir;
     private static volatile ClassLoader guestLoader;
     private static volatile File guestLoaderDir;
@@ -68,6 +79,9 @@ public final class GuestLauncher {
     private static volatile GuestContext cachedGuestContext;
     private static volatile File cachedGuestContextDir;
     private static volatile String cachedGuestContextActivity;
+    private static volatile String bootstrapPreparedDir;
+    private static volatile boolean providersAndAppInitialized;
+    private static volatile File initializedAppGameDir;
     private static volatile String lastLaunchError;
 
     private static final ExecutorService SURFACE_QUEUE = Executors.newSingleThreadExecutor(r -> {
@@ -103,9 +117,264 @@ public final class GuestLauncher {
         lastLaunchError = sb.toString();
     }
 
-    // ------------------------------------------------------------------
-    // Framework path (called from BridgeInstrumentation)
-    // ------------------------------------------------------------------
+    public static boolean shouldInstantiateGuest(Intent intent) {
+        if (intent == null) return false;
+        if (!intent.getBooleanExtra(EXTRA_BOOTSTRAP_READY, false)) {
+            return false;
+        }
+        String dir = intent.getStringExtra(EXTRA_GAME_DIR);
+        return dir != null && dir.equals(bootstrapPreparedDir);
+    }
+
+    public static boolean isBootstrapPreparedFor(String dir) {
+        return dir != null && dir.equals(bootstrapPreparedDir);
+    }
+
+    public static synchronized void invalidateBootstrap() {
+        bootstrapPreparedDir = null;
+        providersAndAppInitialized = false;
+        initializedAppGameDir = null;
+        cachedGuestContext = null;
+        cachedGuestContextDir = null;
+        cachedGuestContextActivity = null;
+    }
+
+    /**
+     * Exits the current guest cleanly and reaps the isolated `:guest` OS process
+     * so every subsequent game starts with a 100% clean ART ClassLoader, EGL state,
+     * and native memory space without affecting {@code MainActivity}.
+     */
+    public static void exitGuestProcess(Activity activity) {
+        try {
+            if (activity != null && !activity.isFinishing()) {
+                activity.finish();
+            }
+        } catch (Throwable ignored) {
+        }
+        final Context appCtx = activity != null
+                ? activity.getApplicationContext()
+                : BridgeApplication.get();
+        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+            SURFACE_QUEUE.execute(() -> {
+                try {
+                    UnicornBridge.setSurface(null);
+                    UnicornBridge.endSession();
+                } catch (Throwable ignored) {
+                }
+                if (appCtx != null && BridgeApplication.isGuestProcess(appCtx)) {
+                    Process.killProcess(Process.myPid());
+                    System.exit(0);
+                }
+            });
+        }, 180);
+    }
+
+    /**
+     * Runs all heavy game preparation off Android's Main UI Thread inside `:guest`.
+     * Never blocks UI input dispatch or rotation.
+     */
+    public static boolean bootstrapOffUiThread(
+            Context ctx, Intent intent, StatusListener listener) {
+        clearLastLaunchError();
+        if (ctx == null || intent == null) {
+            recordLaunchError("Missing context or launch Intent during guest bootstrap", null);
+            return false;
+        }
+        final Context appCtx = ctx.getApplicationContext();
+        final String dir = intent.getStringExtra(EXTRA_GAME_DIR);
+        if (dir == null || dir.isEmpty()) {
+            recordLaunchError("Launch invoked without EXTRA_GAME_DIR", null);
+            return false;
+        }
+        final File gameDir = new File(dir);
+        final File apk = new File(gameDir, "game.apk");
+        if (!apk.isFile()) {
+            recordLaunchError("Incomplete import: missing base game.apk at " + apk.getAbsolutePath(), null);
+            return false;
+        }
+
+        try {
+            notifyStatus(listener, "Initializing container hooks…");
+            BridgeRuntime.ensureInitialized(appCtx);
+
+            Game game = GameRepository.load(gameDir);
+            String pkg = intent.getStringExtra(EXTRA_GAME_PACKAGE);
+            if ((pkg == null || pkg.isEmpty()) && game != null) pkg = game.packageName;
+            if (pkg == null || pkg.isEmpty()) pkg = gameDir.getName();
+
+            final boolean isNative64 = isNative64Game(game, gameDir)
+                    || intent.getBooleanExtra(EXTRA_IS_NATIVE64, false);
+
+            notifyStatus(listener, "Loading manifest & split-APK resources…");
+            List<File> splitFiles = GuestContext.collectStagedSplitApks(gameDir);
+            java.util.ArrayList<String> splitPaths = new java.util.ArrayList<>();
+            for (File f : splitFiles) splitPaths.add(f.getAbsolutePath());
+
+            BinaryXmlManifestReader.ParsedManifest manifest =
+                    BinaryXmlManifestReader.readFromApk(apk.getAbsolutePath(), splitPaths, null);
+
+            String cls = intent.getStringExtra(EXTRA_GUEST_ACTIVITY);
+            if ((cls == null || cls.isEmpty()) && game != null) cls = game.launcherActivity;
+            if (cls == null || cls.isEmpty()) cls = manifest.launcherActivity;
+            cls = BinaryXmlManifestReader.normalizeClassName(pkg, cls);
+            cls = manifest.resolveActivityTarget(cls);
+
+            if (cls.isEmpty()) {
+                recordLaunchError("Guest AndroidManifest.xml declares no launchable Activity (" + pkg + ")", null);
+                return false;
+            }
+
+            guestGameDir = gameDir;
+            guestPackage = pkg;
+            guestClass = cls;
+            guestNative64 = isNative64;
+
+            EglSwapHook.install();
+            EglSwapHook.configure(GraphicsSettings.forGame(appCtx, gameDir));
+
+            if (!isNative64) {
+                notifyStatus(listener, "Staging guest runtime assets…");
+                unpackBundledAssets(apk, gameDir);
+            }
+
+            notifyStatus(listener, "Building guest ClassLoader…");
+            ClassLoader loader = ensureGuestLoader(appCtx, gameDir, pkg, isNative64);
+            Thread.currentThread().setContextClassLoader(loader);
+
+            getOrCreateGuestContext(appCtx, gameDir, pkg, cls, isNative64, loader);
+
+            if (isNative64) {
+                if (UnicornBridge.isSessionActive()) {
+                    UnicornBridge.endSession();
+                    sessionGameDir = null;
+                }
+                EglSwapHook.refreshNativeHooks();
+            } else {
+                boolean hasPayload = hasNativePayload(new File(gameDir, "payload"));
+                if (hasPayload) {
+                    notifyStatus(listener, "Starting ARM32 translation core…");
+                    openNativeSession(appCtx, gameDir, game, pkg, loader);
+                }
+            }
+
+            if (!gameDir.equals(initializedAppGameDir)) {
+                providersAndAppInitialized = false;
+            }
+            bootstrapPreparedDir = gameDir.getAbsolutePath();
+            return true;
+        } catch (Throwable t) {
+            Log.e(TAG, "Guest async bootstrap failed", t);
+            recordLaunchError("Guest bootstrap failed: " + t.getClass().getSimpleName()
+                    + ": " + t.getMessage(), t);
+            return false;
+        }
+    }
+
+    private static void notifyStatus(StatusListener listener, String msg) {
+        if (listener != null && msg != null) {
+            listener.onStatus(msg);
+        }
+    }
+
+    /**
+     * Safely initializes guest manifest {@link ContentProvider}s (such as
+     * {@code InitializationProvider}, {@code FirebaseInitProvider}, {@code FileProvider})
+     * and any declared guest {@link Application} subclass inside `:guest`'s Main Thread
+     * before the guest {@link Activity} is created.
+     */
+    public static synchronized void ensureGuestProvidersAndApplication(Context hostCtx) {
+        final File dir = guestGameDir;
+        if (dir == null || (providersAndAppInitialized && dir.equals(initializedAppGameDir))) {
+            return;
+        }
+        providersAndAppInitialized = true;
+        initializedAppGameDir = dir;
+
+        final GuestContext gc = cachedGuestContext;
+        final ClassLoader loader = guestLoader;
+        if (gc == null || loader == null) return;
+
+        final ClassLoader prevTccl = Thread.currentThread().getContextClassLoader();
+        Thread.currentThread().setContextClassLoader(loader);
+        try {
+            // Inject guest Resources onto the :guest Application/LoadedApk first so any
+            // SDK reading resources during ContentProvider.onCreate() / Application.onCreate()
+            // sees GuestResourcesWrapper.
+            injectContextChainResources(
+                    gc.getGuestApplication(),
+                    gc.getResources(),
+                    true,
+                    Collections.newSetFromMap(new IdentityHashMap<>()));
+
+            String declaredApp = gc.getDeclaredApplicationClass();
+            Application appTarget = gc.getGuestApplication();
+            if (declaredApp != null && !declaredApp.isEmpty()
+                    && !"android.app.Application".equals(declaredApp)
+                    && !GuestApplication.class.getName().equals(declaredApp)) {
+                try {
+                    Class<?> appCls = Class.forName(declaredApp, true, loader);
+                    if (Application.class.isAssignableFrom(appCls)) {
+                        Application custom = (Application) appCls.getDeclaredConstructor().newInstance();
+                        attachCustomApplication(custom, gc);
+                        gc.setCustomGuestApplication(custom);
+                        appTarget = custom;
+                        Log.i(TAG, "instantiated guest Application subclass: " + declaredApp);
+                    }
+                } catch (Throwable t) {
+                    Log.w(TAG, "guest Application instantiation skipped (" + declaredApp + "): " + t);
+                }
+            }
+
+            List<ProviderInfo> providers = gc.getGuestProviders();
+            if (providers != null && !providers.isEmpty()) {
+                for (ProviderInfo pi : providers) {
+                    if (pi == null || pi.name == null || pi.name.isEmpty() || !pi.enabled) continue;
+                    // Skip providers pinned to remote processes other than main/default.
+                    if (pi.processName != null && !pi.processName.isEmpty()
+                            && pi.processName.contains(":")
+                            && !pi.processName.endsWith(":guest")) {
+                        continue;
+                    }
+                    try {
+                        Class<?> pCls = Class.forName(pi.name, true, loader);
+                        if (!ContentProvider.class.isAssignableFrom(pCls)) continue;
+                        ContentProvider cp = (ContentProvider) pCls.getDeclaredConstructor().newInstance();
+                        ProviderInfo piCopy = new ProviderInfo(pi);
+                        cp.attachInfo(appTarget, piCopy);
+                        Log.i(TAG, "initialized guest ContentProvider: " + pi.name);
+                    } catch (Throwable t) {
+                        Log.w(TAG, "guest ContentProvider init guarded (" + pi.name + "): " + t.getMessage());
+                    }
+                }
+            }
+
+            if (appTarget != gc.getGuestApplication()) {
+                try {
+                    appTarget.onCreate();
+                    Log.i(TAG, "guest Application.onCreate() completed");
+                } catch (Throwable t) {
+                    Log.w(TAG, "guest Application.onCreate() guarded: " + t.getMessage());
+                }
+            }
+        } finally {
+            Thread.currentThread().setContextClassLoader(prevTccl);
+        }
+    }
+
+    private static void attachCustomApplication(Application custom, GuestContext gc) {
+        try {
+            Method attach = Application.class.getDeclaredMethod("attach", Context.class);
+            attach.setAccessible(true);
+            attach.invoke(custom, gc);
+        } catch (Throwable ignored) {
+            setFieldQuiet(android.content.ContextWrapper.class, custom, "mBase", gc);
+        }
+        injectContextChainResources(
+                custom,
+                gc.getResources(),
+                false,
+                Collections.newSetFromMap(new IdentityHashMap<>()));
+    }
 
     public static Activity createGuest(Context ctx, Intent intent) {
         clearLastLaunchError();
@@ -127,70 +396,24 @@ public final class GuestLauncher {
         }
 
         try {
-            Game game = GameRepository.load(gameDir);
-            final String pkg = game != null && game.packageName != null && !game.packageName.isEmpty()
-                    ? game.packageName : gameDir.getName();
-
-            BinaryXmlManifestReader.ParsedManifest manifest =
-                    BinaryXmlManifestReader.readFromApk(apk.getAbsolutePath());
-
-            String name = intent.getStringExtra(EXTRA_GUEST_ACTIVITY);
-            if (name == null || name.isEmpty()) {
-                name = game != null && game.launcherActivity != null
-                        ? game.launcherActivity : "";
+            if (!dir.equals(bootstrapPreparedDir)) {
+                bootstrapOffUiThread(ctx, intent, null);
             }
-            if (name.isEmpty()) {
-                name = manifest.launcherActivity;
+            if (getLastLaunchError() != null) {
+                return null;
             }
-            name = BinaryXmlManifestReader.normalizeClassName(pkg, name);
-            name = manifest.resolveActivityTarget(name);
+            ensureGuestProvidersAndApplication(ctx);
 
-            if (name.isEmpty()) {
-                String msg = "Guest AndroidManifest.xml declares no launchable Activity (" + pkg + ")";
-                Log.e(TAG, msg);
-                recordLaunchError(msg, null);
+            final String pkg = guestPackage != null ? guestPackage : gameDir.getName();
+            final String name = guestClass != null ? guestClass : "";
+            final boolean isNative64 = guestNative64;
+            final ClassLoader loader = guestLoader;
+            if (name.isEmpty() || loader == null) {
+                recordLaunchError("Guest class/loader unavailable for " + pkg, null);
                 return null;
             }
 
-            final boolean isNative64 = isNative64Game(game, gameDir);
-            guestPackage = pkg;
-            guestGameDir = gameDir;
-            guestClass = name;
-            guestNative64 = isNative64;
-
-            // Install & configure Zai-Scale Ultra compositor before guest GL init.
-            EglSwapHook.install();
-            GraphicsSettings graphics = GraphicsSettings.forGame(ctx, gameDir);
-            EglSwapHook.configure(graphics);
-
-            // NOTE: Do not run full asset zip extraction on the UI thread if prepareGame()
-            // already unpacked; unpackBundledAssets fast-returns when stamp exists.
-            if (!new File(gameDir, "data/.zai-assets-unpacked").isFile() && !isNative64) {
-                unpackBundledAssets(apk, gameDir);
-            }
-
-            ClassLoader loader = ensureGuestLoader(ctx, gameDir, pkg, isNative64);
             Thread.currentThread().setContextClassLoader(loader);
-
-            // Warm GuestContext right away if prepareGame didn't pre-warm it yet.
-            getOrCreateGuestContext(ctx.getApplicationContext(), gameDir, pkg, name, isNative64, loader);
-
-            if (isNative64) {
-                // Close any lingering Unicorn session from an earlier 32-bit game.
-                if (UnicornBridge.isSessionActive()) {
-                    UnicornBridge.endSession();
-                    sessionGameDir = null;
-                }
-                Log.i(TAG, "native64 mode active for " + pkg + " (Unicorn bypassed)");
-            } else {
-                final boolean hasPayload = hasNativePayload(new File(gameDir, "payload"));
-                if (hasPayload) {
-                    openNativeSession(ctx, gameDir, game, pkg, loader);
-                } else {
-                    Log.i(TAG, "pure-Java import: no ARM32 payload, Unicorn skipped");
-                }
-            }
-
             Class<?> cls = Class.forName(name, true, loader);
             if (!Activity.class.isAssignableFrom(cls)) {
                 String msg = name + " does not extend android.app.Activity (resolved for " + pkg + ")";
@@ -198,13 +421,12 @@ public final class GuestLauncher {
                 recordLaunchError(msg, null);
                 return null;
             }
+
             java.lang.reflect.Constructor<?> ctor = cls.getDeclaredConstructor();
             ctor.setAccessible(true);
             Activity guest = (Activity) ctor.newInstance();
 
-            // Refresh PLT/GOT hooks in case static initializers just dlopen'd guest .so libs.
             EglSwapHook.refreshNativeHooks();
-
             Log.i(TAG, "guest Activity " + name + " instantiated from " + apk.getName()
                     + " (mode=" + (isNative64 ? "native64" : "unicorn32") + ")");
             return guest;
@@ -216,53 +438,16 @@ public final class GuestLauncher {
         }
     }
 
-    /**
-     * Prepares runtime extraction, guest dex loading, manifest resolution,
-     * {@link GuestContext} pre-binding, and initializes the native session off the UI thread
-     * before launching the Proxy Activity.
-     */
     public static void prepareGame(Context ctx, File gameDir, Game game) {
-        clearLastLaunchError();
-        BridgeRuntime.ensureInitialized(ctx);
-        if (gameDir == null || !gameDir.isDirectory()) return;
-
-        final boolean isNative64 = isNative64Game(game, gameDir);
-        guestGameDir = gameDir;
-        String pkg = game != null && game.packageName != null ? game.packageName : gameDir.getName();
-        guestPackage = pkg;
-        guestNative64 = isNative64;
-
-        File apk = new File(gameDir, "game.apk");
-        if (!apk.isFile()) return;
-
-        unpackBundledAssets(apk, gameDir);
-
-        EglSwapHook.install();
-        EglSwapHook.configure(GraphicsSettings.forGame(ctx, gameDir));
-
-        ClassLoader loader = ensureGuestLoader(ctx, gameDir, pkg, isNative64);
-        String launchClass = game != null && game.launcherActivity != null ? game.launcherActivity : "";
-        BinaryXmlManifestReader.ParsedManifest manifest =
-                BinaryXmlManifestReader.readFromApk(apk.getAbsolutePath());
-        if (launchClass.isEmpty()) {
-            launchClass = manifest.launcherActivity;
+        if (ctx == null || gameDir == null) return;
+        Intent i = new Intent();
+        i.putExtra(EXTRA_GAME_DIR, gameDir.getAbsolutePath());
+        if (game != null) {
+            i.putExtra(EXTRA_GAME_PACKAGE, game.packageName);
+            i.putExtra(EXTRA_GUEST_ACTIVITY, game.launcherActivity);
+            i.putExtra(EXTRA_IS_NATIVE64, game.isNative64());
         }
-        launchClass = BinaryXmlManifestReader.normalizeClassName(pkg, launchClass);
-        launchClass = manifest.resolveActivityTarget(launchClass);
-        guestClass = launchClass;
-
-        // Pre-warm GuestContext & Resources/AssetManager off UI thread so launch is instant.
-        getOrCreateGuestContext(ctx.getApplicationContext(), gameDir, pkg, launchClass, isNative64, loader);
-
-        if (!isNative64) {
-            final boolean hasPayload = hasNativePayload(new File(gameDir, "payload"));
-            if (hasPayload) {
-                openNativeSession(ctx, gameDir, game, pkg, loader);
-            }
-        } else if (UnicornBridge.isSessionActive()) {
-            UnicornBridge.endSession();
-            sessionGameDir = null;
-        }
+        bootstrapOffUiThread(ctx, i, null);
     }
 
     private static synchronized ClassLoader ensureGuestLoader(Context ctx, File gameDir,
@@ -285,8 +470,6 @@ public final class GuestLauncher {
         if (isNative64) {
             File dir64 = new File(gameDir, "native64");
             nativeDir = dir64.isDirectory() ? dir64 : new File(gameDir, "native");
-            // Passing hostLibrary = null lets GuestDexLoader load guest native 64-bit .so libs
-            // child-first and directly from staged native64/, installed native dir, or split APKs.
             hostLibrary = null;
             searchPath = buildNativeLibrarySearchPath(ctx, gameDir, pkg, true);
         } else {
@@ -327,8 +510,6 @@ public final class GuestLauncher {
             if (payload.isDirectory()) entries.add(payload.getAbsolutePath());
         }
 
-        // If the package is currently installed on the device, include its nativeLibraryDir
-        // and any APK splits (handles extractNativeLibs=false AAB bundles).
         String primaryAbi = isNative64
                 ? (Build.SUPPORTED_64_BIT_ABIS.length > 0 ? Build.SUPPORTED_64_BIT_ABIS[0] : "arm64-v8a")
                 : (Build.SUPPORTED_32_BIT_ABIS.length > 0 ? Build.SUPPORTED_32_BIT_ABIS[0] : "armeabi-v7a");
@@ -398,11 +579,6 @@ public final class GuestLauncher {
         return gc;
     }
 
-    /**
-     * Combines {@code game.apk} and any {@code splits/*.apk} into one
-     * {@link File#pathSeparator}-delimited DEX path, enforcing read-only
-     * permissions on every archive for Android 14+ ART security rules.
-     */
     public static String buildCombinedDexPath(File gameDir) {
         StringBuilder path = new StringBuilder();
         File baseApk = new File(gameDir, "game.apk");
@@ -459,11 +635,11 @@ public final class GuestLauncher {
 
     private static final Object RESOURCES_INJECT_LOCK = new Object();
     private static final java.util.Map<Object, android.content.res.Resources> SAVED_SHARED_RESOURCES =
-            new java.util.IdentityHashMap<>();
+            new IdentityHashMap<>();
     private static final java.util.Map<Activity, GuestContext> BOUND_GUEST_CONTEXTS =
-            new java.util.WeakHashMap<>();
-    private static final java.util.Set<Activity> CONFIG_HOOKED_ACTIVITIES =
-            java.util.Collections.newSetFromMap(new java.util.WeakHashMap<>());
+            new WeakHashMap<>();
+    private static final Set<Activity> CONFIG_HOOKED_ACTIVITIES =
+            Collections.newSetFromMap(new WeakHashMap<>());
 
     private static void setFieldQuiet(Class<?> stopClass, Object target, String fieldName, Object value) {
         if (target == null) return;
@@ -527,11 +703,10 @@ public final class GuestLauncher {
             Context start,
             android.content.res.Resources guestRes,
             boolean trackSharedForRestore,
-            java.util.Set<Object> visited) {
+            Set<Object> visited) {
         Context cur = start;
         while (cur != null && visited.add(cur)) {
             replaceAllResourcesFields(cur, guestRes, trackSharedForRestore);
-            // Also reach LoadedApk (mPackageInfo) inside ContextImpl across OEM ROMs.
             for (Class<?> c = cur.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
                 try {
                     java.lang.reflect.Field pkgInfoField = c.getDeclaredField("mPackageInfo");
@@ -550,12 +725,6 @@ public final class GuestLauncher {
         }
     }
 
-    /**
-     * Multi-layer universal {@link GuestResourcesWrapper} injection covering
-     * Transsion {@code OverrideResources}, Xiaomi {@code MiuiResources},
-     * OPPO/OnePlus/Realme {@code OplusResources}, Samsung {@code SemResources},
-     * Vivo {@code VivoResources}, and AOSP {@code ContextImpl}/{@code LoadedApk}.
-     */
     public static void injectGuestResourcesMultiLayer(
             Activity activity, GuestContext guestContext, Context hostCtx) {
         if (activity == null || guestContext == null) return;
@@ -566,29 +735,24 @@ public final class GuestLauncher {
 
         final android.content.res.Resources guestRes = guestContext.getResources();
         final Context origBase = activity.getBaseContext();
-        final java.util.Set<Object> visited =
-                java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+        final Set<Object> visited = Collections.newSetFromMap(new IdentityHashMap<>());
 
-        // 1. Patch Activity's original per-Activity ContextImpl / OEM wrappers before swapping mBase.
         if (origBase != null && !(origBase instanceof GuestContext)) {
             injectContextChainResources(origBase, guestRes, false, visited);
         }
 
-        // 2. Replace Activity.mBase -> GuestContext (if not already swapped).
         if (!(origBase instanceof GuestContext)) {
             setFieldQuiet(android.content.ContextWrapper.class, activity, "mBase", guestContext);
         }
 
-        // 3. Patch Activity's ContextThemeWrapper.mResources + GuestApplication + LoadedApk.
         injectContextChainResources(activity, guestRes, false, visited);
         injectContextChainResources(guestContext, guestRes, true, visited);
         injectContextChainResources(guestContext.getGuestApplication(), guestRes, true, visited);
+        injectContextChainResources(guestContext.getEffectiveApplication(), guestRes, true, visited);
         if (hostCtx != null) {
             injectContextChainResources(hostCtx.getApplicationContext(), guestRes, true, visited);
         }
 
-        // 4. Resolve safe guest theme ID and reset mTheme/mInflater so Android builds Theme cleanly
-        //    from GuestResourcesWrapper rather than cached OEM OverrideResources/MiuiResources.
         String targetActName = (guestClass != null && !guestClass.isEmpty())
                 ? guestClass
                 : (guestContext.getPrimaryActivityClass() != null && !guestContext.getPrimaryActivityClass().isEmpty()
@@ -601,7 +765,7 @@ public final class GuestLauncher {
             setFieldQuiet(Activity.class, activity, "mActivityInfo", guestAi);
         }
         setFieldQuiet(Activity.class, activity, "mApplication",
-                guestContext.getGuestApplication());
+                guestContext.getEffectiveApplication());
 
         int themeRes = guestContext.resolveGuestThemeRes(guestAi);
         if (themeRes != 0) {
@@ -692,12 +856,6 @@ public final class GuestLauncher {
         }
     }
 
-    /**
-     * Called after the guest Activity's {@code onCreate}: re-scans ELF PLT/GOT
-     * tables on a worker thread for late-loaded 64-bit engines (Unity/Unreal/Cocos),
-     * unlocks peak display refresh rate for uncapped MFG, and attaches the floating
-     * HUD + Force-Save overlay onto the guest's window.
-     */
     public static void attachOverlayAndRefreshHooks(Activity guest, Context hostCtx) {
         if (guest == null) return;
         SURFACE_QUEUE.execute(EglSwapHook::refreshNativeHooks);
@@ -708,17 +866,11 @@ public final class GuestLauncher {
             InGameOverlay.attach(guest, hostCtx, guestGameDir, guestPackage, guestClass);
         }
 
-        // Schedule delayed hook refreshes OFF the Main UI thread so dl_iterate_phdr never stalls UI.
         final Handler h = new Handler(Looper.getMainLooper());
         h.postDelayed(() -> SURFACE_QUEUE.execute(EglSwapHook::refreshNativeHooks), 800);
         h.postDelayed(() -> SURFACE_QUEUE.execute(EglSwapHook::refreshNativeHooks), 2500);
     }
 
-    /**
-     * Unlocks the highest hardware display mode on Android 6+ and avoids
-     * clamping {@code Surface.setFrameRate} to 60/120 Hz when Unlimited MFG or
-     * Berserk Mode is enabled.
-     */
     public static void applyDisplayFrameRate(Activity activity, GraphicsSettings settings) {
         if (activity == null || settings == null) return;
         try {
@@ -756,20 +908,6 @@ public final class GuestLauncher {
         }
     }
 
-    private static void applyLegacyTheme(Activity guest) {
-        try {
-            int target = guest.getApplicationInfo().targetSdkVersion;
-            int theme = target < 21
-                    ? android.R.style.Theme_Holo_NoActionBar
-                    : android.R.style.Theme_Material_NoActionBar;
-            guest.setTheme(theme);
-            Log.i(TAG, "guest theme fallback: " + (target < 21 ? "Holo" : "Material")
-                    + " (targetSdk=" + target + ")");
-        } catch (Throwable t) {
-            Log.w(TAG, "guest theme fallback failed: " + t);
-        }
-    }
-
     private static void openNativeSession(Context ctx, File gameDir, Game game,
                                           String pkg, ClassLoader loader) {
         if (gameDir.getAbsolutePath().equals(sessionGameDir)
@@ -804,10 +942,6 @@ public final class GuestLauncher {
         Log.i(TAG, "native session start -> " + result);
     }
 
-    // ------------------------------------------------------------------
-    // Surface hand-off
-    // ------------------------------------------------------------------
-
     public static void probeInput(Activity guest) {
         Window window = guest.getWindow();
         if (window == null) return;
@@ -820,6 +954,7 @@ public final class GuestLauncher {
                 return false;
             }
         };
+        probe.setBackgroundColor(Color.TRANSPARENT);
         probe.setClickable(false);
         probe.setFocusable(false);
         probe.setFocusableInTouchMode(false);
@@ -828,10 +963,29 @@ public final class GuestLauncher {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
     }
 
+    /**
+     * NativeActivity subclasses that swap out the native surface for a Java
+     * {@link SurfaceView} (such as Unity 4.x {@code UnityPlayerNativeActivity})
+     * rely on Java view input dispatch ({@code onTouchEvent} / {@code injectEvent})
+     * rather than an unpolled NDK {@code AInputQueue}. Releasing
+     * {@code takeInputQueue(null)} before {@code ViewRootImpl.setView()} keeps
+     * {@code NativePostImeInputStage} from buffering events into an ANR while
+     * letting both {@link InGameOverlay} and the game view receive touches cleanly.
+     */
+    public static void releaseInputQueueIfViewHosted(Activity guest) {
+        if (!(guest instanceof android.app.NativeActivity)) return;
+        Window window = guest.getWindow();
+        if (window == null) return;
+        View decor = window.getDecorView();
+        if (findSurfaceView(decor) != null) {
+            window.takeInputQueue(null);
+            Log.i(TAG, "released NativeActivity InputQueue for Java SurfaceView host: "
+                    + guest.getClass().getName());
+        }
+    }
+
     public static void hookSurface(Activity guest) {
         if (guestNative64) {
-            // Native 64-bit games own their own EGL/Vulkan surface directly;
-            // PLT/GOT hooks intercept swaps at the libEGL/libvulkan boundary.
             EglSwapHook.refreshNativeHooks();
             return;
         }
@@ -904,10 +1058,6 @@ public final class GuestLauncher {
         return null;
     }
 
-    // ------------------------------------------------------------------
-    // Helpers
-    // ------------------------------------------------------------------
-
     private static void unpackBundledAssets(File apk, File gameDir) {
         final File data = new File(gameDir, "data");
         final File stamp = new File(data, ".zai-assets-unpacked");
@@ -973,6 +1123,14 @@ public final class GuestLauncher {
     public static String describe() {
         return guestClass == null ? "<none>"
                 : guestClass + " (" + guestPackage + ")";
+    }
+
+    public static ClassLoader getGuestLoader() {
+        return guestLoader;
+    }
+
+    public static String getGuestClass() {
+        return guestClass;
     }
 
     public static String getGuestPackage() {

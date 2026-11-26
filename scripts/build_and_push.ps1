@@ -15,7 +15,7 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $RepoRoot
 
 Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host " Zai-Bridge v3.2.1 — Automated Build & Sign Pipeline" -ForegroundColor Cyan
+Write-Host " Zai-Bridge v4.0.0 — Automated Build & Sign Pipeline" -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 
 # 1. Locate Android SDK Build-Tools (zipalign & apksigner)
@@ -44,7 +44,7 @@ if (-not (Test-Path $UnsignedOrDebugApk)) {
 
 # 3. Zipalign & Sign with v1 + v2 + v3 APK Signature Schemes
 $AlignedApk = Join-Path $RepoRoot "app/build/outputs/apk/debug/app-debug-aligned.apk"
-$FinalUniversalApk = Join-Path $RepoRoot "Zai-Bridge-v3.2.1-Universal.apk"
+$FinalUniversalApk = Join-Path $RepoRoot "Zai-Bridge-v4.0.0-Universal.apk"
 
 if ($BuildToolsDir) {
     Write-Host "`n[2/4] Running zipalign (-p -f 4) and apksigner (v2 + v3)..." -ForegroundColor Yellow
@@ -72,10 +72,10 @@ if ($BuildToolsDir) {
         throw "apksigner verify failed with exit code $LASTEXITCODE"
     }
 } else {
-    Write-Host "`n[2/4] Copying signed debug APK to Zai-Bridge-v3.2.1-Universal.apk..." -ForegroundColor Yellow
+    Write-Host "`n[2/4] Copying signed debug APK to Zai-Bridge-v4.0.0-Universal.apk..." -ForegroundColor Yellow
     Copy-Item -Path $UnsignedOrDebugApk -Destination $FinalUniversalApk -Force
 }
 
 $ApkSizeMB = [math]::Round((Get-Item $FinalUniversalApk).Length / 1MB, 2)
-Write-Host "Produced Zai-Bridge-v3.2.1-Universal.apk ($ApkSizeMB MB)" -ForegroundColor Green
-Write-Host "`nBuild and signing completed! Publish Zai-Bridge-v3.2.1-Universal.apk via GitHub Releases." -ForegroundColor Cyan
+Write-Host "Produced Zai-Bridge-v4.0.0-Universal.apk ($ApkSizeMB MB)" -ForegroundColor Green
+Write-Host "`nBuild and signing completed! Publish Zai-Bridge-v4.0.0-Universal.apk via GitHub Releases." -ForegroundColor Cyan

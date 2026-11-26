@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 360" width="1280" height="360" role="img" aria-labelledby="title desc">
-  <title id="title">Zai-Bridge v3.2.1 — Universal 32-bit to 64-bit Android translation container</title>
-  <desc id="desc">An obsidian hero banner with an animated cyan-to-amber infinity bridge, a v3.2.1 pill and architecture highlights.</desc>
+  <title id="title">Zai-Bridge v4.0.0 — Universal 32-bit to 64-bit Android translation container</title>
+  <desc id="desc">An obsidian hero banner with an animated cyan-to-amber infinity bridge, a v4.0.0 pill and architecture highlights.</desc>
 
   <defs>
     <linearGradient id="bridge" x1="0" y1="0" x2="1" y2="0">
@@ -74,7 +74,7 @@
       <circle cx="73" cy="293" r="3.5" fill="#00E5FF">
         <animate attributeName="opacity" values="1;0.25;1" dur="2.6s" repeatCount="indefinite"/>
       </circle>
-      <text x="86" y="298" font-family="Inter, Segoe UI, system-ui, sans-serif" font-size="13" font-weight="700" letter-spacing="1.2" fill="#B9F7FF">v3.2.1</text>
+      <text x="86" y="298" font-family="Inter, Segoe UI, system-ui, sans-serif" font-size="13" font-weight="700" letter-spacing="1.2" fill="#B9F7FF">v4.0.0</text>
     </g>
     <g>
       <rect x="170" y="278" width="242" height="30" rx="15" fill="#FFB300" fill-opacity="0.08" stroke="#FFB300" stroke-opacity="0.45"/>

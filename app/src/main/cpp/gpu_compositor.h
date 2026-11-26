@@ -109,7 +109,9 @@ public:
 
     std::string stats() const;
     std::string gpu_description();
+    void note_passthrough_swap();
     void note_shader_failure(const std::string& reason);
+    void trip_runtime_fallback(const std::string& reason);
 
     // Session teardown: deletes every GL object and resets history. Must be
     // called with a GL context current when possible.

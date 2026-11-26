@@ -109,6 +109,10 @@ public final class InGameOverlay {
 
         overlayRoot = new FrameLayout(hostContext);
         overlayRoot.setTag(OVERLAY_TAG);
+        overlayRoot.setBackgroundColor(android.graphics.Color.TRANSPARENT);
+        overlayRoot.setClickable(false);
+        overlayRoot.setFocusable(false);
+        overlayRoot.setFocusableInTouchMode(false);
         overlayRoot.setLayoutParams(new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT));
@@ -194,6 +198,7 @@ public final class InGameOverlay {
 
     private void buildEdgeSwipeHandle() {
         View handle = new View(hostContext);
+        handle.setBackgroundColor(android.graphics.Color.TRANSPARENT);
         FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
                 dp(18), ViewGroup.LayoutParams.MATCH_PARENT);
         lp.gravity = Gravity.END | Gravity.CENTER_VERTICAL;
@@ -467,7 +472,7 @@ public final class InGameOverlay {
         exit.setBackground(exitBg);
         exit.setLayoutParams(new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(44)));
-        exit.setOnClickListener(v -> activity.finish());
+        exit.setOnClickListener(v -> GuestLauncher.exitGuestProcess(activity));
         body.addView(exit);
 
         panel.addView(scroll);
@@ -592,6 +597,7 @@ public final class InGameOverlay {
 
     private void relaunchGuest() {
         try {
+            GuestLauncher.invalidateBootstrap();
             Intent relaunch = new Intent(hostContext, ProxyGameActivity.class);
             relaunch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
             relaunch.putExtra(GuestLauncher.EXTRA_GAME_DIR, gameDir.getAbsolutePath());

@@ -383,10 +383,16 @@ bool surface_size(EGLDisplay dpy, EGLSurface surf, int* width, int* height) {
     return true;
 }
 
-void present_through_compositor(EGLDisplay dpy, EGLSurface surf, bool guest_internal) {
+bool present_through_compositor(EGLDisplay dpy, EGLSurface surf, bool guest_internal) {
     zai::GpuCompositor& compositor = zai::GpuCompositor::instance();
-    if (!compositor.active()) return;
-    if (!compositor.begin(dpy, surf, guest_internal)) return;
+    if (!compositor.active()) return false;
+    if (!compositor.begin(dpy, surf, guest_internal)) {
+        if (guest_internal) {
+            compositor.release_internal_target();
+            if (g_real_bind_framebuffer != nullptr) g_real_bind_framebuffer(GL_FRAMEBUFFER, 0);
+        }
+        return false;
+    }
 
     const int extras = compositor.synthetic_count();
     for (int i = 0; i < extras; ++i) {
@@ -398,6 +404,7 @@ void present_through_compositor(EGLDisplay dpy, EGLSurface surf, bool guest_inte
     }
     compositor.present_current();
     compositor.end_frame();
+    return true;
 }
 
 EGLBoolean trampoline_swap(EGLDisplay dpy, EGLSurface surf) {
@@ -407,16 +414,23 @@ EGLBoolean trampoline_swap(EGLDisplay dpy, EGLSurface surf) {
 
     t_in_trampoline = true;
     zai::GpuCompositor& compositor = zai::GpuCompositor::instance();
+    const bool active = compositor.active();
     const bool guest_internal = t_guest_target && compositor.guest_drew_internal();
-    if (compositor.active() && guest_internal) {
-        present_through_compositor(dpy, surf, true);
-    } else if (compositor.active()) {
-        present_through_compositor(dpy, surf, false);
-    } else if (t_guest_target) {
-        // The compositor was switched off between bind and swap: the frame is
-        // sitting in the internal target, so hand the window back.
-        compositor.release_internal_target();
-        if (g_real_bind_framebuffer != nullptr) g_real_bind_framebuffer(GL_FRAMEBUFFER, 0);
+    if (active) {
+        if (!present_through_compositor(dpy, surf, guest_internal)) {
+            if (guest_internal) {
+                compositor.release_internal_target();
+                if (g_real_bind_framebuffer != nullptr) g_real_bind_framebuffer(GL_FRAMEBUFFER, 0);
+            }
+            compositor.note_passthrough_swap();
+        }
+    } else {
+        // Zai-Scale is Off (100% scale, Off MFG): direct hardware swap with zero FBO blits.
+        if (t_guest_target || compositor.guest_drew_internal()) {
+            compositor.release_internal_target();
+            if (g_real_bind_framebuffer != nullptr) g_real_bind_framebuffer(GL_FRAMEBUFFER, 0);
+        }
+        compositor.note_passthrough_swap();
     }
     t_guest_target = false;
 
@@ -440,17 +454,24 @@ EGLBoolean trampoline_swap_damage(EGLDisplay dpy, EGLSurface surf, const EGLint*
     ++g_damage_swaps;
     t_in_trampoline = true;
     zai::GpuCompositor& compositor = zai::GpuCompositor::instance();
+    const bool guest_internal = t_guest_target && compositor.guest_drew_internal();
     if (compositor.active()) {
-        present_through_compositor(dpy, surf, t_guest_target &&
-                                                   compositor.guest_drew_internal());
-    } else if (t_guest_target) {
-        compositor.release_internal_target();
-        if (g_real_bind_framebuffer != nullptr) g_real_bind_framebuffer(GL_FRAMEBUFFER, 0);
+        if (!present_through_compositor(dpy, surf, guest_internal)) {
+            if (guest_internal) {
+                compositor.release_internal_target();
+                if (g_real_bind_framebuffer != nullptr) g_real_bind_framebuffer(GL_FRAMEBUFFER, 0);
+            }
+            compositor.note_passthrough_swap();
+        }
+    } else {
+        if (t_guest_target || compositor.guest_drew_internal()) {
+            compositor.release_internal_target();
+            if (g_real_bind_framebuffer != nullptr) g_real_bind_framebuffer(GL_FRAMEBUFFER, 0);
+        }
+        compositor.note_passthrough_swap();
     }
     t_guest_target = false;
 
-    // A damaged swap must present the whole window: the compositor resolved the
-    // complete frame, so the partial rectangles no longer describe it.
     const EGLBoolean ok = g_real_swap_damage(dpy, surf, rects, count);
     if (ok == EGL_TRUE) {
         ++g_swaps;
@@ -468,41 +489,47 @@ void trampoline_bind_framebuffer(GLenum target, GLuint framebuffer) {
         return;
     }
 
-    // Do not hijack GL_READ_FRAMEBUFFER or alter draw-target state on readback/blit queries.
     if (target == GL_READ_FRAMEBUFFER) {
         g_real_bind_framebuffer(target, framebuffer);
         return;
     }
 
     zai::GpuCompositor& compositor = zai::GpuCompositor::instance();
+    if (!compositor.active() || !compositor.internal_scaling()) {
+        if (t_guest_target) {
+            t_guest_target = false;
+            compositor.release_internal_target();
+        }
+        g_real_bind_framebuffer(target, framebuffer);
+        return;
+    }
+
     if (framebuffer != 0) {
         t_guest_target = false;
         g_real_bind_framebuffer(target, framebuffer);
         return;
     }
 
-    if (compositor.internal_scaling()) {
-        EGLDisplay dpy = g_egl_current_display != nullptr
-                                 ? g_egl_current_display() : EGL_NO_DISPLAY;
-        EGLSurface surf = g_egl_current_surface != nullptr
-                                  ? g_egl_current_surface(EGL_DRAW) : EGL_NO_SURFACE;
-        int width = 0;
-        int height = 0;
-        if (surface_size(dpy, surf, &width, &height)) {
-            int internal_w = 0;
-            int internal_h = 0;
-            t_in_trampoline = true;
-            GLuint fbo = compositor.bind_internal_target(width, height,
-                                                         &internal_w, &internal_h);
-            if (fbo != 0) {
-                g_real_bind_framebuffer(target, fbo);
-                t_in_trampoline = false;
-                t_guest_target = true;
-                ++g_redirects;
-                return;
-            }
+    EGLDisplay dpy = g_egl_current_display != nullptr
+                             ? g_egl_current_display() : EGL_NO_DISPLAY;
+    EGLSurface surf = g_egl_current_surface != nullptr
+                              ? g_egl_current_surface(EGL_DRAW) : EGL_NO_SURFACE;
+    int width = 0;
+    int height = 0;
+    if (surface_size(dpy, surf, &width, &height)) {
+        int internal_w = 0;
+        int internal_h = 0;
+        t_in_trampoline = true;
+        GLuint fbo = compositor.bind_internal_target(width, height,
+                                                     &internal_w, &internal_h);
+        if (fbo != 0) {
+            g_real_bind_framebuffer(target, fbo);
             t_in_trampoline = false;
+            t_guest_target = true;
+            ++g_redirects;
+            return;
         }
+        t_in_trampoline = false;
     }
     t_guest_target = false;
     g_real_bind_framebuffer(target, framebuffer);
@@ -511,11 +538,12 @@ void trampoline_bind_framebuffer(GLenum target, GLuint framebuffer) {
 void trampoline_viewport(GLint x, GLint y, GLsizei width, GLsizei height) {
     std::call_once(g_resolve_once, resolve_egl_once);
     if (g_real_viewport == nullptr) return;
-    if (t_in_trampoline || !t_guest_target) {
+    zai::GpuCompositor& compositor = zai::GpuCompositor::instance();
+    if (t_in_trampoline || !t_guest_target || !compositor.active() || !compositor.internal_scaling()) {
         g_real_viewport(x, y, width, height);
         return;
     }
-    const int scale = zai::GpuCompositor::instance().scale_percent();
+    const int scale = compositor.scale_percent();
     const float factor = static_cast<float>(scale) / 100.0f;
     const GLsizei scaled_w = static_cast<GLsizei>(static_cast<float>(width) * factor + 0.5f);
     const GLsizei scaled_h = static_cast<GLsizei>(static_cast<float>(height) * factor + 0.5f);
@@ -529,11 +557,12 @@ void trampoline_viewport(GLint x, GLint y, GLsizei width, GLsizei height) {
 void trampoline_scissor(GLint x, GLint y, GLsizei width, GLsizei height) {
     std::call_once(g_resolve_once, resolve_egl_once);
     if (g_real_scissor == nullptr) return;
-    if (t_in_trampoline || !t_guest_target) {
+    zai::GpuCompositor& compositor = zai::GpuCompositor::instance();
+    if (t_in_trampoline || !t_guest_target || !compositor.active() || !compositor.internal_scaling()) {
         g_real_scissor(x, y, width, height);
         return;
     }
-    const int scale = zai::GpuCompositor::instance().scale_percent();
+    const int scale = compositor.scale_percent();
     const float factor = static_cast<float>(scale) / 100.0f;
     const GLsizei scaled_w = static_cast<GLsizei>(static_cast<float>(width) * factor + 0.5f);
     const GLsizei scaled_h = static_cast<GLsizei>(static_cast<float>(height) * factor + 0.5f);

@@ -43,13 +43,18 @@ public final class BridgeRuntime {
             Log.w(TAG, "Hidden API exemption failed or restricted by OEM: " + t);
         }
 
-        // 2. ActivityThread.mInstrumentation virtualization hook (defensive)
-        try {
-            instrumentationInstalled = BridgeInstrumentation.install(appContext);
-            Log.i(TAG, "ActivityThread.mInstrumentation hook: " + (instrumentationInstalled ? "ACTIVE" : "FALLBACK"));
-        } catch (Throwable t) {
-            Log.w(TAG, "ActivityThread.mInstrumentation hook blocked by OEM ROM: " + t);
-            instrumentationInstalled = false;
+        // 2. ActivityThread.mInstrumentation virtualization hook (isolated to :guest)
+        if (BridgeApplication.isGuestProcess(appContext)) {
+            try {
+                instrumentationInstalled = BridgeInstrumentation.install(appContext);
+                Log.i(TAG, "ActivityThread.mInstrumentation hook: "
+                        + (instrumentationInstalled ? "ACTIVE" : "FALLBACK"));
+            } catch (Throwable t) {
+                Log.w(TAG, "ActivityThread.mInstrumentation hook blocked by OEM ROM: " + t);
+                instrumentationInstalled = false;
+            }
+        } else {
+            Log.i(TAG, "ActivityThread.mInstrumentation skipped in main launcher process");
         }
 
         // 3. EGL10 / EGL14 native swap hooks & Zai-Scale compositor (defensive)

@@ -1,5 +1,6 @@
 package com.ziauddin.zaibridge.core;
 
+import android.app.Application;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.ContextWrapper;
@@ -8,6 +9,7 @@ import android.content.pm.ActivityInfo;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
+import android.content.pm.ProviderInfo;
 import android.content.res.AssetManager;
 import android.content.res.Resources;
 import android.os.Build;
@@ -22,20 +24,21 @@ import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
 /**
- * Isolated {@link Context} for a virtualized guest game running inside Zai-Bridge.
+ * Isolated {@link Context} for a virtualized guest game running inside `:guest`.
  *
- * <p>Resolves resources using Android 16's genuine OS-merged split-APK binding
+ * <p>Resolves resources using Android's OS-merged split-APK binding
  * ({@code createPackageContext(..., CONTEXT_IGNORE_SECURITY)} /
- * {@code getResourcesForApplication(pkg)}) when the game is installed, falling back to
- * standalone base APK + {@code splits/*.apk} merged {@code AssetManager}, wrapped in
- * {@link GuestResourcesWrapper} to eliminate {@code Resources$NotFoundException: #0x0}.
- * Also virtualizes {@link PackageManager} via {@link GuestPackageManagerWrapper} and
- * {@code Application} via {@link GuestApplication}.
+ * {@code getResourcesForApplication(pkg)}) when the game is installed, or
+ * standalone merged base + split APKs. Resolves all manifest meta-data through
+ * real OS {@link PackageManager} queries first, falling back to
+ * {@link BinaryXmlManifestReader} with live resource reference resolution so raw
+ * {@code 0x7F......} resource IDs never leak into SDK checks.
  */
 public final class GuestContext extends ContextWrapper {
 
@@ -55,7 +58,10 @@ public final class GuestContext extends ContextWrapper {
     private final ApplicationInfo appInfo;
     private final GuestPackageManagerWrapper packageManager;
     private final GuestApplication guestApplication;
+    private volatile Application customGuestApplication;
     private final ActivityInfo fallbackActivityInfo;
+    private final List<ProviderInfo> providers;
+    private final String declaredApplicationClass;
 
     public GuestContext(Context host, File gameDir, String guestPackage, ClassLoader guestLoader) {
         this(host, gameDir, guestPackage, "", detectNative64Dir(gameDir), guestLoader);
@@ -83,6 +89,7 @@ public final class GuestContext extends ContextWrapper {
 
         PackageManager hostPm = host.getPackageManager();
         PackageInfo installedPkgInfo = queryInstalledPackageInfo(hostPm, this.guestPackage);
+        ApplicationInfo installedAppMeta = queryInstalledApplicationInfoMeta(hostPm, this.guestPackage);
 
         String resolvedBaseApk = stagedBaseApk.isFile() ? stagedBaseApk.getAbsolutePath() : null;
         if (resolvedBaseApk == null && installedPkgInfo != null && installedPkgInfo.applicationInfo != null) {
@@ -112,48 +119,18 @@ public final class GuestContext extends ContextWrapper {
         }
         this.assetApkPaths = Collections.unmodifiableList(apkPaths);
 
-        BinaryXmlManifestReader.ParsedManifest manifest =
-                BinaryXmlManifestReader.readFromApk(resolvedBaseApk);
-        String resolvedActivity = primaryActivityClass != null ? primaryActivityClass : "";
-        if (resolvedActivity.isEmpty()) {
-            resolvedActivity = manifest.launcherActivity;
-        }
-        resolvedActivity = BinaryXmlManifestReader.normalizeClassName(
-                this.guestPackage, resolvedActivity);
-        resolvedActivity = manifest.resolveActivityTarget(resolvedActivity);
-        this.primaryActivityClass = resolvedActivity;
-
         PackageInfo effectivePkgInfo = installedPkgInfo;
         if (effectivePkgInfo == null && resolvedBaseApk != null) {
             effectivePkgInfo = queryArchivePackageInfo(hostPm, resolvedBaseApk);
         }
 
-        this.appInfo = buildGuestApplicationInfo(
-                host,
-                gameDir,
-                this.guestPackage,
-                native64,
-                resolvedBaseApk,
-                splitPaths,
-                installedPkgInfo,
-                effectivePkgInfo,
-                manifest);
-
-        Map<String, ActivityInfo> actMap = buildActivityInfoMap(
-                this.guestPackage,
-                this.primaryActivityClass,
-                this.appInfo,
-                effectivePkgInfo,
-                manifest);
-        this.fallbackActivityInfo = pickFallbackActivityInfo(
-                this.guestPackage, this.primaryActivityClass, this.appInfo, actMap, manifest);
-
-        if (effectivePkgInfo != null) {
-            effectivePkgInfo.applicationInfo = this.appInfo;
-        }
-
+        // Resolve guest Resources BEFORE parsing AXML meta-data so @integer/@string/@bool
+        // references inside AndroidManifest.xml resolve cleanly against live Resources.
+        ApplicationInfo resHintApp = installedAppMeta != null
+                ? installedAppMeta
+                : (effectivePkgInfo != null ? effectivePkgInfo.applicationInfo : null);
         ResourcesInitResult resInit = resolveGuestResources(
-                host, hostPm, this.guestPackage, this.appInfo, this.assetApkPaths);
+                host, hostPm, this.guestPackage, resHintApp, this.assetApkPaths);
         this.resources = new GuestResourcesWrapper(
                 resInit.primaryResources,
                 host.getResources(),
@@ -170,6 +147,58 @@ public final class GuestContext extends ContextWrapper {
             this.theme.applyStyle(R.style.Theme_ZaiBridge_GameHost, true);
         }
 
+        BinaryXmlManifestReader.ParsedManifest manifest =
+                BinaryXmlManifestReader.readFromApk(resolvedBaseApk, splitPaths, resInit.primaryResources);
+
+        String resolvedActivity = primaryActivityClass != null ? primaryActivityClass : "";
+        if (resolvedActivity.isEmpty()) {
+            resolvedActivity = manifest.launcherActivity;
+        }
+        resolvedActivity = BinaryXmlManifestReader.normalizeClassName(
+                this.guestPackage, resolvedActivity);
+        resolvedActivity = manifest.resolveActivityTarget(resolvedActivity);
+        this.primaryActivityClass = resolvedActivity;
+
+        String appCls = manifest.applicationClass;
+        if ((appCls == null || appCls.isEmpty())
+                && installedAppMeta != null
+                && installedAppMeta.className != null) {
+            appCls = BinaryXmlManifestReader.normalizeClassName(
+                    this.guestPackage, installedAppMeta.className);
+        }
+        this.declaredApplicationClass = appCls != null ? appCls : "";
+
+        this.appInfo = buildGuestApplicationInfo(
+                host,
+                gameDir,
+                this.guestPackage,
+                native64,
+                resolvedBaseApk,
+                splitPaths,
+                installedPkgInfo,
+                installedAppMeta,
+                effectivePkgInfo,
+                manifest);
+
+        Map<String, ActivityInfo> actMap = buildActivityInfoMap(
+                this.guestPackage,
+                this.primaryActivityClass,
+                this.appInfo,
+                effectivePkgInfo,
+                manifest);
+        this.fallbackActivityInfo = pickFallbackActivityInfo(
+                this.guestPackage, this.primaryActivityClass, this.appInfo, actMap, manifest);
+
+        this.providers = Collections.unmodifiableList(buildProviderInfoList(
+                this.guestPackage, this.appInfo, effectivePkgInfo, manifest));
+
+        if (effectivePkgInfo != null) {
+            effectivePkgInfo.applicationInfo = this.appInfo;
+            if (!this.providers.isEmpty()) {
+                effectivePkgInfo.providers = this.providers.toArray(new ProviderInfo[0]);
+            }
+        }
+
         this.packageManager = new GuestPackageManagerWrapper(
                 hostPm,
                 this,
@@ -179,7 +208,8 @@ public final class GuestContext extends ContextWrapper {
                 this.appInfo,
                 effectivePkgInfo,
                 actMap,
-                this.fallbackActivityInfo);
+                this.fallbackActivityInfo,
+                this.providers);
 
         this.guestApplication = new GuestApplication(this);
         ensureStorageDirs();
@@ -233,10 +263,21 @@ public final class GuestContext extends ContextWrapper {
         } catch (Throwable binderLarge) {
             try {
                 return pm.getPackageInfo(
-                        pkg, PackageManager.GET_ACTIVITIES | PackageManager.GET_META_DATA);
+                        pkg, PackageManager.GET_ACTIVITIES | PackageManager.GET_META_DATA
+                                | PackageManager.GET_PROVIDERS);
             } catch (Throwable ignored) {
                 return null;
             }
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    private static ApplicationInfo queryInstalledApplicationInfoMeta(PackageManager pm, String pkg) {
+        if (pm == null || pkg == null || pkg.isEmpty()) return null;
+        try {
+            return pm.getApplicationInfo(pkg, PackageManager.GET_META_DATA);
+        } catch (Throwable ignored) {
+            return null;
         }
     }
 
@@ -268,10 +309,13 @@ public final class GuestContext extends ContextWrapper {
             String baseApk,
             List<String> splitPaths,
             PackageInfo installedPkg,
+            ApplicationInfo installedAppMeta,
             PackageInfo archivePkg,
             BinaryXmlManifestReader.ParsedManifest manifest) {
         ApplicationInfo ai;
-        if (installedPkg != null && installedPkg.applicationInfo != null) {
+        if (installedAppMeta != null) {
+            ai = new ApplicationInfo(installedAppMeta);
+        } else if (installedPkg != null && installedPkg.applicationInfo != null) {
             ai = new ApplicationInfo(installedPkg.applicationInfo);
         } else if (archivePkg != null && archivePkg.applicationInfo != null) {
             ai = new ApplicationInfo(archivePkg.applicationInfo);
@@ -312,10 +356,20 @@ public final class GuestContext extends ContextWrapper {
             ai.deviceProtectedDataDir = dataDir.getAbsolutePath();
         }
 
+        // Put resolved AXML metadata first, then overlay genuine OS-parsed PackageManager
+        // meta-data on top so OS values (e.g. google_play_services_version) ALWAYS win.
         Bundle meta = new Bundle();
-        if (ai.metaData != null) meta.putAll(ai.metaData);
         if (!manifest.applicationMetaData.isEmpty()) {
             meta.putAll(manifest.applicationMetaData);
+        }
+        if (archivePkg != null && archivePkg.applicationInfo != null && archivePkg.applicationInfo.metaData != null) {
+            meta.putAll(archivePkg.applicationInfo.metaData);
+        }
+        if (installedPkg != null && installedPkg.applicationInfo != null && installedPkg.applicationInfo.metaData != null) {
+            meta.putAll(installedPkg.applicationInfo.metaData);
+        }
+        if (installedAppMeta != null && installedAppMeta.metaData != null) {
+            meta.putAll(installedAppMeta.metaData);
         }
         ai.metaData = meta;
         return ai;
@@ -342,7 +396,9 @@ public final class GuestContext extends ContextWrapper {
                 ai.applicationInfo = appInfo;
                 ai.name = BinaryXmlManifestReader.normalizeClassName(guestPkg, src.name);
 
-                Bundle merged = manifest.buildMergedMetaData(ai.name);
+                Bundle merged = new Bundle();
+                if (appInfo.metaData != null) merged.putAll(appInfo.metaData);
+                merged.putAll(manifest.buildMergedMetaData(ai.name));
                 if (src.metaData != null) {
                     merged.putAll(src.metaData);
                 }
@@ -350,12 +406,13 @@ public final class GuestContext extends ContextWrapper {
                 map.put(ai.name, ai);
             }
         }
-        // Wire <activity-alias> names to their resolved target ActivityInfo.
         for (Map.Entry<String, String> entry : manifest.aliasTargets.entrySet()) {
             ActivityInfo targetInfo = map.get(entry.getValue());
             if (targetInfo != null) {
                 ActivityInfo aliasInfo = new ActivityInfo(targetInfo);
-                Bundle merged = manifest.buildMergedMetaData(entry.getKey());
+                Bundle merged = new Bundle();
+                if (appInfo.metaData != null) merged.putAll(appInfo.metaData);
+                merged.putAll(manifest.buildMergedMetaData(entry.getKey()));
                 if (targetInfo.metaData != null) merged.putAll(targetInfo.metaData);
                 aliasInfo.metaData = merged;
                 map.put(entry.getKey(), aliasInfo);
@@ -366,10 +423,56 @@ public final class GuestContext extends ContextWrapper {
             synth.packageName = guestPkg;
             synth.name = primaryActivity;
             synth.applicationInfo = appInfo;
-            synth.metaData = manifest.buildMergedMetaData(primaryActivity);
+            Bundle merged = new Bundle();
+            if (appInfo.metaData != null) merged.putAll(appInfo.metaData);
+            merged.putAll(manifest.buildMergedMetaData(primaryActivity));
+            synth.metaData = merged;
             map.put(primaryActivity, synth);
         }
         return map;
+    }
+
+    private static List<ProviderInfo> buildProviderInfoList(
+            String guestPkg,
+            ApplicationInfo appInfo,
+            PackageInfo pkgInfo,
+            BinaryXmlManifestReader.ParsedManifest manifest) {
+        Map<String, ProviderInfo> byName = new HashMap<>();
+        if (pkgInfo != null && pkgInfo.providers != null) {
+            for (ProviderInfo src : pkgInfo.providers) {
+                if (src == null || src.name == null) continue;
+                ProviderInfo pi = new ProviderInfo(src);
+                pi.packageName = guestPkg;
+                pi.applicationInfo = appInfo;
+                pi.name = BinaryXmlManifestReader.normalizeClassName(guestPkg, src.name);
+                if (pi.metaData == null) pi.metaData = new Bundle();
+                byName.put(pi.name, pi);
+            }
+        }
+        for (BinaryXmlManifestReader.ProviderEntry entry : manifest.providers) {
+            if (entry.name == null || entry.name.isEmpty()) continue;
+            ProviderInfo pi = byName.get(entry.name);
+            if (pi == null) {
+                pi = new ProviderInfo();
+                pi.packageName = guestPkg;
+                pi.name = entry.name;
+                pi.authority = entry.authorities;
+                pi.enabled = entry.enabled;
+                pi.exported = entry.exported;
+                pi.initOrder = entry.initOrder;
+                pi.applicationInfo = appInfo;
+                pi.metaData = new Bundle(entry.metaData);
+                byName.put(pi.name, pi);
+            } else {
+                Bundle merged = new Bundle(entry.metaData);
+                if (pi.metaData != null) merged.putAll(pi.metaData);
+                pi.metaData = merged;
+                if (pi.initOrder == 0) pi.initOrder = entry.initOrder;
+            }
+        }
+        List<ProviderInfo> list = new ArrayList<>(byName.values());
+        Collections.sort(list, Comparator.comparingInt((ProviderInfo p) -> p.initOrder).reversed());
+        return list;
     }
 
     private static ActivityInfo pickFallbackActivityInfo(
@@ -389,7 +492,10 @@ public final class GuestContext extends ContextWrapper {
         fallback.packageName = guestPkg;
         fallback.name = primaryActivity != null ? primaryActivity : "";
         fallback.applicationInfo = appInfo;
-        fallback.metaData = manifest.buildMergedMetaData(primaryActivity);
+        Bundle merged = new Bundle();
+        if (appInfo.metaData != null) merged.putAll(appInfo.metaData);
+        merged.putAll(manifest.buildMergedMetaData(primaryActivity));
+        fallback.metaData = merged;
         return fallback;
     }
 
@@ -409,7 +515,6 @@ public final class GuestContext extends ContextWrapper {
                 return new ResourcesInitResult(pkgRes, pkgCtx.getTheme());
             }
         } catch (PackageManager.NameNotFoundException ignored) {
-            // Game is standalone / uninstalled APK; use fallback below.
         } catch (Throwable t) {
             Log.w(TAG, "createPackageContext failed for " + guestPkg + ": " + t.getMessage());
         }
@@ -433,8 +538,6 @@ public final class GuestContext extends ContextWrapper {
                 Object cookie = addAssetPath.invoke(am, path);
                 if (cookie instanceof Integer && ((Integer) cookie) > 0) {
                     loadedCount++;
-                } else {
-                    Log.w(TAG, "addAssetPath returned 0 for " + path);
                 }
             }
             if (loadedCount > 0) {
@@ -450,23 +553,20 @@ public final class GuestContext extends ContextWrapper {
             Log.w(TAG, "standalone AssetManager fallback failed: " + t.getMessage());
         }
 
-        try {
-            Resources appRes = pm.getResourcesForApplication(guestAppInfo);
-            if (appRes != null) {
-                return new ResourcesInitResult(appRes, null);
+        if (guestAppInfo != null) {
+            try {
+                Resources appRes = pm.getResourcesForApplication(guestAppInfo);
+                if (appRes != null) {
+                    return new ResourcesInitResult(appRes, null);
+                }
+            } catch (Throwable ignored) {
             }
-        } catch (Throwable ignored) {
         }
 
         Log.w(TAG, "using host Resources as last-resort base for " + guestPkg);
         return new ResourcesInitResult(host.getResources(), null);
     }
 
-    /**
-     * Merges the guest's base APK and all staged split APKs into an existing
-     * {@link AssetManager} so legacy views created against an Activity's initial
-     * resources still read {@code assets/} and resource entries cleanly.
-     */
     public void mergeInto(AssetManager target) {
         if (target == null || assetApkPaths.isEmpty()) return;
         try {
@@ -508,6 +608,22 @@ public final class GuestContext extends ContextWrapper {
         return guestApplication;
     }
 
+    public void setCustomGuestApplication(Application customApp) {
+        this.customGuestApplication = customApp;
+    }
+
+    public Application getEffectiveApplication() {
+        return customGuestApplication != null ? customGuestApplication : guestApplication;
+    }
+
+    public String getDeclaredApplicationClass() {
+        return declaredApplicationClass;
+    }
+
+    public List<ProviderInfo> getGuestProviders() {
+        return providers;
+    }
+
     public String getPrimaryActivityClass() {
         return primaryActivityClass;
     }
@@ -518,7 +634,7 @@ public final class GuestContext extends ContextWrapper {
 
     @Override
     public Context getApplicationContext() {
-        return guestApplication;
+        return customGuestApplication != null ? customGuestApplication : guestApplication;
     }
 
     @Override
@@ -543,7 +659,6 @@ public final class GuestContext extends ContextWrapper {
 
     @Override
     public String getOpPackageName() {
-        // Android 10–16 AppOpsManager verifies calling UID matches getOpPackageName().
         return super.getOpPackageName();
     }
 
@@ -580,11 +695,6 @@ public final class GuestContext extends ContextWrapper {
         return guestLoader != null ? guestLoader : super.getClassLoader();
     }
 
-    /**
-     * Resolves a safe theme resource ID guaranteed to belong either to the guest's
-     * own {@link AssetManager} or Android's universal framework resources ({@code 0x01......}).
-     * Prevents applying a host {@code 0x7f......} theme ID onto the guest AssetManager.
-     */
     public int resolveGuestThemeRes(ActivityInfo guestAi) {
         Resources guestPrimary = resources.getGuestPrimary();
         int[] candidates = {
@@ -617,7 +727,7 @@ public final class GuestContext extends ContextWrapper {
     @Override
     public Context createPackageContext(String packageName, int flags)
             throws PackageManager.NameNotFoundException {
-        if (guestPackage.equals(packageName)) {
+        if (guestPackage.equals(packageName) || hostPackage.equals(packageName)) {
             return this;
         }
         return super.createPackageContext(packageName, flags);

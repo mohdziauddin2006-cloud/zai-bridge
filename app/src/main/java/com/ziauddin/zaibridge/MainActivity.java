@@ -261,33 +261,15 @@ public class MainActivity extends AppCompatActivity implements GameAdapter.Liste
 
     private void launch(Game game) {
         if (game == null) return;
-        showLoading(true);
-        bgExecutor.execute(() -> {
-            try {
-                File dir = GameRepository.gameDir(MainActivity.this, game.directoryName);
-                GuestLauncher.prepareGame(MainActivity.this, dir, game);
-            } catch (Throwable t) {
-                Log.e(TAG, "Failed to prepare game on background thread", t);
-            }
-
-            mainHandler.post(() -> {
-                showLoading(false);
-                if (!BridgeRuntime.isInstrumentationInstalled()) {
-                    com.ziauddin.zaibridge.core.BridgeInstrumentation
-                            .install(getApplicationContext());
-                }
-                final boolean virtualized = BridgeRuntime.isInstrumentationInstalled();
-                Intent intent = new Intent(MainActivity.this, virtualized
-                        ? ProxyGameActivity.class : GameHostActivity.class);
-                intent.putExtra(GuestLauncher.EXTRA_GAME_DIR,
-                        GameRepository.gameDir(MainActivity.this, game.directoryName).getAbsolutePath());
-                intent.putExtra(GuestLauncher.EXTRA_GAME_LABEL, game.label);
-                intent.putExtra(GuestLauncher.EXTRA_GUEST_ACTIVITY, game.launcherActivity);
-                Log.i(TAG, "launching " + game.label + " via "
-                        + (virtualized ? "ProxyGameActivity (Instrumentation)" : "GameHostActivity"));
-                startActivity(intent);
-            });
-        });
+        File dir = GameRepository.gameDir(MainActivity.this, game.directoryName);
+        Intent intent = new Intent(MainActivity.this, ProxyGameActivity.class);
+        intent.putExtra(GuestLauncher.EXTRA_GAME_DIR, dir.getAbsolutePath());
+        intent.putExtra(GuestLauncher.EXTRA_GAME_LABEL, game.label);
+        intent.putExtra(GuestLauncher.EXTRA_GUEST_ACTIVITY, game.launcherActivity);
+        intent.putExtra(GuestLauncher.EXTRA_GAME_PACKAGE, game.packageName);
+        intent.putExtra(GuestLauncher.EXTRA_IS_NATIVE64, game.isNative64());
+        Log.i(TAG, "dispatching " + game.label + " to :guest container (non-blocking)");
+        startActivity(intent);
     }
 
     private void probeHardwareGpu(TextView hardware) {

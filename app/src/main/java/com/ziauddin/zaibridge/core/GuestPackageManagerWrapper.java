@@ -33,17 +33,17 @@ import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.annotation.RequiresApi;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
 /**
- * {@link PackageManager} virtualization wrapper for guest activities.
+ * {@link PackageManager} virtualization wrapper for guest components inside `:guest`.
  *
- * <p>Intercepts metadata, component, application, package, and resource queries so that
- * Unity {@code UnityPlayer} ({@code unity.build-id}, {@code unity.splash-mode},
- * {@code unityplayer.UnityActivity}) and Unity 6 {@code GameActivity}
- * ({@code android.app.lib_name}) always read the guest APK's {@code AndroidManifest.xml}
- * even when hosted through {@code ProxyGameActivity} or {@code GameHostActivity}.
+ * <p>Intercepts metadata, component, provider, application, package, and resource queries
+ * for both the guest package name and the container's own package name (when SDKs query
+ * {@code context.getPackageName()} before context propagation finishes) so Unity, Play
+ * Services, Firebase, and AndroidX Startup always read the resolved {@code metaData} Bundle.
  */
 @SuppressWarnings("deprecation")
 public final class GuestPackageManagerWrapper extends PackageManager {
@@ -58,6 +58,7 @@ public final class GuestPackageManagerWrapper extends PackageManager {
     private final PackageInfo guestPackageInfo;
     private final Map<String, ActivityInfo> guestActivities;
     private final ActivityInfo fallbackActivityInfo;
+    private final List<ProviderInfo> guestProviders;
 
     public GuestPackageManagerWrapper(
             @NonNull PackageManager base,
@@ -68,7 +69,8 @@ public final class GuestPackageManagerWrapper extends PackageManager {
             @NonNull ApplicationInfo guestAppInfo,
             @Nullable PackageInfo guestPackageInfo,
             @NonNull Map<String, ActivityInfo> guestActivities,
-            @NonNull ActivityInfo fallbackActivityInfo) {
+            @NonNull ActivityInfo fallbackActivityInfo,
+            @NonNull List<ProviderInfo> guestProviders) {
         this.base = base;
         this.guestContext = guestContext;
         this.hostPackage = hostPackage;
@@ -78,6 +80,7 @@ public final class GuestPackageManagerWrapper extends PackageManager {
         this.guestPackageInfo = guestPackageInfo;
         this.guestActivities = guestActivities;
         this.fallbackActivityInfo = fallbackActivityInfo;
+        this.guestProviders = guestProviders;
     }
 
     private boolean isVirtualHostActivity(@Nullable ComponentName component) {
@@ -87,7 +90,15 @@ public final class GuestPackageManagerWrapper extends PackageManager {
         if (cls != null && (cls.endsWith("ProxyGameActivity") || cls.endsWith("GameHostActivity"))) {
             return true;
         }
-        return guestPackage.equals(pkg);
+        return isVirtualGuestOrContainerPkg(pkg);
+    }
+
+    private boolean isGuestPkg(@Nullable String packageName) {
+        return packageName != null && packageName.equals(guestPackage);
+    }
+
+    private boolean isVirtualGuestOrContainerPkg(@Nullable String packageName) {
+        return packageName != null && (packageName.equals(guestPackage) || packageName.equals(hostPackage));
     }
 
     @Nullable
@@ -109,9 +120,19 @@ public final class GuestPackageManagerWrapper extends PackageManager {
         return null;
     }
 
+    private ApplicationInfo cloneGuestApplicationInfo() {
+        ApplicationInfo copy = new ApplicationInfo(guestAppInfo);
+        if (guestAppInfo.metaData != null) {
+            copy.metaData = new Bundle(guestAppInfo.metaData);
+        } else {
+            copy.metaData = new Bundle();
+        }
+        return copy;
+    }
+
     private ActivityInfo cloneActivityInfo(ActivityInfo src) {
         ActivityInfo copy = new ActivityInfo(src);
-        copy.applicationInfo = guestAppInfo;
+        copy.applicationInfo = cloneGuestApplicationInfo();
         copy.packageName = guestPackage;
         if (copy.metaData == null) {
             copy.metaData = new Bundle();
@@ -121,8 +142,62 @@ public final class GuestPackageManagerWrapper extends PackageManager {
         return copy;
     }
 
-    private boolean isGuestPkg(@Nullable String packageName) {
-        return packageName != null && packageName.equals(guestPackage);
+    private ProviderInfo cloneProviderInfo(ProviderInfo src) {
+        ProviderInfo copy = new ProviderInfo(src);
+        copy.applicationInfo = cloneGuestApplicationInfo();
+        copy.packageName = guestPackage;
+        if (copy.metaData == null) {
+            copy.metaData = new Bundle();
+        } else {
+            copy.metaData = new Bundle(copy.metaData);
+        }
+        return copy;
+    }
+
+    @Nullable
+    private ProviderInfo findGuestProvider(@Nullable ComponentName component) {
+        if (component == null) return null;
+        String pkg = component.getPackageName();
+        if (!isVirtualGuestOrContainerPkg(pkg)) return null;
+        String cls = component.getClassName();
+        String norm = BinaryXmlManifestReader.normalizeClassName(guestPackage, cls);
+        for (ProviderInfo pi : guestProviders) {
+            if (pi.name != null && (pi.name.equals(cls) || pi.name.equals(norm))) {
+                return cloneProviderInfo(pi);
+            }
+        }
+        return null;
+    }
+
+    @Nullable
+    private PackageInfo cloneGuestPackageInfo() {
+        if (guestPackageInfo == null) return null;
+        PackageInfo copy = new PackageInfo();
+        copy.packageName = guestPackageInfo.packageName != null ? guestPackageInfo.packageName : guestPackage;
+        copy.versionCode = guestPackageInfo.versionCode;
+        if (Build.VERSION.SDK_INT >= 28) {
+            copy.setLongVersionCode(guestPackageInfo.getLongVersionCode());
+        }
+        copy.versionName = guestPackageInfo.versionName;
+        copy.sharedUserId = guestPackageInfo.sharedUserId;
+        copy.sharedUserLabel = guestPackageInfo.sharedUserLabel;
+        copy.firstInstallTime = guestPackageInfo.firstInstallTime;
+        copy.lastUpdateTime = guestPackageInfo.lastUpdateTime;
+        copy.requestedPermissions = guestPackageInfo.requestedPermissions;
+        copy.requestedPermissionsFlags = guestPackageInfo.requestedPermissionsFlags;
+        copy.splitNames = guestPackageInfo.splitNames;
+        copy.signatures = guestPackageInfo.signatures;
+        if (Build.VERSION.SDK_INT >= 28) {
+            copy.signingInfo = guestPackageInfo.signingInfo;
+        }
+        copy.applicationInfo = cloneGuestApplicationInfo();
+        copy.activities = guestPackageInfo.activities;
+        copy.services = guestPackageInfo.services;
+        copy.receivers = guestPackageInfo.receivers;
+        copy.providers = guestProviders.isEmpty()
+                ? guestPackageInfo.providers
+                : guestProviders.toArray(new ProviderInfo[0]);
+        return copy;
     }
 
     @Override
@@ -147,12 +222,8 @@ public final class GuestPackageManagerWrapper extends PackageManager {
 
     @Override
     public ApplicationInfo getApplicationInfo(String packageName, int flags) throws NameNotFoundException {
-        if (isGuestPkg(packageName)) {
-            ApplicationInfo copy = new ApplicationInfo(guestAppInfo);
-            if (guestAppInfo.metaData != null) {
-                copy.metaData = new Bundle(guestAppInfo.metaData);
-            }
-            return copy;
+        if (isVirtualGuestOrContainerPkg(packageName)) {
+            return cloneGuestApplicationInfo();
         }
         return base.getApplicationInfo(packageName, flags);
     }
@@ -161,20 +232,17 @@ public final class GuestPackageManagerWrapper extends PackageManager {
     @Override
     public ApplicationInfo getApplicationInfo(String packageName, ApplicationInfoFlags flags)
             throws NameNotFoundException {
-        if (isGuestPkg(packageName)) {
-            ApplicationInfo copy = new ApplicationInfo(guestAppInfo);
-            if (guestAppInfo.metaData != null) {
-                copy.metaData = new Bundle(guestAppInfo.metaData);
-            }
-            return copy;
+        if (isVirtualGuestOrContainerPkg(packageName)) {
+            return cloneGuestApplicationInfo();
         }
         return base.getApplicationInfo(packageName, flags);
     }
 
     @Override
     public PackageInfo getPackageInfo(String packageName, int flags) throws NameNotFoundException {
-        if (isGuestPkg(packageName) && guestPackageInfo != null) {
-            return guestPackageInfo;
+        if (isVirtualGuestOrContainerPkg(packageName)) {
+            PackageInfo pi = cloneGuestPackageInfo();
+            if (pi != null) return pi;
         }
         return base.getPackageInfo(packageName, flags);
     }
@@ -183,8 +251,9 @@ public final class GuestPackageManagerWrapper extends PackageManager {
     @Override
     public PackageInfo getPackageInfo(String packageName, PackageInfoFlags flags)
             throws NameNotFoundException {
-        if (isGuestPkg(packageName) && guestPackageInfo != null) {
-            return guestPackageInfo;
+        if (isVirtualGuestOrContainerPkg(packageName)) {
+            PackageInfo pi = cloneGuestPackageInfo();
+            if (pi != null) return pi;
         }
         return base.getPackageInfo(packageName, flags);
     }
@@ -192,22 +261,52 @@ public final class GuestPackageManagerWrapper extends PackageManager {
     @Override
     public PackageInfo getPackageInfo(VersionedPackage versionedPackage, int flags)
             throws NameNotFoundException {
-        if (versionedPackage != null && isGuestPkg(versionedPackage.getPackageName())
-                && guestPackageInfo != null) {
-            return guestPackageInfo;
+        if (versionedPackage != null && isVirtualGuestOrContainerPkg(versionedPackage.getPackageName())) {
+            PackageInfo pi = cloneGuestPackageInfo();
+            if (pi != null) return pi;
         }
         return base.getPackageInfo(versionedPackage, flags);
     }
 
+    @Override
+    public ProviderInfo getProviderInfo(ComponentName component, int flags) throws NameNotFoundException {
+        ProviderInfo found = findGuestProvider(component);
+        if (found != null) return found;
+        return base.getProviderInfo(component, flags);
+    }
+
     @RequiresApi(33)
     @Override
-    public PackageInfo getPackageInfo(VersionedPackage versionedPackage, PackageInfoFlags flags)
+    public ProviderInfo getProviderInfo(ComponentName component, ComponentInfoFlags flags)
             throws NameNotFoundException {
-        if (versionedPackage != null && isGuestPkg(versionedPackage.getPackageName())
-                && guestPackageInfo != null) {
-            return guestPackageInfo;
+        ProviderInfo found = findGuestProvider(component);
+        if (found != null) return found;
+        return base.getProviderInfo(component, flags);
+    }
+
+    @Override
+    public ProviderInfo resolveContentProvider(String authority, int flags) {
+        if (authority != null && !authority.isEmpty()) {
+            for (ProviderInfo pi : guestProviders) {
+                if (pi.authority != null && pi.authority.contains(authority)) {
+                    return cloneProviderInfo(pi);
+                }
+            }
         }
-        return base.getPackageInfo(versionedPackage, flags);
+        return base.resolveContentProvider(authority, flags);
+    }
+
+    @Override
+    public List<ProviderInfo> queryContentProviders(String processName, int uid, int flags) {
+        List<ProviderInfo> merged = new ArrayList<>();
+        for (ProviderInfo pi : guestProviders) {
+            merged.add(cloneProviderInfo(pi));
+        }
+        List<ProviderInfo> real = base.queryContentProviders(processName, uid, flags);
+        if (real != null) {
+            merged.addAll(real);
+        }
+        return merged;
     }
 
     @Override
@@ -220,7 +319,7 @@ public final class GuestPackageManagerWrapper extends PackageManager {
 
     @Override
     public Resources getResourcesForApplication(ApplicationInfo app) throws NameNotFoundException {
-        if (app != null && (isGuestPkg(app.packageName) || app == guestAppInfo)) {
+        if (app != null && (isVirtualGuestOrContainerPkg(app.packageName) || app == guestAppInfo)) {
             return guestContext.getResources();
         }
         return base.getResourcesForApplication(app);
@@ -230,7 +329,7 @@ public final class GuestPackageManagerWrapper extends PackageManager {
     @Override
     public Resources getResourcesForApplication(ApplicationInfo app, Configuration configuration)
             throws NameNotFoundException {
-        if (app != null && (isGuestPkg(app.packageName) || app == guestAppInfo)) {
+        if (app != null && (isVirtualGuestOrContainerPkg(app.packageName) || app == guestAppInfo)) {
             return guestContext.getResources();
         }
         return base.getResourcesForApplication(app, configuration);
@@ -238,7 +337,7 @@ public final class GuestPackageManagerWrapper extends PackageManager {
 
     @Override
     public Resources getResourcesForApplication(String appPackageName) throws NameNotFoundException {
-        if (isGuestPkg(appPackageName)) {
+        if (isVirtualGuestOrContainerPkg(appPackageName)) {
             return guestContext.getResources();
         }
         return base.getResourcesForApplication(appPackageName);
@@ -268,7 +367,7 @@ public final class GuestPackageManagerWrapper extends PackageManager {
 
     @Override
     public Drawable getDrawable(String packageName, int resid, ApplicationInfo appInfo) {
-        if (isGuestPkg(packageName) || appInfo == guestAppInfo) {
+        if (isVirtualGuestOrContainerPkg(packageName) || appInfo == guestAppInfo) {
             try {
                 return guestContext.getResources().getDrawable(resid, guestContext.getTheme());
             } catch (Throwable ignored) {
@@ -279,7 +378,7 @@ public final class GuestPackageManagerWrapper extends PackageManager {
 
     @Override
     public CharSequence getText(String packageName, int resid, ApplicationInfo appInfo) {
-        if (isGuestPkg(packageName) || appInfo == guestAppInfo) {
+        if (isVirtualGuestOrContainerPkg(packageName) || appInfo == guestAppInfo) {
             try {
                 return guestContext.getResources().getText(resid);
             } catch (Throwable ignored) {
@@ -290,7 +389,7 @@ public final class GuestPackageManagerWrapper extends PackageManager {
 
     @Override
     public XmlResourceParser getXml(String packageName, int resid, ApplicationInfo appInfo) {
-        if (isGuestPkg(packageName) || appInfo == guestAppInfo) {
+        if (isVirtualGuestOrContainerPkg(packageName) || appInfo == guestAppInfo) {
             try {
                 return guestContext.getResources().getXml(resid);
             } catch (Throwable ignored) {
@@ -373,8 +472,6 @@ public final class GuestPackageManagerWrapper extends PackageManager {
     @RequiresApi(33) @Override public ActivityInfo getReceiverInfo(ComponentName component, ComponentInfoFlags flags) throws NameNotFoundException { return base.getReceiverInfo(component, flags); }
     @Override public ServiceInfo getServiceInfo(ComponentName component, int flags) throws NameNotFoundException { return base.getServiceInfo(component, flags); }
     @RequiresApi(33) @Override public ServiceInfo getServiceInfo(ComponentName component, ComponentInfoFlags flags) throws NameNotFoundException { return base.getServiceInfo(component, flags); }
-    @Override public ProviderInfo getProviderInfo(ComponentName component, int flags) throws NameNotFoundException { return base.getProviderInfo(component, flags); }
-    @RequiresApi(33) @Override public ProviderInfo getProviderInfo(ComponentName component, ComponentInfoFlags flags) throws NameNotFoundException { return base.getProviderInfo(component, flags); }
     @Override public List<PackageInfo> getInstalledPackages(int flags) { return base.getInstalledPackages(flags); }
     @RequiresApi(33) @Override public List<PackageInfo> getInstalledPackages(PackageInfoFlags flags) { return base.getInstalledPackages(flags); }
     @Override public List<PackageInfo> getPackagesHoldingPermissions(String[] permissions, int flags) { return base.getPackagesHoldingPermissions(permissions, flags); }
@@ -409,8 +506,6 @@ public final class GuestPackageManagerWrapper extends PackageManager {
     @Override public ResolveInfo resolveService(Intent intent, int flags) { return base.resolveService(intent, flags); }
     @Override public List<ResolveInfo> queryIntentServices(Intent intent, int flags) { return base.queryIntentServices(intent, flags); }
     @Override public List<ResolveInfo> queryIntentContentProviders(Intent intent, int flags) { return base.queryIntentContentProviders(intent, flags); }
-    @Override public ProviderInfo resolveContentProvider(String name, int flags) { return base.resolveContentProvider(name, flags); }
-    @Override public List<ProviderInfo> queryContentProviders(String processName, int uid, int flags) { return base.queryContentProviders(processName, uid, flags); }
     @Override public InstrumentationInfo getInstrumentationInfo(ComponentName className, int flags) throws NameNotFoundException { return base.getInstrumentationInfo(className, flags); }
     @Override public List<InstrumentationInfo> queryInstrumentation(String targetPackage, int flags) { return base.queryInstrumentation(targetPackage, flags); }
     @Override public Drawable getActivityIcon(ComponentName activityName) throws NameNotFoundException { return base.getActivityIcon(activityName); }
